@@ -1,0 +1,12 @@
+# 中药化合物智能鉴定平台 - 依赖要求
+# TCM Compound Identification Platform - Requirements
+
+# 核心依赖
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+
+# 可选依赖（用于增强功能）
+plotly>=5.18.0  # 用于交互式图表
+matplotlib>=3.7.0  # 用于图表绘制
