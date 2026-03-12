@@ -1,23 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署版 v5.0
-==========================================
+中药化合物智能鉴定平台 - 云端部署版 v4.3-ext
+==============================================
 
 功能说明：
-- 专为云端部署优化，支持 Streamlit Community Cloud
-- 基于大规模中药质谱数据库的化合物鉴定工具
-- 支持高分辨质谱数据上传和分析
-- 六级评级标准鉴定结果
-- 新增：诊断离子比对使用外部文件“诊断离子.xlsx”
-- 新增：同一观测 m/z 共用序号，不同加和离子分行显示
-- 新增：支持只上传正离子或负离子模式数据
-- 新增：取消候选数量限制，列出所有可能化合物
-- 新增：碎片/诊断离子匹配仅用容差 (Da)，范围可调
-- 优化：移除废弃参数、增加文件列名校验、改进进度提示、增强错误处理
+- 基于最初版本 v4.3 的核心鉴定逻辑
+- 新增：诊断离子比对使用外部文件“诊断离子.xlsx”（按化合物类型分组）
+- 保留：同一化合物共用序号，不同加和离子分行显示
+- 保留：六级评级标准，碎片/诊断离子匹配仅用容差 (Da)
+- 整合优化：支持单模式上传、取消候选数限制、文件列名校验、错误处理
 
 作者：MiniMax Agent
 日期：2026-03-12
-版本：v5.0（云端部署版）
+版本：v4.3-ext（云端部署版）
 """
 
 import streamlit as st
@@ -34,12 +29,12 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 鉴定程序核心代码
+# 鉴定程序核心代码（基于 v4.3，诊断离子库改为外部文件）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.0
+    中药化合物鉴定终极版程序 v4.3-ext
     
     功能特点：
     1. 使用全部35,828条数据库记录，不遗漏任何潜在化合物
@@ -47,7 +42,7 @@ class UltimateGardeniaIdentifier:
     3. 诊断离子比对基于外部文件“诊断离子.xlsx”（按化合物类型分组）
     4. 精确的六级评级标准
     5. 多进程并行加速
-    6. 同一观测 m/z 共用序号，不同加和离子分行显示
+    6. 同一化合物共用序号，不同加和离子分行显示
     7. 独立控制碎片离子容差和诊断离子容差（仅Da，无ppm）
     8. CID 估算保留时间
     """
@@ -64,6 +59,8 @@ class UltimateGardeniaIdentifier:
             'fragment_tolerance': 0.05,       # 碎片离子匹配容差 (Da)
             'diagnostic_tolerance': 0.05,      # 诊断离子匹配容差 (Da)
             'tolerance_ppm': 50,
+            'max_candidates': 3,                # 不再使用，保留兼容
+            'min_fragment_count': 1,
             'min_intensity': 100,
             'ppm_tier1': 10,
             'ppm_tier2': 20,
@@ -82,7 +79,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.0 - 云端部署版")
+        print("中药化合物鉴定程序 v4.3-ext - 云端部署版")
         print("="*80)
         print("\n【1/6】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -306,7 +303,7 @@ class UltimateGardeniaIdentifier:
         # 先尝试匹配化合物类型字段
         if compound_type:
             for key in self.diagnostic_ions_by_type.keys():
-                if key.lower() in compound_type:
+                if key.lower() in compound_type or compound_type in key.lower():
                     return key
         
         # 若类型字段无匹配，尝试从名称推断
@@ -533,7 +530,7 @@ class UltimateGardeniaIdentifier:
         return candidates
     
     def generate_report(self, herb_name=None):
-        """生成化合物鉴定报告（同一观测 m/z 共用序号，不同加和离子分行）"""
+        """生成化合物鉴定报告（同一化合物共用序号，不同加和离子分行）"""
         if herb_name is None:
             herb_name = self.herb_name if self.herb_name else '中药'
         
@@ -608,15 +605,22 @@ class UltimateGardeniaIdentifier:
         # 转换为DataFrame
         df = pd.DataFrame(all_records)
         
-        # 按观测m/z分组，组内按评级、ppm排序
-        df_sorted = df.sort_values(by=['观测m/z', '评级', 'ppm'], ascending=[True, True, True]).reset_index(drop=True)
+        # 标准化分子式（用于分组）
+        df['分子式_标准化'] = df['分子式'].apply(normalize_formula)
+        df['化合物ID'] = df['化合物中文名'].str.strip() + '_' + df['分子式_标准化'].str.strip()
         
-        # 为每个观测m/z分配相同序号
-        unique_obs = df_sorted['观测m/z'].unique()
-        obs_to_seq = {obs: i+1 for i, obs in enumerate(unique_obs)}
-        df_sorted['序号'] = df_sorted['观测m/z'].map(obs_to_seq)
+        # 按评级、ppm排序（同一化合物内按ppm排序）
+        df_sorted = df.sort_values(by=['评级', 'ppm'], ascending=[True, True]).reset_index(drop=True)
         
-        # 按序号、评级、ppm排序（确保序号顺序，组内按评级、ppm）
+        # 为每个化合物组分配相同序号
+        unique_ids = df_sorted['化合物ID'].unique()
+        id_to_seq = {uid: i+1 for i, uid in enumerate(unique_ids)}
+        df_sorted['序号'] = df_sorted['化合物ID'].map(id_to_seq)
+        
+        # 删除临时列
+        df_sorted.drop(columns=['化合物ID', '分子式_标准化'], inplace=True)
+        
+        # 重新按序号、评级、ppm排序（确保序号顺序，组内按评级、ppm）
         df_final = df_sorted.sort_values(by=['序号', '评级', 'ppm'], ascending=[True, True, True]).reset_index(drop=True)
         
         return df_final
@@ -704,21 +708,23 @@ def deduplicate_report(input_file, output_file):
     changes = (df['分子式'] != df['分子式_标准化']).sum()
     print(f'  分子式标准化变化数: {changes}')
     
-    # 按观测m/z分组，分配序号
-    print('\n步骤2: 按观测m/z分组，分配序号')
-    # 按观测m/z、评级、ppm排序
-    df = df.sort_values(by=['观测m/z', '评级', 'ppm'], ascending=[True, True, True]).reset_index(drop=True)
+    # 合并同一化合物（保留所有行，序号重新分配）
+    print('\n步骤2: 合并同一化合物（保留多行，序号共用）')
+    df['化合物ID'] = df['化合物中文名'].str.strip() + '_' + df['分子式_标准化'].str.strip()
+    
+    # 按评级、ppm排序
+    df = df.sort_values(by=['评级', 'ppm'], ascending=[True, True]).reset_index(drop=True)
     
     # 分配序号（每组相同）
-    unique_obs = df['观测m/z'].unique()
-    obs_to_seq = {obs: i+1 for i, obs in enumerate(unique_obs)}
-    df['序号'] = df['观测m/z'].map(obs_to_seq)
+    unique_ids = df['化合物ID'].unique()
+    id_to_seq = {uid: i+1 for i, uid in enumerate(unique_ids)}
+    df['序号'] = df['化合物ID'].map(id_to_seq)
     
     df_dedup = df.sort_values(by=['序号', '评级', 'ppm'], ascending=[True, True, True]).reset_index(drop=True)
     print(f'  合并后记录数: {len(df_dedup)}')
     
     # 清理临时列
-    for col in ['分子式_标准化']:
+    for col in ['化合物ID', '分子式_标准化']:
         if col in df_dedup.columns:
             df_dedup = df_dedup.drop(columns=[col])
     
@@ -805,7 +811,7 @@ def find_database_path():
 
 @st.cache_data
 def load_diagnostic_ions_cached():
-    """加载诊断离子数据库（带缓存）"""
+    """加载诊断离子数据库（带缓存，用于筛查页面）"""
     diagnostic_ion_paths = [
         "诊断离子.xlsx",
         "data/诊断离子.xlsx",
@@ -884,11 +890,11 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# Streamlit 网页应用部分
+# Streamlit 网页应用部分（基于最初版本界面，整合优化）
 # ============================================================================
 
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.0",
+    page_title="中药化合物智能鉴定平台 v4.3-ext",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -912,7 +918,7 @@ def create_header():
     st.markdown("""
     <div class="main-header">
         <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于高分辨质谱数据库的化合物鉴定工具 v5.0（云端版）</p>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于高分辨质谱数据库的化合物鉴定工具 v4.3-ext（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -933,10 +939,10 @@ def create_sidebar():
     st.sidebar.markdown("---")
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.0（云端版）
+    - 程序版本：v4.3-ext（云端版）
     - 数据库规模：35,828条化合物记录
-    - 诊断离子：84,433条记录（来自外部文件）
-    - 核心特点：诊断离子基于外部文件、同一观测m/z共用序号、支持单模式上传
+    - 诊断离子：84,433条记录（来自外部文件，支持回退内置库）
+    - 核心特点：诊断离子基于外部文件、同一化合物共用序号、支持单模式上传
     """)
     st.sidebar.markdown("""
     <div style="text-align: center; color: #999; font-size: 0.7rem; padding: 1rem 0;">
@@ -969,9 +975,8 @@ def show_login_page():
         password = st.text_input("密码", type="password", placeholder="请输入密码", key="login_password")
         
         # 从 Streamlit Secrets 或环境变量获取密码，提高安全性
-        # 默认使用硬编码密码（仅用于测试），建议在生产环境中配置 secrets
         correct_username = "ZY"
-        correct_password = st.secrets.get("APP_PASSWORD", "513513")  # 若未配置 secrets，默认使用 513513
+        correct_password = st.secrets.get("APP_PASSWORD", "513513")
         
         if st.button("登录", type="primary", use_container_width=True):
             if username == correct_username and password == correct_password:
@@ -1016,11 +1021,11 @@ def show_home_page():
         st.markdown("""
         <div class="feature-card"><h4>🔍 智能化合物鉴定</h4><p>基于高分辨质谱数据，在35,828条数据库记录中进行精准匹配，支持正负离子模式。</p></div>
         <div class="feature-card"><h4>📈 六级评级标准</h4><p>确证级、高置信级、推定级、提示级、参考级、排除级，科学评估鉴定结果可靠性。</p></div>
-        <div class="feature-card"><h4>🧪 诊断离子分析</h4><p>诊断离子比对基于外部“诊断离子.xlsx”文件，支持自定义离子库。</p></div>
+        <div class="feature-card"><h4>🧪 诊断离子分析</h4><p>诊断离子比对基于外部“诊断离子.xlsx”文件，支持自定义离子库，若文件缺失则回退内置库。</p></div>
         """, unsafe_allow_html=True)
     with col2:
         st.markdown("""
-        <div class="feature-card"><h4>🔗 同一观测m/z共用序号</h4><p>同一观测m/z下的不同候选化合物分行显示，序号相同，便于识别来自同一母离子的多种可能。</p></div>
+        <div class="feature-card"><h4>🔗 同一化合物共用序号</h4><p>同一化合物（中文名+分子式）下不同加和离子分行显示，序号相同，便于完整呈现。</p></div>
         <div class="feature-card"><h4>🌱 药材来源分析</h4><p>详细统计鉴定结果的药材来源分布，帮助筛选特征化合物。</p></div>
         <div class="feature-card"><h4>⚡ 高性能处理</h4><p>采用二分查找索引和多进程并行处理，支持大规模数据库高效检索。</p></div>
         """, unsafe_allow_html=True)
@@ -1028,7 +1033,7 @@ def show_home_page():
     st.markdown("## 🚀 快速开始")
     st.info("""
     ### 使用步骤
-    1. **准备数据**：准备好质谱数据文件（Excel格式）、数据库文件（TCM-SM-MS DB.xlsx）和诊断离子文件（诊断离子.xlsx）
+    1. **准备数据**：准备好质谱数据文件（Excel格式）、数据库文件（TCM-SM-MS DB.xlsx）和诊断离子文件（诊断离子.xlsx，可选）
     2. **上传文件**：在"开始鉴定"页面上传正负离子质谱数据（可以只上传一种模式）
     3. **配置参数**：设置ppm容差、碎片离子容差等参数
     4. **运行鉴定**：点击"开始鉴定"按钮进行分析
@@ -1070,7 +1075,7 @@ def show_analysis_page():
                 st.success(f"✅ 文件格式正确: {msg}")
             else:
                 st.error(f"❌ 文件格式错误: {msg}")
-                ms_positive_file = None  # 清除无效文件
+                ms_positive_file = None
     with col2:
         st.markdown("### 负离子模式数据")
         ms_negative_file = st.file_uploader("上传负离子模式质谱数据 (.xlsx)（可选）", type=['xlsx'], key='ms_negative',
@@ -1081,7 +1086,7 @@ def show_analysis_page():
                 st.success(f"✅ 文件格式正确: {msg}")
             else:
                 st.error(f"❌ 文件格式错误: {msg}")
-                ms_negative_file = None  # 清除无效文件
+                ms_negative_file = None
     st.markdown("---")
     st.markdown("## ⚙️ 鉴定参数配置")
     col1, col2, col3 = st.columns(3)
@@ -1155,7 +1160,7 @@ def show_analysis_page():
                         herb_name=herb_name,
                         config=config,
                         use_parallel=use_parallel,
-                        diagnostic_ion_path=diag_path  # 传递诊断离子文件路径
+                        diagnostic_ion_path=diag_path
                     )
                     
                     status_text.text("【5/6】正在处理质谱数据...")
@@ -1308,7 +1313,7 @@ def show_guide_page():
     st.markdown("## 📖 使用指南")
     st.info("""
     ### 使用步骤
-    1. **准备数据**：准备好质谱数据文件（Excel格式）、数据库文件（TCM-SM-MS DB.xlsx）和诊断离子文件（诊断离子.xlsx）
+    1. **准备数据**：准备好质谱数据文件（Excel格式）、数据库文件（TCM-SM-MS DB.xlsx）和诊断离子文件（诊断离子.xlsx，可选）
     2. **上传文件**：在"开始鉴定"页面上传正负离子质谱数据（可以只上传一种模式）
     3. **配置参数**：设置ppm容差、碎片离子容差等参数
     4. **运行鉴定**：点击"开始鉴定"按钮进行分析
@@ -1325,8 +1330,8 @@ def show_guide_page():
     
     ### 重要说明
     - 碎片离子和诊断离子匹配仅使用绝对容差 (Da)，不计算 ppm
-    - 诊断离子匹配基于外部文件“诊断离子.xlsx”，按化合物类型分组
-    - 同一观测 m/z 下的所有候选化合物共用序号，不同加和离子分行显示
+    - 诊断离子匹配基于外部文件“诊断离子.xlsx”（若文件不存在则回退到内置库）
+    - 同一化合物（中文名+分子式）共用序号，不同加和离子分行显示
     - 容差范围可调 0.00-1.50 Da
     """)
     st.markdown("---")
@@ -1417,7 +1422,7 @@ def show_results_page():
     if not confirmed_df.empty:
         st.dataframe(confirmed_df[['化合物中文名', '化合物英文名', '分子式', 'ppm', '药材名称', '诊断离子']],
                      use_container_width=True, hide_index=True)
-    st.markdown("### 📋 完整鉴定结果（同一观测m/z共用序号）")
+    st.markdown("### 📋 完整鉴定结果（同一化合物共用序号）")
     all_columns = report.columns.tolist()
     default_cols = ['序号', '观测m/z', '化合物中文名', '分子式', 'ppm', '评级名称', '药材名称',
                     '与文献中匹配的碎片离子个数', '与文献中匹配的碎片离子', '诊断离子个数', '诊断离子']
