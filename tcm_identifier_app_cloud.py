@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.0
+中药化合物智能鉴定平台 - 云端部署增强版 v5.1
 ==============================================
 
 功能特点：
+- 支持外部诊断离子文件（诊断离子.xlsx）
 - 综合置信度评分（ppm、碎片覆盖率、诊断离子、保留时间、中性丢失）
 - 择优输出最佳候选，自动区分同分异构体
 - 六级评级标准 + 综合得分辅助判断
-- 智能去重基于得分而非丰度
+- 智能去重基于得分
 - 完全兼容原数据库格式，额外字段可选项
 
 作者：MiniMax Agent
 日期：2026-03-12
-版本：v5.0（增强版）
+版本：v5.1（增强版 + 外部诊断离子）
 """
 
 import streamlit as st
@@ -29,24 +30,26 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 鉴定程序核心代码（增强版）
+# 鉴定程序核心代码（增强版 + 外部诊断离子）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.0（增强版）
+    中药化合物鉴定终极版程序 v5.1（增强版 + 外部诊断离子）
     
     新增特性：
-    1. 综合置信度评分系统
-    2. 保留时间匹配（需数据库含'保留时间(min)'列）
-    3. 中性丢失匹配（需数据库含'中性丢失'列或外部规则文件）
-    4. 择优输出：每个母离子仅返回得分最高的候选
-    5. 去重基于得分而非丰度
+    1. 支持外部诊断离子文件（Excel格式）
+    2. 综合置信度评分系统
+    3. 保留时间匹配（需数据库含'保留时间(min)'列）
+    4. 中性丢失匹配（需数据库含'中性丢失'列或外部规则文件）
+    5. 择优输出：每个母离子仅返回得分最高的候选
+    6. 去重基于得分而非丰度
     """
     
     def __init__(self, database_path, ms_positive_path, ms_negative_path, 
                  herb_name=None, config=None, use_parallel=True,
-                 rt_tolerance=0.3, loss_tolerance=0.02):
+                 rt_tolerance=0.3, loss_tolerance=0.02,
+                 external_diagnostic_file=None):
         """初始化鉴定程序（增强版）"""
         # 默认配置参数
         self.config = {
@@ -55,7 +58,7 @@ class UltimateGardeniaIdentifier:
             'cid_max': 1.0,
             'fragment_tolerance': 0.05,
             'tolerance_ppm': 50,
-            'max_candidates': 3,          # 保留，但增强版只返回最佳，可用于调试
+            'max_candidates': 3,          # 保留，用于调试
             'min_fragment_count': 1,
             'min_intensity': 100,
             'ppm_tier1': 10,
@@ -87,7 +90,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.0（增强版）")
+        print("中药化合物鉴定程序 v5.1（增强版 + 外部诊断离子）")
         print("="*80)
         print("\n【1/7】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -110,10 +113,13 @@ class UltimateGardeniaIdentifier:
         # 构建优化索引
         print("【4/7】正在构建索引...")
         self._build_optimized_index()
-        self._build_diagnostic_ion_library()
+        
+        # 构建诊断性离子库（支持外部文件）
+        print("【5/7】正在加载诊断离子库...")
+        self._build_diagnostic_ion_library(external_diagnostic_file)
         
         # 加载辅助数据（保留时间、裂解规则等）
-        print("【5/7】正在加载辅助数据...")
+        print("【6/7】正在加载辅助数据...")
         self._load_auxiliary_data()
         
         # 统计信息
@@ -125,6 +131,7 @@ class UltimateGardeniaIdentifier:
         
         # 打印初始化信息
         self._print_initialization_info()
+        print("【7/7】初始化完成，准备鉴定")
     
     def _load_data(self, filepath):
         """加载数据文件（支持Excel格式）"""
@@ -253,8 +260,35 @@ class UltimateGardeniaIdentifier:
             pass
         return np.array(fragments)
     
-    def _build_diagnostic_ion_library(self):
-        """构建各类化合物的诊断性离子库"""
+    def _build_diagnostic_ion_library(self, external_file=None):
+        """构建诊断性离子库（支持外部Excel文件）"""
+        if external_file and os.path.exists(external_file):
+            try:
+                df = pd.read_excel(external_file)
+                # 要求Excel文件至少包含 '化合物类型' 和 '诊断碎片离子m/z' 两列
+                required_cols = ['化合物类型', '诊断碎片离子m/z']
+                if not all(col in df.columns for col in required_cols):
+                    raise ValueError(f"外部诊断离子文件缺少必要列：{required_cols}")
+                
+                self.diagnostic_ions = {}
+                for category, group in df.groupby('化合物类型'):
+                    ions = group['诊断碎片离子m/z'].dropna().tolist()
+                    # 可选添加描述列，若无则使用默认描述
+                    description = group['描述'].iloc[0] if '描述' in group.columns else f'来自外部文件，{len(ions)}个离子'
+                    self.diagnostic_ions[category] = {
+                        'ions': ions,
+                        'description': description
+                    }
+                print(f"  成功加载外部诊断离子库：{len(self.diagnostic_ions)} 类，{len(df)} 条记录")
+            except Exception as e:
+                print(f"  加载外部诊断离子文件失败：{e}，将使用内置库")
+                self._build_default_diagnostic_ions()
+        else:
+            print("  未提供外部诊断离子文件，使用内置诊断离子库")
+            self._build_default_diagnostic_ions()
+    
+    def _build_default_diagnostic_ions(self):
+        """默认内置诊断离子库"""
         self.diagnostic_ions = {
             '环烯醚萜类': {
                 'ions': [138.055, 124.039, 110.023, 96.008, 82.029, 67.029, 127.039],
@@ -288,8 +322,7 @@ class UltimateGardeniaIdentifier:
     
     def _load_auxiliary_data(self):
         """加载辅助数据（如外部保留时间表、裂解规则）"""
-        # 这里可以扩展：从外部文件加载额外的保留时间或裂解规则
-        # 目前使用数据库中已存在的字段
+        # 预留扩展点
         pass
     
     def _parse_losses(self, loss_string):
@@ -318,10 +351,11 @@ class UltimateGardeniaIdentifier:
         return observed_losses
     
     def _classify_compound(self, name, compound_type):
-        """分类化合物"""
+        """分类化合物（用于匹配诊断离子库中的类别）"""
         name = name.lower()
         compound_type = str(compound_type).lower()
         
+        # 优先根据compound_type判断
         if any(keyword in compound_type for keyword in ['环烯醚', 'iridoid']):
             return '环烯醚萜类'
         if any(keyword in compound_type for keyword in ['有机酸', '酚酸']):
@@ -333,9 +367,11 @@ class UltimateGardeniaIdentifier:
         if any(keyword in compound_type for keyword in ['生物碱', 'alkaloid']):
             return '生物碱类'
         
+        # 根据名称判断栀子特异
         if any(keyword in name for keyword in ['京尼平', '栀子', 'genipos', 'gardenia']):
             return '栀子特异'
         
+        # 如果都不匹配，返回'其他'，但诊断离子库中可能没有这个类别，匹配时会跳过
         return '其他'
     
     def _binary_search_range(self, mz_array, mz, tolerance_ppm):
@@ -372,7 +408,7 @@ class UltimateGardeniaIdentifier:
         return list(set(matched))
     
     def _find_diagnostic_ions_fast(self, matched_fragments, category):
-        """快速查找诊断性离子"""
+        """快速查找诊断性离子（使用当前加载的诊断离子库）"""
         if len(matched_fragments) == 0:
             return []
         
@@ -385,7 +421,7 @@ class UltimateGardeniaIdentifier:
         diagnostic = []
         for diag_val in diag_ions:
             for matched_val in matched_arr:
-                if abs(float(matched_val) - float(diag_val)) <= 0.05:
+                if abs(float(matched_val) - float(diag_val)) <= self.config['fragment_tolerance']:
                     diagnostic.append(float(matched_val))
                     break
         
@@ -484,7 +520,7 @@ class UltimateGardeniaIdentifier:
         return score, details
     
     def extract_precursor_ions(self, ms_data, ionization_mode):
-        """从质谱数据中提取母离子信息（不变）"""
+        """从质谱数据中提取母离子信息"""
         precursors = []
         mz_columns = [col for col in ms_data.columns if 'Peak_' in col and '_m/z' in col]
         min_intensity = self.config['min_intensity']
@@ -508,18 +544,28 @@ class UltimateGardeniaIdentifier:
                             fragments.append(mz_value)
                             fragments_dict[mz_value] = intensity
                 
-                rt = row.get('出峰时间', np.nan)
+                # 尝试获取保留时间：先找“出峰时间t/min”列，再找“出峰时间”
+                rt = row.get('出峰时间t/min', np.nan)
+                if pd.isna(rt):
+                    rt = row.get('出峰时间', np.nan)
+                
+                # 如果仍为空且存在CID列，则模拟计算
                 if pd.isna(rt) and 'CID' in row.index:
                     cid = row['CID']
                     gt = self.config['gradient_time']
-                    rt = 0.5 if pd.isna(cid) else (
-                        gt if cid >= self.config['cid_max'] else 
-                        round(gt * (cid - self.config['cid_min']) / (self.config['cid_max'] - self.config['cid_min']), 2)
-                    )
+                    cid_min = self.config['cid_min']
+                    cid_max = self.config['cid_max']
+                    if pd.isna(cid):
+                        rt = 0.5
+                    else:
+                        if cid >= cid_max:
+                            rt = gt
+                        else:
+                            rt = round(gt * (cid - cid_min) / (cid_max - cid_min), 2)
                 
                 precursors.append({
                     'precursor_mz': float(precursor_mz),
-                    'retention_time': rt,
+                    'retention_time': rt if not pd.isna(rt) else None,
                     'fragments': np.array(sorted(fragments, reverse=True)),
                     'fragments_dict': fragments_dict,
                     'mode': ionization_mode,
@@ -610,7 +656,6 @@ class UltimateGardeniaIdentifier:
             herb_name = self.herb_name if self.herb_name else '中药'
         
         results = []
-        sequence = 1
         compound_best_record = {}  # 键为(中文名,分子式)，值为(记录,得分)
         
         # 处理正离子模式
@@ -780,10 +825,88 @@ def normalize_formula(formula):
 
 
 def deduplicate_report(input_file, output_file):
-    """集成去重功能（保持不变，但增强版报告已去重，可不调用）"""
-    # ... 保持原有代码不变 ...
-    # 为了节省篇幅，此处省略，实际使用时复制原代码中的deduplicate_report函数
-    pass
+    """集成去重功能（保留，但增强版报告已内嵌去重）"""
+    print('\n' + '='*80)
+    print('【集成去重处理】')
+    print('='*80)
+    
+    print(f'\n正在读取报告: {input_file}')
+    df = pd.read_excel(input_file)
+    print(f'  原始记录数: {len(df)}')
+    
+    # 标准化分子式
+    print('\n步骤1: 标准化分子式（去除Unicode下标）')
+    df['分子式_标准化'] = df['分子式'].apply(normalize_formula)
+    changes = (df['分子式'] != df['分子式_标准化']).sum()
+    print(f'  分子式标准化变化数: {changes}')
+    
+    # 合并同一化合物
+    print('\n步骤2: 合并同一化合物（合并正负离子模式结果）')
+    df['化合物ID'] = df['化合物中文名'].str.strip() + '_' + df['分子式_标准化'].str.strip()
+    
+    def select_best(group):
+        sorted_group = group.sort_values(by=['评级', 'ppm'], ascending=[True, True])
+        return sorted_group.iloc[0]
+    
+    def aggregate_modes(group):
+        best = select_best(group)
+        modes = group['离子化方式'].unique()
+        best['离子化方式'] = '/'.join(modes)
+        return best
+    
+    df_dedup = df.groupby('化合物ID', as_index=False).apply(aggregate_modes, include_groups=False)
+    print(f'  合并后记录数: {len(df_dedup)}')
+    
+    # 最终去重
+    print('\n步骤3: 最终去重（保留最佳评级和最小ppm）')
+    df_dedup = df_dedup.sort_values(by=['评级', 'ppm'], ascending=[True, True])
+    df_dedup = df_dedup.drop_duplicates(subset=['化合物ID'], keep='first')
+    print(f'  最终记录数: {len(df_dedup)}')
+    
+    # 清理并保存
+    print('\n步骤4: 生成最终报告')
+    for col in ['化合物ID', '分子式_标准化']:
+        if col in df_dedup.columns:
+            df_dedup = df_dedup.drop(columns=[col])
+    
+    df_dedup = df_dedup.sort_values(by=['评级', 'ppm'], ascending=[True, True])
+    df_dedup = df_dedup.reset_index(drop=True)
+    df_dedup['序号'] = range(1, len(df_dedup) + 1)
+    
+    df_dedup.to_excel(output_file, index=False)
+    print(f'  报告已保存至: {output_file}')
+    
+    # 统计报告
+    print('\n' + '='*80)
+    print('去重统计报告')
+    print('='*80)
+    print(f'原始记录数: {len(df)}')
+    print(f'最终记录数: {len(df_dedup)}')
+    print(f'去除重复: {len(df) - len(df_dedup)} 条 ({100*(len(df) - len(df_dedup))/len(df):.1f}%)')
+    
+    print('\n【评级分布】')
+    for level in ['确证级', '高置信级', '推定级', '提示级', '参考级']:
+        count = (df_dedup['评级名称'] == level).sum()
+        print(f'  - {level}: {count} 个')
+    
+    print('\n【ppm误差分布】')
+    ppm_10 = (df_dedup['ppm'] <= 10).sum()
+    ppm_20 = ((df_dedup['ppm'] > 10) & (df_dedup['ppm'] <= 20)).sum()
+    ppm_50 = ((df_dedup['ppm'] > 20) & (df_dedup['ppm'] <= 50)).sum()
+    print(f'  - ≤10ppm: {ppm_10} 个 ({100*ppm_10/len(df_dedup):.1f}%)')
+    print(f'  - 10-20ppm: {ppm_20} 个 ({100*ppm_20/len(df_dedup):.1f}%)')
+    print(f'  - 20-50ppm: {ppm_50} 个 ({100*ppm_50/len(df_dedup):.1f}%)')
+    
+    print('\n【药材来源分布（前10）】')
+    for herb, count in df_dedup['药材名称'].value_counts().head(10).items():
+        print(f'  - {herb}: {count} 个')
+    
+    print('\n【确证级化合物列表（前15）】')
+    confirmed = df_dedup[df_dedup['评级'] == 1].head(15)
+    for _, row in confirmed.iterrows():
+        print(f'  - {row["化合物中文名"]} ({row["分子式"]}) - ppm={row["ppm"]:.4f}')
+    
+    return df_dedup
 
 
 # ============================================================================
@@ -874,10 +997,60 @@ def find_diagnostic_ion_path():
 
 
 def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_mode=None):
-    """匹配诊断离子（保持不变）"""
-    # ... 原函数代码 ...
-    # 为节省篇幅，此处省略，实际使用时复制原代码
-    pass
+    """匹配诊断离子（用于单独筛查功能）"""
+    if diagnostic_df.empty or not user_mz_values:
+        return pd.DataFrame()
+    
+    # 过滤离子模式
+    if ion_mode and ion_mode != "全部":
+        filtered_df = diagnostic_df[diagnostic_df['离子模式'] == ion_mode].copy()
+    else:
+        filtered_df = diagnostic_df.copy()
+    
+    # 确保m/z列为数值类型
+    if '诊断碎片离子m/z' not in filtered_df.columns:
+        return pd.DataFrame()
+    
+    filtered_df = filtered_df.dropna(subset=['诊断碎片离子m/z'])
+    
+    if filtered_df.empty:
+        return pd.DataFrame()
+    
+    results = []
+    
+    for user_mz in user_mz_values:
+        user_mz = float(user_mz)
+        tolerance = user_mz * tolerance_ppm / 1e6
+        
+        mz_min = user_mz - tolerance
+        mz_max = user_mz + tolerance
+        
+        matches = filtered_df[
+            (filtered_df['诊断碎片离子m/z'] >= mz_min) & 
+            (filtered_df['诊断碎片离子m/z'] <= mz_max)
+        ]
+        
+        for _, row in matches.iterrows():
+            ref_mz = row['诊断碎片离子m/z']
+            ppm_error = abs(user_mz - ref_mz) / ref_mz * 1e6
+            
+            results.append({
+                '输入m/z': user_mz,
+                '匹配诊断离子m/z': ref_mz,
+                '误差(ppm)': round(ppm_error, 4),
+                '化合物类型': row.get('化合物类型', ''),
+                '离子模式': row.get('离子模式', ''),
+                '中文名称': row.get('中文名称', ''),
+                '英文名称': row.get('英文名称', ''),
+                '分子式': row.get('分子式', ''),
+                '药材名': row.get('药材名', ''),
+                '准分子离子m/z': row.get('准分子离子m/z', ''),
+                '加合形式': row.get('加合形式', ''),
+                '相对丰度': row.get('相对丰度', ''),
+                '类特征性离子': row.get('类特征性离子', False)
+            })
+    
+    return pd.DataFrame(results)
 
 
 # ============================================================================
@@ -886,23 +1059,142 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.0（增强版）",
+    page_title="中药化合物智能鉴定平台 v5.1（增强版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 设置中文字体支持（同原代码）
+# 设置中文字体支持
 st.markdown("""
 <style>
-    /* 样式同原代码，此处省略 */
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap');
+    
+    * {
+        font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif !important;
+    }
+    
+    .main-header {
+        background: linear-gradient(135deg, #2E7D32 0%, #1976D2 100%);
+        padding: 2rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+        color: white;
+    }
+    
+    .feature-card {
+        background: white;
+        border-radius: 10px;
+        padding: 1.5rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        margin-bottom: 1rem;
+        border-left: 4px solid #2E7D32;
+    }
+    
+    .stat-box {
+        background: linear-gradient(135deg, #f5f7fa 0%, #e4e8eb 100%);
+        border-radius: 8px;
+        padding: 1rem;
+        text-align: center;
+        margin: 0.5rem 0;
+    }
+    
+    .stat-number {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #2E7D32;
+    }
+    
+    .stat-label {
+        font-size: 0.9rem;
+        color: #666;
+    }
+    
+    .level-1 { background-color: #28a745; color: white; }
+    .level-2 { background-color: #17a2b8; color: white; }
+    .level-3 { background-color: #ffc107; color: black; }
+    .level-4 { background-color: #fd7e14; color: white; }
+    .level-5 { background-color: #6c757d; color: white; }
+    
+    .stDataFrame {
+        border-radius: 8px;
+    }
+    
+    div[data-testid="stExpander"] {
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
 def load_css():
-    """加载自定义CSS样式（同原代码）"""
-    pass
+    """加载自定义CSS样式"""
+    st.markdown("""
+    <style>
+        /* 整体应用样式 */
+        .stApp {
+            background: linear-gradient(180deg, #f8f9fa 0%, #ffffff 100%);
+        }
+        
+        /* 标题样式 */
+        h1, h2, h3 {
+            color: #2E7D32 !important;
+            font-weight: 600 !important;
+        }
+        
+        /* 侧边栏样式 */
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #ffffff 0%, #f5f7fa 100%);
+            border-right: 1px solid #e0e0e0;
+        }
+        
+        /* 按钮样式 */
+        .stButton > button {
+            background: linear-gradient(135deg, #2E7D32 0%, #1976D2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 0.5rem 1rem;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        
+        .stButton > button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(46, 125, 50, 0.4);
+        }
+        
+        /* 进度条样式 */
+        .stProgress > div > div {
+            background: linear-gradient(90deg, #2E7D32 0%, #1976D2 100%);
+        }
+        
+        /* 文件上传样式 */
+        [data-testid="stFileUploader"] {
+            border: 2px dashed #2E7D32;
+            border-radius: 10px;
+            padding: 2rem;
+            background: rgba(46, 125, 50, 0.05);
+        }
+        
+        /* 表格样式 */
+        .dataframe {
+            font-size: 0.9rem;
+        }
+        
+        /* 指标卡片 */
+        [data-testid="stMetricValue"] {
+            font-size: 1.5rem !important;
+            color: #2E7D32;
+        }
+        
+        /* 警告和信息框 */
+        .stAlert {
+            border-radius: 8px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
 
 def create_header():
@@ -910,13 +1202,13 @@ def create_header():
     st.markdown("""
     <div class="main-header">
         <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（增强版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于综合评分的智能鉴定工具 v5.0（云端版）</p>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于综合评分和外部诊断离子的智能鉴定工具 v5.1（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
 
 def create_sidebar():
-    """创建侧边栏导航（同原代码）"""
+    """创建侧边栏导航"""
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1rem 0;">
         <h2 style="color: #2E7D32; margin-bottom: 0.5rem;">🔬 TCM Identifier</h2>
@@ -933,11 +1225,11 @@ def create_sidebar():
     
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.0（增强版）
+    - 程序版本：v5.1（增强版）
     - 数据库规模：35,828条化合物记录
-    - 诊断离子：84,433条记录
+    - 诊断离子：支持外部文件
     - 支持药材：291种
-    - 核心特点：综合评分、保留时间匹配、中性丢失分析
+    - 核心特点：综合评分、保留时间匹配、中性丢失分析、外部诊断离子
     """)
     
     st.sidebar.markdown("""
@@ -951,13 +1243,95 @@ def create_sidebar():
 
 
 def show_home_page():
-    """首页（同原代码，可稍作修改）"""
+    """首页"""
     create_header()
-    # ... 省略，与原代码类似 ...
+    
+    st.markdown("## 📊 系统概览")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown("""
+        <div class="stat-box">
+            <div class="stat-number">35,828</div>
+            <div class="stat-label">数据库化合物数</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown("""
+        <div class="stat-box">
+            <div class="stat-number">291</div>
+            <div class="stat-label">支持药材种类</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown("""
+        <div class="stat-box">
+            <div class="stat-number">6</div>
+            <div class="stat-label">鉴定评级级别</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col4:
+        st.markdown("""
+        <div class="stat-box">
+            <div class="stat-number">400+</div>
+            <div class="stat-label">化合物类型</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.markdown("## ✨ 核心功能")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("""
+        <div class="feature-card">
+            <h4>🔍 智能化合物鉴定</h4>
+            <p>基于高分辨质谱数据，在35,828条数据库记录中进行精准匹配，支持正负离子模式。</p>
+        </div>
+        <div class="feature-card">
+            <h4>📈 六级评级标准</h4>
+            <p>确证级、高置信级、推定级、提示级、参考级、排除级，科学评估鉴定结果可靠性。</p>
+        </div>
+        <div class="feature-card">
+            <h4>🧪 外部诊断离子</h4>
+            <p>支持上传自定义诊断离子文件（诊断离子.xlsx），灵活适配各类化合物特征。</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown("""
+        <div class="feature-card">
+            <h4>⚡ 综合评分系统</h4>
+            <p>综合ppm、碎片覆盖率、诊断离子、保留时间、中性丢失计算得分，择优输出。</p>
+        </div>
+        <div class="feature-card">
+            <h4>🌱 药材来源分析</h4>
+            <p>详细统计鉴定结果的药材来源分布，帮助筛选目标药材的特征化合物。</p>
+        </div>
+        <div class="feature-card">
+            <h4>🚀 云端优化</h4>
+            <p>采用缓存和并行处理，支持Streamlit Community Cloud一键部署。</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.markdown("## 🚀 快速开始")
+    st.info("""
+    ### 使用步骤
+    1. **准备数据**：准备好质谱数据文件（Excel格式）和数据库文件（TCM-SM-MS DB.xlsx）
+    2. **上传文件**：在"开始鉴定"页面上传正负离子质谱数据
+    3. **可选**：上传自定义诊断离子文件（诊断离子.xlsx）
+    4. **配置参数**：设置ppm容差、保留时间容差等参数
+    5. **运行鉴定**：点击"开始鉴定"按钮进行分析
+    6. **查看结果**：在"结果分析"页面查看和导出鉴定报告
+    """)
+    
+    if st.button("立即开始鉴定 →", type="primary"):
+        st.session_state['page'] = '开始鉴定'
+        st.rerun()
 
 
 def show_analysis_page():
-    """鉴定分析页面（增强版：增加保留时间容差设置）"""
+    """鉴定分析页面（增强版：增加外部诊断离子上传）"""
     create_header()
     
     st.markdown("## 📁 上传质谱数据")
@@ -965,8 +1339,18 @@ def show_analysis_page():
     col1, col2 = st.columns(2)
     with col1:
         ms_positive_file = st.file_uploader("上传正离子模式质谱数据 (.xlsx)", type=['xlsx'], key='ms_positive')
+        if ms_positive_file:
+            st.success(f"✅ 已上传: {ms_positive_file.name}")
     with col2:
         ms_negative_file = st.file_uploader("上传负离子模式质谱数据 (.xlsx)", type=['xlsx'], key='ms_negative')
+        if ms_negative_file:
+            st.success(f"✅ 已上传: {ms_negative_file.name}")
+    
+    st.markdown("---")
+    st.markdown("## 🧪 外部诊断离子（可选）")
+    diagnostic_file = st.file_uploader("上传自定义诊断离子文件 (.xlsx，格式：化合物类型、诊断碎片离子m/z)", type=['xlsx'], key='diagnostic')
+    if diagnostic_file:
+        st.success(f"✅ 已上传诊断离子文件: {diagnostic_file.name}")
     
     st.markdown("---")
     st.markdown("## ⚙️ 鉴定参数配置")
@@ -1010,10 +1394,16 @@ def show_analysis_page():
                     with open(neg_path, 'wb') as f:
                         f.write(ms_negative_file.getbuffer())
                     
+                    # 保存诊断离子文件（如果有）
+                    diag_path = None
+                    if diagnostic_file:
+                        diag_path = os.path.join(temp_dir, diagnostic_file.name)
+                        with open(diag_path, 'wb') as f:
+                            f.write(diagnostic_file.getbuffer())
+                    
                     db_path = find_database_path()
                     if not db_path:
-                        st.error("未找到数据库文件！")
-                        st.info("请将数据库文件放在项目目录下。")
+                        st.error("未找到数据库文件！请将 TCM-SM-MS DB.xlsx 放在项目目录下。")
                         return
                     
                     st.info(f"✅ 已找到数据库文件: {db_path}")
@@ -1031,7 +1421,8 @@ def show_analysis_page():
                         herb_name=herb_name,
                         use_parallel=use_parallel,
                         rt_tolerance=rt_tolerance,
-                        loss_tolerance=loss_tolerance
+                        loss_tolerance=loss_tolerance,
+                        external_diagnostic_file=diag_path
                     )
                     
                     status_text.text("【6/7】正在处理质谱数据...")
@@ -1042,7 +1433,6 @@ def show_analysis_page():
                     progress_bar.progress(80)
                     status_text.text("【7/7】生成报告...")
                     
-                    # 保存结果到session state
                     st.session_state['analysis_results'] = report
                     st.session_state['identifier'] = identifier
                     
@@ -1062,8 +1452,182 @@ def show_analysis_page():
         st.warning("⚠️ 请先上传正负离子模式的质谱数据文件")
 
 
+def show_diagnostic_ion_page():
+    """诊断离子筛查页面（独立功能）"""
+    create_header()
+    
+    st.markdown("## 🔬 诊断离子筛查")
+    st.markdown("根据输入的m/z值，在诊断离子数据库中查找匹配的化合物特征离子，帮助快速识别化合物类别。")
+    
+    diagnostic_df = load_diagnostic_ions_cached()
+    
+    if diagnostic_df.empty:
+        st.error("未找到诊断离子数据库文件（诊断离子.xlsx），请将文件放在项目目录下。")
+        return
+    
+    st.success(f"✅ 已加载诊断离子数据库，包含 {len(diagnostic_df)} 条记录")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        if '化合物类型' in diagnostic_df.columns:
+            st.metric("化合物类型", diagnostic_df['化合物类型'].nunique())
+    with col2:
+        if '药材名' in diagnostic_df.columns:
+            st.metric("药材种类", diagnostic_df['药材名'].nunique())
+    with col3:
+        if '诊断碎片离子m/z' in diagnostic_df.columns:
+            st.metric("诊断离子数", diagnostic_df['诊断碎片离子m/z'].nunique())
+    with col4:
+        if '类特征性离子' in diagnostic_df.columns:
+            char_ions = diagnostic_df[diagnostic_df['类特征性离子'] == True].shape[0]
+            st.metric("类特征性离子", char_ions)
+    
+    st.markdown("---")
+    st.markdown("### 📥 输入m/z值")
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        mz_input = st.text_area(
+            "输入m/z值（每行一个值，或用逗号分隔）",
+            placeholder="例如：\n151.003\n137.024, 121.029",
+            height=150
+        )
+    with col2:
+        st.markdown("#### 参数设置")
+        tolerance_ppm = st.number_input("ppm容差", min_value=1, max_value=100, value=10)
+        ion_mode = st.selectbox("离子模式", options=["全部", "正离子", "负离子"], index=0)
+        show_only_class_specific = st.checkbox("仅显示类特征性离子", value=False)
+    
+    def parse_mz_values(input_text):
+        if not input_text or not input_text.strip():
+            return []
+        for sep in [',', ';', '\t', ' ']:
+            if sep in input_text:
+                input_text = input_text.replace(sep, '\n')
+        mz_values = []
+        for line in input_text.strip().split('\n'):
+            line = line.strip()
+            if line:
+                try:
+                    mz_values.append(float(line))
+                except ValueError:
+                    continue
+        return mz_values
+    
+    if mz_input:
+        user_mz_values = parse_mz_values(mz_input)
+        if not user_mz_values:
+            st.warning("⚠️ 无法解析输入的m/z值，请检查输入格式。")
+        else:
+            st.markdown("---")
+            with st.spinner("正在匹配诊断离子..."):
+                results_df = match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=tolerance_ppm, ion_mode=ion_mode)
+            
+            if show_only_class_specific and not results_df.empty:
+                results_df = results_df[results_df['类特征性离子'] == True]
+            
+            st.markdown("### 📊 匹配结果统计")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("输入离子数", len(user_mz_values))
+            with col2:
+                matched_ions = results_df['输入m/z'].nunique() if not results_df.empty else 0
+                st.metric("匹配离子数", matched_ions)
+            with col3:
+                matched_compounds = results_df['化合物类型'].nunique() if not results_df.empty else 0
+                st.metric("化合物类型数", matched_compounds)
+            
+            if not results_df.empty:
+                st.markdown("#### 化合物类型分布")
+                type_dist = results_df['化合物类型'].value_counts()
+                st.bar_chart(type_dist)
+                
+                st.markdown("### 📋 匹配结果详情")
+                display_cols = ['输入m/z', '匹配诊断离子m/z', '误差(ppm)', '化合物类型', '离子模式', '中文名称', '英文名称', '药材名', '类特征性离子']
+                available_cols = [c for c in display_cols if c in results_df.columns]
+                st.dataframe(results_df[available_cols], use_container_width=True, hide_index=True)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    csv = results_df.to_csv(index=False, encoding='utf-8-sig')
+                    st.download_button("📥 导出CSV", data=csv, file_name=f"诊断离子筛查_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
+                with col2:
+                    buffer = BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        results_df.to_excel(writer, index=False, sheet_name='诊断离子匹配结果')
+                    st.download_button("📥 导出Excel", data=buffer.getvalue(), file_name=f"诊断离子筛查_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                st.info("未找到匹配的诊断离子，请尝试增大ppm容差或更换离子模式。")
+
+
+def show_guide_page():
+    """使用指南页面"""
+    create_header()
+    st.markdown("## 📖 使用指南（增强版）")
+    st.info("""
+    ### 新增功能说明
+    - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。
+    - **综合评分**：根据ppm、碎片覆盖率、诊断离子、保留时间、中性丢失计算综合得分，得分越高置信度越高。
+    - **保留时间匹配**：若数据库包含'保留时间(min)'列，程序将利用保留时间进行辅助筛选。
+    - **中性丢失分析**：若数据库包含'中性丢失'列（如162.0528,176.0321），程序将匹配中性丢失，提高区分度。
+    - **择优输出**：每个母离子仅返回得分最高的候选，减少冗余。
+    
+    ### 评级标准（同原六级标准）
+    - 确证级、高置信级、推定级、提示级、参考级、排除级
+    
+    ### 使用步骤
+    1. 上传正负离子质谱数据（Excel）
+    2. （可选）上传自定义诊断离子文件
+    3. 设置参数（ppm容差、保留时间容差等）
+    4. 点击开始鉴定
+    5. 在结果页面查看综合得分和评级
+    """)
+
+
+def show_database_page():
+    """数据库预览页面"""
+    create_header()
+    st.markdown("## 🗃️ 数据库预览")
+    
+    db_path = find_database_path()
+    if not db_path:
+        st.error("未找到数据库文件！请将 TCM-SM-MS DB.xlsx 放在项目目录下。")
+        return
+    
+    try:
+        with st.spinner("正在加载数据库..."):
+            df = load_database_cached()
+        if df.empty:
+            st.error("数据库文件为空或无法读取！")
+            return
+        
+        st.success(f"✅ 成功加载数据库，包含 {len(df)} 条化合物记录")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("总记录数", len(df))
+        with col2:
+            herb_count = df['药材名称'].nunique() if '药材名称' in df.columns else 0
+            st.metric("药材种类", herb_count)
+        with col3:
+            type_count = df['化合物类型'].nunique() if '化合物类型' in df.columns else 0
+            st.metric("化合物类型", type_count)
+        with col4:
+            if '准分子离子（正）' in df.columns:
+                valid_mz = df['准分子离子（正）'].notna().sum()
+                st.metric("有效正离子记录", valid_mz)
+        
+        st.info(f"数据库文件路径: {db_path}")
+        st.markdown("### 数据库预览（前10行）")
+        st.dataframe(df.head(10), use_container_width=True)
+        
+    except Exception as e:
+        st.error(f"加载数据库时出错：{str(e)}")
+        st.exception(e)
+
+
 def show_results_page():
-    """结果分析页面（增强版：增加综合得分显示）"""
+    """结果分析页面（增强版）"""
     create_header()
     
     if 'analysis_results' not in st.session_state:
@@ -1081,7 +1645,6 @@ def show_results_page():
         st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
         return
     
-    # 统计信息
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("鉴定化合物总数", len(report))
@@ -1095,18 +1658,15 @@ def show_results_page():
         avg_score = report['综合得分'].mean()
         st.metric("平均综合得分", f"{avg_score:.1f}")
     
-    # 评级分布
     st.markdown("### 📊 评级分布")
     level_counts = report['评级名称'].value_counts()
     st.bar_chart(level_counts.reindex(['确证级', '高置信级', '推定级', '提示级', '参考级']).fillna(0))
     
-    # 得分分布
     st.markdown("### 📈 综合得分分布")
     score_bins = pd.cut(report['综合得分'], bins=[0, 30, 50, 70, 80, 100], labels=['<30', '30-50', '50-70', '70-80', '80-100'])
     score_dist = score_bins.value_counts().sort_index()
     st.bar_chart(score_dist)
     
-    # 详细表格
     st.markdown("### 📋 完整鉴定结果")
     
     all_columns = report.columns.tolist()
@@ -1130,7 +1690,6 @@ def show_results_page():
         }
     )
     
-    # 导出
     st.markdown("---")
     st.markdown("### 📥 导出报告")
     
@@ -1143,35 +1702,6 @@ def show_results_page():
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             report.to_excel(writer, index=False, sheet_name='鉴定结果')
         st.download_button(label="📥 导出Excel", data=buffer.getvalue(), file_name=f"鉴定报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-def show_guide_page():
-    """使用指南页面（增强版：说明新增功能）"""
-    create_header()
-    st.markdown("## 📖 使用指南（增强版）")
-    st.info("""
-    ### 新增功能说明
-    - **综合评分**：根据ppm、碎片覆盖率、诊断离子、保留时间、中性丢失计算综合得分，得分越高置信度越高。
-    - **保留时间匹配**：若数据库包含'保留时间(min)'列，程序将利用保留时间进行辅助筛选。
-    - **中性丢失分析**：若数据库包含'中性丢失'列（如162.0528,176.0321），程序将匹配中性丢失，提高区分度。
-    - **择优输出**：每个母离子仅返回得分最高的候选，减少冗余。
-    
-    ### 评级标准（同原六级标准）
-    - 确证级、高置信级、推定级、提示级、参考级、排除级
-    
-    ### 使用步骤
-    1. 上传正负离子质谱数据（Excel）
-    2. 设置参数（ppm容差、保留时间容差等）
-    3. 点击开始鉴定
-    4. 在结果页面查看综合得分和评级
-    """)
-
-
-def show_database_page():
-    """数据库预览页面（同原代码，可略）"""
-    create_header()
-    st.markdown("## 🗃️ 数据库预览")
-    # ... 省略，与原代码类似 ...
 
 
 def main():
@@ -1189,9 +1719,7 @@ def main():
     elif page == "开始鉴定":
         show_analysis_page()
     elif page == "诊断离子筛查":
-        # 可复用原诊断离子页面函数
-        # 此处略，实际使用需包含原函数
-        st.info("诊断离子筛查功能与原版相同")
+        show_diagnostic_ion_page()
     elif page == "使用指南":
         show_guide_page()
     elif page == "数据库预览":
