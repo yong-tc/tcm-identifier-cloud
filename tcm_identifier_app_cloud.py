@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.2
+中药化合物智能鉴定平台 - 云端部署增强版 v5.4
 ==============================================
 
 功能特点：
 - 自动加载项目目录下的诊断离子.xlsx（如果存在）
 - 支持上传自定义诊断离子文件覆盖默认
-- 综合置信度评分（ppm、碎片覆盖率、诊断离子、保留时间、中性丢失）
+- 综合置信度评分（ppm、碎片覆盖率、诊断离子、中性丢失）
+- 优化的评分策略：放宽ppm误差范围、提高碎片和诊断离子权重
 - 择优输出最佳候选，自动区分同分异构体
 - 六级评级标准 + 综合得分辅助判断
-- 智能去重基于得分
-- 报告列优化：删除冗余列、完整显示匹配碎片和诊断离子、正确统计文献来源数
+- 智能去重基于得分，并合并所有药材来源
+- 分子式标准化（去除Unicode下标）
+- 加和离子字段清洗（多值时只取第一个）
 
-作者：MiniMax Agent
+作者：张永
 日期：2026-03-12
-版本：v5.2（增强版 + 自动加载诊断离子）
+版本：v5.4（评分优化版）
 """
 
 import streamlit as st
@@ -31,20 +33,22 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 鉴定程序核心代码（增强版 + 自动加载诊断离子）
+# 鉴定程序核心代码（评分优化版）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.2（增强版 + 自动加载诊断离子）
+    中药化合物鉴定终极版程序 v5.4（评分优化版）
     
     新增特性：
     1. 支持外部诊断离子文件（Excel格式），自动查找项目目录下的诊断离子.xlsx
-    2. 综合置信度评分系统
-    3. 保留时间匹配（需数据库含'保留时间(min)'列）
-    4. 中性丢失匹配（需数据库含'中性丢失'列或外部规则文件）
+    2. 综合置信度评分系统（优化：放宽ppm、提高碎片和诊断离子权重）
+    3. 保留时间匹配已移除（根据用户要求）
+    4. 中性丢失匹配权重降为5分
     5. 择优输出：每个母离子仅返回得分最高的候选
-    6. 去重基于得分而非丰度
+    6. 去重基于得分，并合并所有药材来源
+    7. 分子式标准化（去除Unicode下标）
+    8. 加和离子字段清洗（多值时只取第一个）
     """
     
     def __init__(self, database_path, ms_positive_path, ms_negative_path, 
@@ -64,13 +68,12 @@ class UltimateGardeniaIdentifier:
             'min_intensity': 100,
             'ppm_tier1': 10,
             'ppm_tier2': 20,
-            # 新增评分权重（内部使用）
+            # 评分权重（优化版）
             'score_weights': {
                 'ppm': 40,
-                'frag_coverage': 30,
-                'diagnostic': 10,
-                'rt': 10,
-                'neutral_loss': 10
+                'frag_coverage': 40,       # 碎片覆盖率权重提高
+                'diagnostic': 15,           # 诊断离子权重提高
+                'neutral_loss': 5            # 中性丢失权重降低
             }
         }
         
@@ -79,7 +82,7 @@ class UltimateGardeniaIdentifier:
             self.config.update(config)
         
         # 新增参数
-        self.rt_tolerance = rt_tolerance          # 保留时间容差（分钟）
+        self.rt_tolerance = rt_tolerance          # 保留时间容差（分钟）（虽已不使用，但保留参数兼容）
         self.loss_tolerance = loss_tolerance      # 中性丢失质量容差（Da）
         
         # 目标药材名称
@@ -91,7 +94,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.2（增强版 + 自动加载诊断离子）")
+        print("中药化合物鉴定程序 v5.4（评分优化版）")
         print("="*80)
         print("\n【1/7】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -169,7 +172,7 @@ class UltimateGardeniaIdentifier:
         return filtered_db
     
     def _build_optimized_index(self):
-        """构建优化索引（增强版：保留额外信息）"""
+        """构建优化索引（增强版：保留额外信息，并对分子式标准化）"""
         self.sorted_idx_pos = []
         self.sorted_idx_neg = []
         self.mz_values_pos = []
@@ -179,7 +182,6 @@ class UltimateGardeniaIdentifier:
         self.compound_info = {}
         
         # 额外存储用于评分的字段
-        self.rt_values = {}          # 保留时间，键为db_idx
         self.neutral_losses = {}      # 中性丢失列表，键为db_idx
         
         for idx, row in self.database.iterrows():
@@ -189,6 +191,9 @@ class UltimateGardeniaIdentifier:
             cn_name = str(row.get('名称（中文）', ''))
             en_name = str(row.get('名称（英文）', ''))
             formula = str(row.get('分子式', ''))
+            # 标准化分子式
+            if formula and formula != 'nan':
+                formula = normalize_formula(formula)
             herb = str(row.get('药材名称', ''))
             compound_type = str(row.get('化合物类型', ''))
             source = str(row.get('文献来源', ''))
@@ -205,13 +210,6 @@ class UltimateGardeniaIdentifier:
                 'adduct_pos': str(row.get('加合物（正）', '')),
                 'adduct_neg': str(row.get('加合物（负）', ''))
             }
-            
-            # 加载保留时间（如果存在）
-            if '保留时间(min)' in row and pd.notna(row['保留时间(min)']):
-                try:
-                    self.rt_values[idx] = float(row['保留时间(min)'])
-                except:
-                    pass
             
             # 加载中性丢失（如果存在）
             if '中性丢失' in row and pd.notna(row['中性丢失']):
@@ -462,17 +460,22 @@ class UltimateGardeniaIdentifier:
     def _score_candidate(self, candidate, precursor, db_idx):
         """
         计算候选化合物的综合置信度得分（越高越好）
+        优化版：放宽ppm误差，提高碎片和诊断离子权重，移除保留时间
         """
         weights = self.config['score_weights']
         score = 0.0
         details = {}
         
-        # 1. ppm得分（满分 weights['ppm']）
+        # 1. ppm得分（满分 weights['ppm']）- 放宽范围
         ppm = candidate['ppm']
         if ppm <= 5:
-            ppm_score = weights['ppm']
-        elif ppm <= 20:
-            ppm_score = weights['ppm'] * (1 - (ppm - 5) / 15)
+            ppm_score = weights['ppm']  # 40
+        elif ppm <= 15:
+            ppm_score = 30  # 固定值，可调节
+        elif ppm <= 30:
+            ppm_score = 20
+        elif ppm <= 50:
+            ppm_score = 10
         else:
             ppm_score = 0
         details['ppm'] = ppm_score
@@ -487,25 +490,12 @@ class UltimateGardeniaIdentifier:
             frag_score = 0
         details['frag_coverage'] = frag_score
         
-        # 3. 诊断离子奖励
+        # 3. 诊断离子奖励（每个7分，上限15）
         diag_count = len(candidate['diagnostic_ions'])
-        diag_score = min(diag_count * 5, weights['diagnostic'])  # 每个诊断离子5分，上限权重
+        diag_score = min(diag_count * 7, weights['diagnostic'])  # 每个7分
         details['diagnostic'] = diag_score
         
-        # 4. 保留时间匹配（如果有）
-        rt_score = 0
-        if db_idx in self.rt_values:
-            exp_rt = precursor.get('retention_time')
-            theo_rt = self.rt_values[db_idx]
-            if exp_rt is not None and exp_rt > 0:
-                rt_diff = abs(exp_rt - theo_rt)
-                if rt_diff <= self.rt_tolerance:
-                    rt_score = weights['rt']
-                elif rt_diff <= self.rt_tolerance * 2:
-                    rt_score = weights['rt'] * 0.5
-        details['rt'] = rt_score
-        
-        # 5. 中性丢失匹配
+        # 4. 中性丢失匹配（权重5分）
         loss_score = 0
         if db_idx in self.neutral_losses:
             expected_losses = self.neutral_losses[db_idx]
@@ -517,11 +507,11 @@ class UltimateGardeniaIdentifier:
                     if abs(exp - obs) <= self.loss_tolerance:
                         match_count += 1
                         break
-            loss_score = min(match_count * 5, weights['neutral_loss'])  # 每个匹配5分
+            loss_score = min(match_count * 2.5, weights['neutral_loss'])  # 每个匹配2.5分，总分5
         details['neutral_loss'] = loss_score
         
         # 总得分
-        score = ppm_score + frag_score + diag_score + rt_score + loss_score
+        score = ppm_score + frag_score + diag_score + loss_score
         details['total'] = score
         
         return score, details
@@ -625,7 +615,7 @@ class UltimateGardeniaIdentifier:
             candidate = {
                 'name_cn': info['name_cn'],
                 'name_en': info['name_en'],
-                'formula': info['formula'] if info['formula'] and info['formula'] != 'nan' else '待确定',
+                'formula': info['formula'],  # 已标准化
                 'cas': info['cas'],
                 'herb': info['herb'],
                 'compound_type': info['compound_type'],
@@ -658,12 +648,13 @@ class UltimateGardeniaIdentifier:
             return scored_candidates[:return_top]
     
     def generate_report(self, herb_name=None):
-        """生成化合物鉴定报告（增强版：择优输出，基于得分去重，报告列优化）"""
+        """生成化合物鉴定报告（增强版：择优输出，合并所有药材来源）"""
         if herb_name is None:
             herb_name = self.herb_name if self.herb_name else '中药'
         
-        results = []
-        compound_best_record = {}  # 键为(中文名,分子式)，值为(记录,得分)
+        # 用于存储最佳记录和所有药材集合
+        best_records = {}      # 键: (name_cn, formula) -> (record, score)
+        herbs_collection = {}  # 键: (name_cn, formula) -> set of herbs
         
         # 处理正离子模式
         print(f"\n【6/7】正在处理 {herb_name} 正离子模式质谱数据...")
@@ -707,7 +698,6 @@ class UltimateGardeniaIdentifier:
             # 处理文献来源：拆分并计数
             source_str = best_candidate.get('source', '')
             if pd.notna(source_str) and source_str:
-                # 假设来源以分号分隔，可根据实际调整
                 source_list = [s.strip() for s in str(source_str).split(';') if s.strip()]
                 source_count = len(source_list)
                 source_display = '; '.join(source_list)
@@ -719,22 +709,29 @@ class UltimateGardeniaIdentifier:
             matched_frags = best_candidate['matched_fragments']
             diag_ions = best_candidate['diagnostic_ions']
             
+            # 清洗加和离子：如果包含逗号或分号，只取第一个
+            adduct = best_candidate['adduct']
+            if adduct:
+                for sep in [',', ';']:
+                    if sep in adduct:
+                        adduct = adduct.split(sep)[0].strip()
+                        break
+            
             record = {
                 '序号': 0,
                 '出峰时间t/min': precursor['retention_time'],
                 '化合物中文名': best_candidate['name_cn'],
                 '化合物英文名': en_name,
-                '分子式': formula,
+                '分子式': formula,  # 已标准化
                 'CAS号': best_candidate['cas'],
-                '药材名称': best_candidate['herb'],  # 数据库中的原始字段，可能已包含多个药材
+                '药材名称': best_candidate['herb'],  # 临时值，后面会合并
                 '化合物类型': best_candidate['compound_type'],
                 '离子化方式': best_candidate['mode'],
-                '加和离子': best_candidate['adduct'],
+                '加和离子': adduct,
                 'm/z实际值': round(best_candidate['observed_mz'], 4),
                 'm/z理论值': round(best_candidate['theoretical_mz'], 4),
                 'ppm': round(best_candidate['ppm'], 4),
                 '是否有碎片数据': '是' if precursor['fragments'].size > 0 else '否',
-                # 删除冗余的'碎片离子数量'列
                 '主要碎片离子': '; '.join([f'{f:.4f}' for f in matched_frags]) if matched_frags else '',
                 '匹配碎片数': len(matched_frags),
                 '诊断性离子个数': len(diag_ions),
@@ -748,15 +745,25 @@ class UltimateGardeniaIdentifier:
                 '综合得分': round(best_candidate['score'], 2)
             }
             
-            # 去重：基于得分保留最佳记录
             compound_key = (best_candidate['name_cn'], formula)
-            current_score = best_candidate['score']
             
-            if compound_key not in compound_best_record or current_score > compound_best_record[compound_key][1]:
-                compound_best_record[compound_key] = (record, current_score)
+            # 收集药材名称
+            if compound_key not in herbs_collection:
+                herbs_collection[compound_key] = set()
+            herbs_collection[compound_key].add(best_candidate['herb'])
+            
+            # 更新最佳记录
+            current_score = best_candidate['score']
+            if compound_key not in best_records or current_score > best_records[compound_key][1]:
+                best_records[compound_key] = (record, current_score)
         
-        # 提取最终记录
-        results = [rec for rec, _ in compound_best_record.values()]
+        # 合并药材名称并生成最终报告
+        results = []
+        for compound_key, (record, _) in best_records.items():
+            herbs = herbs_collection[compound_key]
+            # 合并药材名称（去重后按字母排序）
+            record['药材名称'] = '; '.join(sorted(herbs))
+            results.append(record)
         
         # 生成DataFrame并排序
         report_df = pd.DataFrame(results)
@@ -818,7 +825,7 @@ class UltimateGardeniaIdentifier:
     def _print_initialization_info(self):
         """打印初始化信息"""
         print("\n" + "="*80)
-        print("程序初始化完成（增强版）")
+        print("程序初始化完成（评分优化版）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -826,7 +833,6 @@ class UltimateGardeniaIdentifier:
         print(f"  - 正离子质谱: {len(self.ms_positive)} 条记录")
         print(f"  - 负离子质谱: {len(self.ms_negative)} 条记录")
         print(f"  - 诊断性离子库: {len(self.diagnostic_ions)} 类")
-        print(f"  - 保留时间数据: {len(self.rt_values)} 条")
         print(f"  - 中性丢失数据: {len(self.neutral_losses)} 条")
         print(f"  - 并行处理: {'启用' if self.use_parallel else '禁用'}")
         print("="*80)
@@ -1081,7 +1087,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.2（增强版）",
+    page_title="中药化合物智能鉴定平台 v5.4（评分优化版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1223,8 +1229,8 @@ def create_header():
     """创建应用头部"""
     st.markdown("""
     <div class="main-header">
-        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（增强版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于综合评分和外部诊断离子的智能鉴定工具 v5.2（云端版）</p>
+        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（评分优化版）</h1>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于综合评分的智能鉴定工具 v5.4（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1234,7 +1240,7 @@ def create_sidebar():
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1rem 0;">
         <h2 style="color: #2E7D32; margin-bottom: 0.5rem;">🔬 TCM Identifier</h2>
-        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（增强版）</p>
+        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（评分优化版）</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1247,16 +1253,16 @@ def create_sidebar():
     
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.2（增强版）
+    - 程序版本：v5.4（评分优化版）
     - 数据库规模：35,828条化合物记录
     - 诊断离子：自动加载项目目录下的诊断离子.xlsx
     - 支持药材：291种
-    - 核心特点：综合评分、保留时间匹配、中性丢失分析、外部诊断离子
+    - 核心特点：优化评分（放宽ppm、提高碎片/诊断离子权重）、药材名称合并
     """)
     
     st.sidebar.markdown("""
     <div style="text-align: center; color: #999; font-size: 0.7rem; padding: 1rem 0;">
-        <p>© 2026 MiniMax Agent</p>
+        <p>© 2026 张永</p>
         <p>中药化合物智能鉴定平台</p>
     </div>
     """, unsafe_allow_html=True)
@@ -1322,12 +1328,12 @@ def show_home_page():
     with col2:
         st.markdown("""
         <div class="feature-card">
-            <h4>⚡ 综合评分系统</h4>
-            <p>综合ppm、碎片覆盖率、诊断离子、保留时间、中性丢失计算得分，择优输出。</p>
+            <h4>⚡ 优化评分系统</h4>
+            <p>放宽ppm误差范围，提高碎片匹配和诊断离子权重，综合得分更合理。</p>
         </div>
         <div class="feature-card">
-            <h4>🌱 药材来源分析</h4>
-            <p>详细统计鉴定结果的药材来源分布，帮助筛选目标药材的特征化合物。</p>
+            <h4>🌱 药材来源合并</h4>
+            <p>同一化合物的所有药材来源自动合并显示，实现“所有的药材”。</p>
         </div>
         <div class="feature-card">
             <h4>🚀 云端优化</h4>
@@ -1586,14 +1592,13 @@ def show_diagnostic_ion_page():
 def show_guide_page():
     """使用指南页面"""
     create_header()
-    st.markdown("## 📖 使用指南（增强版）")
+    st.markdown("## 📖 使用指南（评分优化版）")
     st.info("""
     ### 新增功能说明
     - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。若不上传，程序会自动加载项目目录下的诊断离子.xlsx（如果存在）。
-    - **综合评分**：根据ppm、碎片覆盖率、诊断离子、保留时间、中性丢失计算综合得分，得分越高置信度越高。
-    - **保留时间匹配**：若数据库包含'保留时间(min)'列，程序将利用保留时间进行辅助筛选。
-    - **中性丢失分析**：若数据库包含'中性丢失'列（如162.0528,176.0321），程序将匹配中性丢失，提高区分度。
+    - **优化评分系统**：放宽ppm误差范围（≤5得满分，≤15得30分，≤30得20分，≤50得10分），提高碎片覆盖率权重至40分，诊断离子每个7分（上限15分），中性丢失权重5分，取消保留时间评分。
     - **择优输出**：每个母离子仅返回得分最高的候选，减少冗余。
+    - **药材名称合并**：同一化合物的所有药材来源自动合并显示，实现“所有的药材”。
     
     ### 评级标准（同原六级标准）
     - 确证级、高置信级、推定级、提示级、参考级、排除级
@@ -1662,7 +1667,7 @@ def show_results_page():
     
     report = st.session_state['analysis_results']
     
-    st.markdown("## 📊 鉴定结果分析（增强版）")
+    st.markdown("## 📊 鉴定结果分析（评分优化版）")
     
     if report.empty:
         st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
