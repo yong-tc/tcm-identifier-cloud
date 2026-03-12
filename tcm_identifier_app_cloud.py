@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.7
+中药化合物智能鉴定平台 - 云端部署增强版 v5.8
 ==========================================================
 
 功能特点：
@@ -8,6 +8,7 @@
 - 支持上传自定义诊断离子文件覆盖默认
 - 碎片匹配时自动排除母离子，避免母离子被计入碎片
 - 诊断离子匹配时自动排除母离子
+- 利用同一保留时间窗口内同一化合物的不同加和离子信息提升可信度
 - 重新设计的综合评分系统：基于评级计算得分，确保1、2级≥60且总分≤100
 - 支持只上传正离子或负离子单个文件进行鉴定
 - 择优输出最佳候选，自动区分同分异构体
@@ -18,7 +19,7 @@
 
 作者：张永
 日期：2026-03-12
-版本：v5.7（优化版）
+版本：v5.8（多加和离子融合版）
 """
 
 import streamlit as st
@@ -35,29 +36,31 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 鉴定程序核心代码（优化版）
+# 鉴定程序核心代码（多加和离子融合版）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.7（优化版）
+    中药化合物鉴定终极版程序 v5.8（多加和离子融合版）
     
     新增特性：
     1. 支持外部诊断离子文件（Excel格式），自动查找项目目录下的诊断离子.xlsx
     2. 碎片匹配时自动排除母离子
     3. 诊断离子匹配时自动排除母离子
-    4. 重新设计的综合评分系统：基于评级、ppm、匹配碎片数、诊断离子个数计算，总分≤100
-    5. 支持只上传正离子或负离子单个文件进行鉴定
-    6. 择优输出：每个母离子仅返回得分最高的候选
-    7. 去重基于得分，并合并所有药材来源
-    8. 分子式标准化（去除Unicode下标）
-    9. 加和离子字段清洗（多值时只取第一个）
+    4. 利用同一保留时间窗口内同一化合物的不同加和离子信息提升可信度
+    5. 重新设计的综合评分系统：基于评级、ppm、匹配碎片数、诊断离子个数计算，总分≤100
+    6. 支持只上传正离子或负离子单个文件进行鉴定
+    7. 择优输出：每个母离子仅返回得分最高的候选
+    8. 去重基于得分，并合并所有药材来源
+    9. 分子式标准化（去除Unicode下标）
+    10. 加和离子字段清洗（多值时只取第一个）
     """
     
     def __init__(self, database_path, ms_positive_path, ms_negative_path, 
                  herb_name=None, config=None, use_parallel=True,
                  rt_tolerance=0.3, loss_tolerance=0.02,
-                 external_diagnostic_file=None):
+                 external_diagnostic_file=None,
+                 rt_fusion_tolerance=0.2):
         """初始化鉴定程序（增强版）"""
         # 默认配置参数
         self.config = {
@@ -78,8 +81,9 @@ class UltimateGardeniaIdentifier:
             self.config.update(config)
         
         # 新增参数
-        self.rt_tolerance = rt_tolerance          # 保留时间容差（分钟）（虽已不使用，但保留参数兼容）
+        self.rt_tolerance = rt_tolerance          # 保留时间容差（分钟）（用于CID模拟）
         self.loss_tolerance = loss_tolerance      # 中性丢失质量容差（Da）
+        self.rt_fusion_tolerance = rt_fusion_tolerance  # 用于融合多加和离子的保留时间容差
         
         # 目标药材名称
         self.herb_name = herb_name
@@ -90,7 +94,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.7（优化版）")
+        print("中药化合物鉴定程序 v5.8（多加和离子融合版）")
         print("="*80)
         print("\n【1/7】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -656,7 +660,7 @@ class UltimateGardeniaIdentifier:
             return scored_candidates[:return_top]
     
     def generate_report(self, herb_name=None):
-        """生成化合物鉴定报告（增强版：择优输出，合并所有药材来源，使用新评分）"""
+        """生成化合物鉴定报告（增强版：择优输出，合并所有药材来源，使用新评分，并融合多加和离子）"""
         if herb_name is None:
             herb_name = self.herb_name if self.herb_name else '中药'
         
@@ -729,7 +733,7 @@ class UltimateGardeniaIdentifier:
             matched_frags = best_candidate['matched_fragments']
             diag_ions = best_candidate['diagnostic_ions']
             
-            # 清洗加和离子：如果包含逗号或分号，只取第一个
+            # 清洗加和离子：如果包含逗号或分号，只取第一个（临时处理，后续融合时会合并）
             adduct = best_candidate['adduct']
             if adduct:
                 for sep in [',', ';']:
@@ -785,16 +789,94 @@ class UltimateGardeniaIdentifier:
             if compound_key not in best_records or current_score > best_records[compound_key][1]:
                 best_records[compound_key] = (record, current_score)
         
-        # 合并药材名称并生成最终报告
-        results = []
-        for compound_key, (record, _) in best_records.items():
-            herbs = herbs_collection[compound_key]
-            # 合并药材名称（去重后按字母排序）
-            record['药材名称'] = '; '.join(sorted(herbs))
-            results.append(record)
+        # 此时 best_records 中包含了每个化合物在所有离子模式下的最佳记录
+        # 但同一化合物可能对应多个记录（不同加和离子、不同保留时间）
+        # 我们需要先合并药材名称，再按保留时间窗口进行多加和离子融合
         
-        # 生成DataFrame并排序
-        report_df = pd.DataFrame(results)
+        # 首先，合并药材名称到每个记录中
+        records_list = []
+        for compound_key, (record, score) in best_records.items():
+            herbs = herbs_collection[compound_key]
+            record['药材名称'] = '; '.join(sorted(herbs))
+            records_list.append(record)
+        
+        if not records_list:
+            return pd.DataFrame()
+        
+        # 按保留时间排序，以便进行时间窗口聚类
+        records_list.sort(key=lambda x: x['出峰时间t/min'] if x['出峰时间t/min'] is not None else 0)
+        
+        # 定义保留时间容差（用于融合）
+        rt_tol = self.rt_fusion_tolerance
+        
+        # 分组融合：按保留时间窗口和化合物标识分组
+        fused_records = []
+        i = 0
+        n = len(records_list)
+        while i < n:
+            # 开始一个新组，包含当前记录
+            group = [records_list[i]]
+            j = i + 1
+            # 将时间差在容差内的后续记录加入组
+            while j < n:
+                rt1 = group[0]['出峰时间t/min']
+                rt2 = records_list[j]['出峰时间t/min']
+                # 如果任一时间为None，则不能作为同一组
+                if rt1 is None or rt2 is None:
+                    break
+                if abs(rt1 - rt2) <= rt_tol:
+                    group.append(records_list[j])
+                    j += 1
+                else:
+                    break
+            
+            # 对组内记录按化合物进一步分组（同一保留时间窗口内可能有不同化合物共流出）
+            compound_groups = {}
+            for rec in group:
+                key = (rec['化合物中文名'], rec['分子式'])
+                if key not in compound_groups:
+                    compound_groups[key] = []
+                compound_groups[key].append(rec)
+            
+            # 对每个化合物组进行融合
+            for comp_key, comp_recs in compound_groups.items():
+                if len(comp_recs) == 1:
+                    # 只有一个记录，直接加入
+                    fused_records.append(comp_recs[0])
+                else:
+                    # 多个记录（不同加和离子），进行融合
+                    # 找出得分最高的记录作为基础
+                    best_rec = max(comp_recs, key=lambda x: x['综合得分'])
+                    # 收集所有加和离子（去重）
+                    adducts = set()
+                    modes = set()
+                    for rec in comp_recs:
+                        if rec['加和离子']:
+                            adducts.add(rec['加和离子'])
+                        if rec['离子化方式']:
+                            modes.add(rec['离子化方式'])
+                    # 合并
+                    best_rec['加和离子'] = '; '.join(sorted(adducts))
+                    best_rec['离子化方式'] = '/'.join(sorted(modes))
+                    
+                    # 计算奖励分：每个额外加和离子加3分，上限15分
+                    bonus = min((len(comp_recs) - 1) * 3, 15)
+                    new_score = min(best_rec['综合得分'] + bonus, 100)
+                    best_rec['综合得分'] = new_score
+                    
+                    # 评级提升：如果所有记录评级均为2级或以上，且记录数≥2，则提升为1级
+                    if len(comp_recs) >= 2 and all(rec['评级'] <= 2 for rec in comp_recs):
+                        best_rec['评级'] = 1
+                        best_rec['评级名称'] = '确证级'
+                        best_rec['置信度'] = '最高'
+                        best_rec['报告建议'] = '可直接报告'
+                    
+                    fused_records.append(best_rec)
+            
+            i = j  # 移动索引到下一组
+        
+        # 生成最终的DataFrame
+        report_df = pd.DataFrame(fused_records)
         
         if not report_df.empty:
             # 按评级和得分排序
@@ -857,7 +939,7 @@ class UltimateGardeniaIdentifier:
     def _print_initialization_info(self):
         """打印初始化信息"""
         print("\n" + "="*80)
-        print("程序初始化完成（优化版）")
+        print("程序初始化完成（多加和离子融合版）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -865,6 +947,7 @@ class UltimateGardeniaIdentifier:
         print(f"  - 正离子质谱: {len(self.ms_positive)} 条记录")
         print(f"  - 负离子质谱: {len(self.ms_negative)} 条记录")
         print(f"  - 诊断性离子库: {len(self.diagnostic_ions)} 类")
+        print(f"  - 保留时间融合容差: {self.rt_fusion_tolerance} min")
         print(f"  - 并行处理: {'启用' if self.use_parallel else '禁用'}")
         print("="*80)
 
@@ -1118,7 +1201,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.7（优化版）",
+    page_title="中药化合物智能鉴定平台 v5.8（多加和离子融合版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1260,8 +1343,8 @@ def create_header():
     """创建应用头部"""
     st.markdown("""
     <div class="main-header">
-        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（优化版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">自动排除母离子干扰 v5.7（云端版）</p>
+        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（多加和离子融合版）</h1>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">自动融合多加和离子提升可信度 v5.8（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1271,7 +1354,7 @@ def create_sidebar():
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1rem 0;">
         <h2 style="color: #2E7D32; margin-bottom: 0.5rem;">🔬 TCM Identifier</h2>
-        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（优化版）</p>
+        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（多加和离子融合版）</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1284,11 +1367,11 @@ def create_sidebar():
     
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.7（优化版）
+    - 程序版本：v5.8（多加和离子融合版）
     - 数据库规模：35,828条化合物记录
     - 诊断离子：自动加载项目目录下的诊断离子.xlsx
     - 支持药材：291种
-    - 核心特点：自动排除母离子干扰、药材名称合并、支持单文件上传
+    - 核心特点：多加和离子融合、自动排除母离子、药材名称合并、支持单文件上传
     """)
     
     st.sidebar.markdown("""
@@ -1359,12 +1442,12 @@ def show_home_page():
     with col2:
         st.markdown("""
         <div class="feature-card">
-            <h4>⚡ 自动排除母离子</h4>
-            <p>碎片匹配和诊断离子识别时自动排除母离子，避免虚高，使结果更准确。</p>
+            <h4>⚡ 多加和离子融合</h4>
+            <p>同一保留时间窗口内同一化合物的不同加和离子证据自动融合，给予奖励分并可能提升评级。</p>
         </div>
         <div class="feature-card">
-            <h4>🌱 药材来源合并</h4>
-            <p>同一化合物的所有药材来源自动合并显示，实现“所有的药材”。</p>
+            <h4>🌱 自动排除母离子</h4>
+            <p>碎片匹配和诊断离子识别时自动排除母离子，避免虚高，使结果更准确。</p>
         </div>
         <div class="feature-card">
             <h4>📁 单文件支持</h4>
@@ -1390,7 +1473,7 @@ def show_home_page():
 
 
 def show_analysis_page():
-    """鉴定分析页面（增强版：支持单文件上传）"""
+    """鉴定分析页面（增强版：支持单文件上传，增加融合容差设置）"""
     create_header()
     
     st.markdown("## 📁 上传质谱数据")
@@ -1433,7 +1516,8 @@ def show_analysis_page():
     with col1:
         fragment_tolerance = st.number_input("碎片匹配容差 (Da)", min_value=0.01, max_value=1.0, value=0.05, step=0.01)
     with col2:
-        rt_tolerance = st.number_input("保留时间容差 (min)", min_value=0.1, max_value=2.0, value=0.3, step=0.1)
+        rt_tolerance = st.number_input("保留时间容差 (min)", min_value=0.1, max_value=2.0, value=0.3, step=0.1, 
+                                       help="用于判断同一化合物的保留时间窗口（多加和离子融合）")
     with col3:
         loss_tolerance = st.number_input("中性丢失容差 (Da)", min_value=0.01, max_value=0.5, value=0.02, step=0.01)
     
@@ -1491,7 +1575,8 @@ def show_analysis_page():
                         use_parallel=use_parallel,
                         rt_tolerance=rt_tolerance,
                         loss_tolerance=loss_tolerance,
-                        external_diagnostic_file=diag_path
+                        external_diagnostic_file=diag_path,
+                        rt_fusion_tolerance=rt_tolerance  # 使用相同的保留时间容差用于融合
                     )
                     
                     status_text.text("【6/7】正在处理质谱数据...")
@@ -1632,13 +1717,13 @@ def show_diagnostic_ion_page():
 def show_guide_page():
     """使用指南页面"""
     create_header()
-    st.markdown("## 📖 使用指南（优化版）")
+    st.markdown("## 📖 使用指南（多加和离子融合版）")
     st.info("""
     ### 新增功能说明
+    - **多加和离子融合**：在设定的保留时间容差范围内，若同一化合物出现多个加和离子，程序将自动融合这些证据，给予额外奖励分（每个额外加和离子+3分，上限15分），并可能提升评级（若所有原始评级≥2级，则提升为1级确证级）。
     - **自动排除母离子**：在碎片匹配和诊断离子识别时，自动排除与母离子接近的离子，避免虚高，使结果更准确。
     - **单文件支持**：可只上传正离子或负离子单个文件进行鉴定，灵活适配不同实验数据。
     - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。若不上传，程序会自动加载项目目录下的诊断离子.xlsx（如果存在）。
-    - **择优输出**：每个母离子仅返回得分最高的候选，减少冗余。
     - **药材名称合并**：同一化合物的所有药材来源自动合并显示，实现“所有的药材”。
     
     ### 评级标准（同原六级标准）
@@ -1708,7 +1793,7 @@ def show_results_page():
     
     report = st.session_state['analysis_results']
     
-    st.markdown("## 📊 鉴定结果分析（优化版）")
+    st.markdown("## 📊 鉴定结果分析（多加和离子融合版）")
     
     if report.empty:
         st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
