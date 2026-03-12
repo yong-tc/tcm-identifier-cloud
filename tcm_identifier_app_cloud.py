@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.6
+中药化合物智能鉴定平台 - 云端部署增强版 v5.7
 ==========================================================
 
 功能特点：
 - 自动加载项目目录下的诊断离子.xlsx（如果存在）
 - 支持上传自定义诊断离子文件覆盖默认
+- 碎片匹配时自动排除母离子，避免母离子被计入碎片
+- 诊断离子匹配时自动排除母离子
 - 重新设计的综合评分系统：基于评级计算得分，确保1、2级≥60且总分≤100
 - 支持只上传正离子或负离子单个文件进行鉴定
 - 择优输出最佳候选，自动区分同分异构体
@@ -16,7 +18,7 @@
 
 作者：张永
 日期：2026-03-12
-版本：v5.6（评分优化版 + 单文件支持）
+版本：v5.7（优化版）
 """
 
 import streamlit as st
@@ -33,21 +35,23 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 鉴定程序核心代码（评分优化版 + 单文件支持）
+# 鉴定程序核心代码（优化版）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.6（评分优化版 + 单文件支持）
+    中药化合物鉴定终极版程序 v5.7（优化版）
     
     新增特性：
     1. 支持外部诊断离子文件（Excel格式），自动查找项目目录下的诊断离子.xlsx
-    2. 重新设计的综合评分系统：基于评级、ppm、匹配碎片数、诊断离子个数计算，总分≤100
-    3. 支持只上传正离子或负离子单个文件进行鉴定
-    4. 择优输出：每个母离子仅返回得分最高的候选
-    5. 去重基于得分，并合并所有药材来源
-    6. 分子式标准化（去除Unicode下标）
-    7. 加和离子字段清洗（多值时只取第一个）
+    2. 碎片匹配时自动排除母离子
+    3. 诊断离子匹配时自动排除母离子
+    4. 重新设计的综合评分系统：基于评级、ppm、匹配碎片数、诊断离子个数计算，总分≤100
+    5. 支持只上传正离子或负离子单个文件进行鉴定
+    6. 择优输出：每个母离子仅返回得分最高的候选
+    7. 去重基于得分，并合并所有药材来源
+    8. 分子式标准化（去除Unicode下标）
+    9. 加和离子字段清洗（多值时只取第一个）
     """
     
     def __init__(self, database_path, ms_positive_path, ms_negative_path, 
@@ -86,7 +90,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.6（评分优化版 + 单文件支持）")
+        print("中药化合物鉴定程序 v5.7（优化版）")
         print("="*80)
         print("\n【1/7】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -389,8 +393,10 @@ class UltimateGardeniaIdentifier:
         
         return range(left, right)
     
-    def _match_fragments_fast(self, observed, reference, tolerance=0.05):
-        """快速匹配碎片离子"""
+    def _match_fragments_fast(self, observed, reference, tolerance=0.05, precursor_mz=None):
+        """
+        快速匹配碎片离子，并排除与母离子接近的碎片
+        """
         matched = []
         if len(reference) == 0:
             return matched
@@ -401,14 +407,18 @@ class UltimateGardeniaIdentifier:
         for ref_val in ref_arr:
             if pd.notna(ref_val) and float(ref_val) > 0:
                 for obs_val in obs_arr:
-                    if abs(float(obs_val) - float(ref_val)) <= tolerance:
-                        matched.append(float(obs_val))
+                    # 如果该碎片接近母离子，则跳过（不认为是碎片）
+                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance:
+                        continue
+                    if abs(obs_val - ref_val) <= tolerance:
+                        matched.append(obs_val)
                         break
-        
         return list(set(matched))
     
-    def _find_diagnostic_ions_fast(self, matched_fragments, category):
-        """快速查找诊断性离子（使用当前加载的诊断离子库）"""
+    def _find_diagnostic_ions_fast(self, matched_fragments, category, precursor_mz=None):
+        """
+        快速查找诊断性离子，并可选择排除母离子
+        """
         if len(matched_fragments) == 0:
             return []
         
@@ -417,14 +427,17 @@ class UltimateGardeniaIdentifier:
         
         diag_ions = np.array(self.diagnostic_ions[category]['ions'])
         matched_arr = np.asarray(matched_fragments)
+        tolerance = self.config['fragment_tolerance']
         
         diagnostic = []
         for diag_val in diag_ions:
             for matched_val in matched_arr:
-                if abs(float(matched_val) - float(diag_val)) <= self.config['fragment_tolerance']:
+                if abs(matched_val - diag_val) <= tolerance:
+                    # 可选：排除母离子
+                    if precursor_mz is not None and abs(matched_val - precursor_mz) <= tolerance:
+                        continue
                     diagnostic.append(float(matched_val))
                     break
-        
         return list(set(diagnostic))
     
     def _determine_confidence_level(self, ppm, matched_count, diagnostic_count, has_fragment_data):
@@ -593,8 +606,19 @@ class UltimateGardeniaIdentifier:
             info = self.compound_info[db_idx]
             category = self._classify_compound(info['name_cn'] + ' ' + info['name_en'], info['compound_type'])
             
-            matched_fragments = self._match_fragments_fast(precursor['fragments'], ref_frags, self.config['fragment_tolerance'])
-            diagnostic_ions = self._find_diagnostic_ions_fast(matched_fragments, category)
+            # 匹配碎片时传入母离子m/z，排除母离子本身
+            matched_fragments = self._match_fragments_fast(
+                precursor['fragments'], 
+                ref_frags, 
+                self.config['fragment_tolerance'],
+                precursor['precursor_mz']
+            )
+            # 查找诊断离子时也传入母离子m/z，排除母离子
+            diagnostic_ions = self._find_diagnostic_ions_fast(
+                matched_fragments, 
+                category,
+                precursor['precursor_mz']
+            )
             
             theoretical_mz = mz_val
             ppm = abs(float(precursor['precursor_mz']) - theoretical_mz) / theoretical_mz * 1e6
@@ -615,15 +639,13 @@ class UltimateGardeniaIdentifier:
                 'mode': mode,
                 'source': info['source'],
                 'category': category,
-                'db_index': db_idx  # 保留索引以便后续获取额外信息
+                'db_index': db_idx
             }
             
-            # 旧版评分已弃用，这里只保留候选，得分在生成报告时重新计算
             # 为保持排序，暂时用ppm和匹配碎片数作为临时排序依据
-            candidate['temp_score'] = -ppm  # 临时排序用
+            candidate['temp_score'] = -ppm
             
-            if True:  # 移除得分阈值过滤
-                scored_candidates.append(candidate)
+            scored_candidates.append(candidate)
         
         # 按临时分数排序（仅用于调试时的返回多个）
         scored_candidates.sort(key=lambda x: (-len(x['matched_fragments']), -x['temp_score']))
@@ -835,7 +857,7 @@ class UltimateGardeniaIdentifier:
     def _print_initialization_info(self):
         """打印初始化信息"""
         print("\n" + "="*80)
-        print("程序初始化完成（评分优化版 + 单文件支持）")
+        print("程序初始化完成（优化版）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -1096,7 +1118,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.6（评分优化版 + 单文件支持）",
+    page_title="中药化合物智能鉴定平台 v5.7（优化版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1238,8 +1260,8 @@ def create_header():
     """创建应用头部"""
     st.markdown("""
     <div class="main-header">
-        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（评分优化版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于评级的新评分系统 v5.6（支持单文件上传）</p>
+        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（优化版）</h1>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">自动排除母离子干扰 v5.7（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1249,7 +1271,7 @@ def create_sidebar():
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1rem 0;">
         <h2 style="color: #2E7D32; margin-bottom: 0.5rem;">🔬 TCM Identifier</h2>
-        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（评分优化版）</p>
+        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（优化版）</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1262,11 +1284,11 @@ def create_sidebar():
     
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.6（评分优化版 + 单文件支持）
+    - 程序版本：v5.7（优化版）
     - 数据库规模：35,828条化合物记录
     - 诊断离子：自动加载项目目录下的诊断离子.xlsx
     - 支持药材：291种
-    - 核心特点：新评分系统（1级≥80，2级≥60，总分≤100）、药材名称合并、支持单文件上传
+    - 核心特点：自动排除母离子干扰、药材名称合并、支持单文件上传
     """)
     
     st.sidebar.markdown("""
@@ -1337,8 +1359,8 @@ def show_home_page():
     with col2:
         st.markdown("""
         <div class="feature-card">
-            <h4>⚡ 全新评分系统</h4>
-            <p>基于评级计算综合得分，确保1级≥80分，2级≥60分，总分不超过100分，级别越小得分越高。</p>
+            <h4>⚡ 自动排除母离子</h4>
+            <p>碎片匹配和诊断离子识别时自动排除母离子，避免虚高，使结果更准确。</p>
         </div>
         <div class="feature-card">
             <h4>🌱 药材来源合并</h4>
@@ -1469,7 +1491,7 @@ def show_analysis_page():
                         use_parallel=use_parallel,
                         rt_tolerance=rt_tolerance,
                         loss_tolerance=loss_tolerance,
-                        external_diagnostic_file=diag_path  # 若为None，将在内部自动查找默认文件
+                        external_diagnostic_file=diag_path
                     )
                     
                     status_text.text("【6/7】正在处理质谱数据...")
@@ -1610,10 +1632,10 @@ def show_diagnostic_ion_page():
 def show_guide_page():
     """使用指南页面"""
     create_header()
-    st.markdown("## 📖 使用指南（评分优化版）")
+    st.markdown("## 📖 使用指南（优化版）")
     st.info("""
     ### 新增功能说明
-    - **全新评分系统**：综合得分基于评级、ppm误差、匹配碎片数和诊断离子个数计算，确保1级化合物得分≥80，2级化合物得分≥60，总分不超过100分，级别越小得分越高。
+    - **自动排除母离子**：在碎片匹配和诊断离子识别时，自动排除与母离子接近的离子，避免虚高，使结果更准确。
     - **单文件支持**：可只上传正离子或负离子单个文件进行鉴定，灵活适配不同实验数据。
     - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。若不上传，程序会自动加载项目目录下的诊断离子.xlsx（如果存在）。
     - **择优输出**：每个母离子仅返回得分最高的候选，减少冗余。
@@ -1686,7 +1708,7 @@ def show_results_page():
     
     report = st.session_state['analysis_results']
     
-    st.markdown("## 📊 鉴定结果分析（评分优化版）")
+    st.markdown("## 📊 鉴定结果分析（优化版）")
     
     if report.empty:
         st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
