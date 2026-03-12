@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署版 v4.8
+中药化合物智能鉴定平台 - 云端部署版 v5.0
 ==========================================
 
 功能说明：
@@ -8,7 +8,8 @@
 - 基于大规模中药质谱数据库的化合物鉴定工具
 - 支持高分辨质谱数据上传和分析
 - 六级评级标准鉴定结果
-- 新增：同一化合物共用序号，不同加和离子分行显示
+- 新增：诊断离子比对使用外部文件“诊断离子.xlsx”
+- 新增：同一观测 m/z 共用序号，不同加和离子分行显示
 - 新增：支持只上传正离子或负离子模式数据
 - 新增：取消候选数量限制，列出所有可能化合物
 - 新增：碎片/诊断离子匹配仅用容差 (Da)，范围可调
@@ -16,7 +17,7 @@
 
 作者：MiniMax Agent
 日期：2026-03-12
-版本：v4.8（云端部署版）
+版本：v5.0（云端部署版）
 """
 
 import streamlit as st
@@ -38,21 +39,22 @@ warnings.filterwarnings('ignore')
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v4.8
+    中药化合物鉴定终极版程序 v5.0
     
     功能特点：
     1. 使用全部35,828条数据库记录，不遗漏任何潜在化合物
     2. 可选药材筛选模式（筛选/全库）
-    3. 完整的诊断性离子库（环烯醚萜类、有机酸类、黄酮类、萜类等）
+    3. 诊断离子比对基于外部文件“诊断离子.xlsx”（按化合物类型分组）
     4. 精确的六级评级标准
     5. 多进程并行加速
-    6. 同一化合物共用序号，不同加和离子分行显示
+    6. 同一观测 m/z 共用序号，不同加和离子分行显示
     7. 独立控制碎片离子容差和诊断离子容差（仅Da，无ppm）
     8. CID 估算保留时间
     """
     
     def __init__(self, database_path, ms_positive_path, ms_negative_path, 
-                 herb_name=None, config=None, use_parallel=True):
+                 herb_name=None, config=None, use_parallel=True,
+                 diagnostic_ion_path=None):
         """初始化鉴定程序"""
         # 默认配置参数
         self.config = {
@@ -80,7 +82,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v4.8 - 云端部署版")
+        print("中药化合物鉴定程序 v5.0 - 云端部署版")
         print("="*80)
         print("\n【1/6】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -100,10 +102,13 @@ class UltimateGardeniaIdentifier:
         self.ms_positive = self._load_data(ms_positive_path) if ms_positive_path else pd.DataFrame()
         self.ms_negative = self._load_data(ms_negative_path) if ms_negative_path else pd.DataFrame()
         
+        # 加载诊断离子数据库（外部文件）
+        print("【4/6】正在加载诊断离子数据库...")
+        self.diagnostic_ions_by_type = self._load_diagnostic_ions(diagnostic_ion_path)
+        
         # 构建优化索引
-        print("【4/6】正在构建索引...")
+        print("【5/6】正在构建索引...")
         self._build_optimized_index()
-        self._build_diagnostic_ion_library()
         
         # 统计信息
         self.stats = {
@@ -127,6 +132,75 @@ class UltimateGardeniaIdentifier:
                 return pd.DataFrame()
         print(f"警告: 文件不存在或路径无效: {filepath}")
         return pd.DataFrame()
+    
+    def _load_diagnostic_ions(self, filepath):
+        """加载外部诊断离子文件，构建按化合物类型分组的离子列表"""
+        diagnostic_dict = {}
+        
+        if filepath and os.path.exists(filepath):
+            try:
+                df = pd.read_excel(filepath)
+                # 确保必要列存在
+                if '诊断碎片离子m/z' not in df.columns or '化合物类型' not in df.columns:
+                    print("警告: 诊断离子文件缺少必要列，将使用内置诊断离子库。")
+                    return self._build_fallback_diagnostic_ions()
+                
+                # 转换m/z列为数值，过滤无效值
+                df['诊断碎片离子m/z'] = pd.to_numeric(df['诊断碎片离子m/z'], errors='coerce')
+                df = df.dropna(subset=['诊断碎片离子m/z', '化合物类型'])
+                
+                # 按化合物类型分组，收集离子列表（去重）
+                for compound_type, group in df.groupby('化合物类型'):
+                    ions = group['诊断碎片离子m/z'].unique().tolist()
+                    diagnostic_dict[compound_type] = {
+                        'ions': ions,
+                        'description': f'从外部文件加载，共 {len(ions)} 个离子'
+                    }
+                
+                print(f"  成功加载诊断离子库: {len(diagnostic_dict)} 个化合物类型")
+                return diagnostic_dict
+                
+            except Exception as e:
+                print(f"警告: 加载诊断离子文件时出错: {e}，将使用内置诊断离子库。")
+                return self._build_fallback_diagnostic_ions()
+        else:
+            print("警告: 未找到诊断离子文件，将使用内置诊断离子库。")
+            return self._build_fallback_diagnostic_ions()
+    
+    def _build_fallback_diagnostic_ions(self):
+        """构建内置的诊断离子库（备用）"""
+        fallback = {
+            '环烯醚萜类': {
+                'ions': [138.055, 124.039, 110.023, 96.008, 82.029, 67.029, 127.039],
+                'description': '环烯醚萜类特征脱水碎片'
+            },
+            '有机酸类': {
+                'ions': [191.056, 179.034, 173.045, 135.045, 93.034, 85.029],
+                'description': '咖啡酰奎尼酸系列特征离子'
+            },
+            '黄酮类': {
+                'ions': [151.003, 137.024, 121.029, 107.049, 81.034, 65.039],
+                'description': '黄酮苷元特征碎片'
+            },
+            '萜类': {
+                'ions': [127.076, 113.060, 99.044, 85.029, 71.013],
+                'description': '萜类特征碎片'
+            },
+            '栀子特异': {
+                'ions': [127.039, 113.024, 101.024, 69.034, 97.028],
+                'description': '栀子特有成分特征离子'
+            },
+            '生物碱类': {
+                'ions': [105.070, 91.054, 79.054, 65.039],
+                'description': '生物碱特征碎片'
+            },
+            '酚酸类': {
+                'ions': [137.024, 123.044, 109.028, 95.049],
+                'description': '酚酸类特征碎片'
+            }
+        }
+        print("  使用内置诊断离子库（备用）")
+        return fallback
     
     def _filter_by_herb(self, herb_name):
         """按药材名称筛选数据库"""
@@ -224,59 +298,41 @@ class UltimateGardeniaIdentifier:
             pass
         return np.array(fragments)
     
-    def _build_diagnostic_ion_library(self):
-        """构建各类化合物的诊断性离子库"""
-        self.diagnostic_ions = {
-            '环烯醚萜类': {
-                'ions': [138.055, 124.039, 110.023, 96.008, 82.029, 67.029, 127.039],
-                'description': '环烯醚萜类特征脱水碎片'
-            },
-            '有机酸类': {
-                'ions': [191.056, 179.034, 173.045, 135.045, 93.034, 85.029],
-                'description': '咖啡酰奎尼酸系列特征离子'
-            },
-            '黄酮类': {
-                'ions': [151.003, 137.024, 121.029, 107.049, 81.034, 65.039],
-                'description': '黄酮苷元特征碎片'
-            },
-            '萜类': {
-                'ions': [127.076, 113.060, 99.044, 85.029, 71.013],
-                'description': '萜类特征碎片'
-            },
-            '栀子特异': {
-                'ions': [127.039, 113.024, 101.024, 69.034, 97.028],
-                'description': '栀子特有成分特征离子'
-            },
-            '生物碱类': {
-                'ions': [105.070, 91.054, 79.054, 65.039],
-                'description': '生物碱特征碎片'
-            },
-            '酚酸类': {
-                'ions': [137.024, 123.044, 109.028, 95.049],
-                'description': '酚酸类特征碎片'
-            }
-        }
-    
     def _classify_compound(self, name, compound_type):
-        """分类化合物"""
+        """分类化合物（用于匹配诊断离子类型）"""
         name = name.lower()
         compound_type = str(compound_type).lower()
         
-        if any(keyword in compound_type for keyword in ['环烯醚', 'iridoid']):
-            return '环烯醚萜类'
-        if any(keyword in compound_type for keyword in ['有机酸', '酚酸']):
-            return '有机酸类'
-        if any(keyword in compound_type for keyword in ['黄酮', 'flavon']):
-            return '黄酮类'
-        if any(keyword in compound_type for keyword in ['萜', 'terpen']):
-            return '萜类'
-        if any(keyword in compound_type for keyword in ['生物碱', 'alkaloid']):
-            return '生物碱类'
+        # 先尝试匹配化合物类型字段
+        if compound_type:
+            for key in self.diagnostic_ions_by_type.keys():
+                if key.lower() in compound_type:
+                    return key
         
-        if any(keyword in name for keyword in ['京尼平', '栀子', 'genipos', 'gardenia']):
-            return '栀子特异'
+        # 若类型字段无匹配，尝试从名称推断
+        if any(keyword in name for keyword in ['环烯醚', 'iridoid']):
+            for key in self.diagnostic_ions_by_type.keys():
+                if '环烯醚' in key or 'iridoid' in key.lower():
+                    return key
+        if any(keyword in name for keyword in ['有机酸', '酚酸']):
+            for key in self.diagnostic_ions_by_type.keys():
+                if '有机酸' in key or '酚酸' in key:
+                    return key
+        if any(keyword in name for keyword in ['黄酮', 'flavon']):
+            for key in self.diagnostic_ions_by_type.keys():
+                if '黄酮' in key or 'flavon' in key.lower():
+                    return key
+        if any(keyword in name for keyword in ['萜', 'terpen']):
+            for key in self.diagnostic_ions_by_type.keys():
+                if '萜' in key or 'terpen' in key.lower():
+                    return key
+        if any(keyword in name for keyword in ['生物碱', 'alkaloid']):
+            for key in self.diagnostic_ions_by_type.keys():
+                if '生物碱' in key or 'alkaloid' in key.lower():
+                    return key
         
-        return '其他'
+        # 若仍无匹配，返回第一个类型作为兜底（或 None）
+        return next(iter(self.diagnostic_ions_by_type.keys())) if self.diagnostic_ions_by_type else None
     
     def _binary_search_range(self, mz_array, mz, tolerance_ppm):
         """二分查找快速定位候选化合物"""
@@ -314,16 +370,22 @@ class UltimateGardeniaIdentifier:
         return list(set(matched))
     
     def _find_diagnostic_ions_fast(self, matched_fragments, category, tolerance=None):
-        """快速查找诊断性离子（使用配置的 diagnostic_tolerance，仅Da）"""
+        """快速查找诊断性离子（使用配置的 diagnostic_tolerance，基于外部诊断离子库）"""
         if tolerance is None:
             tolerance = self.config['diagnostic_tolerance']
         if len(matched_fragments) == 0:
             return []
         
-        if category not in self.diagnostic_ions:
-            return []
+        if category not in self.diagnostic_ions_by_type:
+            # 尝试模糊匹配
+            for key in self.diagnostic_ions_by_type.keys():
+                if category in key or key in category:
+                    category = key
+                    break
+            else:
+                return []  # 无匹配类型
         
-        diag_ions = np.array(self.diagnostic_ions[category]['ions'])
+        diag_ions = np.array(self.diagnostic_ions_by_type[category]['ions'])
         matched_arr = np.asarray(matched_fragments)
         
         diagnostic = []
@@ -471,7 +533,7 @@ class UltimateGardeniaIdentifier:
         return candidates
     
     def generate_report(self, herb_name=None):
-        """生成化合物鉴定报告（同一化合物共用序号，不同加和离子分行）"""
+        """生成化合物鉴定报告（同一观测 m/z 共用序号，不同加和离子分行）"""
         if herb_name is None:
             herb_name = self.herb_name if self.herb_name else '中药'
         
@@ -546,22 +608,15 @@ class UltimateGardeniaIdentifier:
         # 转换为DataFrame
         df = pd.DataFrame(all_records)
         
-        # 标准化分子式（用于分组）
-        df['分子式_标准化'] = df['分子式'].apply(normalize_formula)
-        df['化合物ID'] = df['化合物中文名'].str.strip() + '_' + df['分子式_标准化'].str.strip()
+        # 按观测m/z分组，组内按评级、ppm排序
+        df_sorted = df.sort_values(by=['观测m/z', '评级', 'ppm'], ascending=[True, True, True]).reset_index(drop=True)
         
-        # 按评级、ppm排序（同一化合物内按ppm排序）
-        df_sorted = df.sort_values(by=['评级', 'ppm'], ascending=[True, True]).reset_index(drop=True)
+        # 为每个观测m/z分配相同序号
+        unique_obs = df_sorted['观测m/z'].unique()
+        obs_to_seq = {obs: i+1 for i, obs in enumerate(unique_obs)}
+        df_sorted['序号'] = df_sorted['观测m/z'].map(obs_to_seq)
         
-        # 为每个化合物组分配相同序号
-        unique_ids = df_sorted['化合物ID'].unique()
-        id_to_seq = {uid: i+1 for i, uid in enumerate(unique_ids)}
-        df_sorted['序号'] = df_sorted['化合物ID'].map(id_to_seq)
-        
-        # 删除临时列
-        df_sorted.drop(columns=['化合物ID', '分子式_标准化'], inplace=True)
-        
-        # 重新按序号、评级、ppm排序（确保序号顺序，组内按评级、ppm）
+        # 按序号、评级、ppm排序（确保序号顺序，组内按评级、ppm）
         df_final = df_sorted.sort_values(by=['序号', '评级', 'ppm'], ascending=[True, True, True]).reset_index(drop=True)
         
         return df_final
@@ -614,7 +669,7 @@ class UltimateGardeniaIdentifier:
         print(f"  - 负离子索引: {len(self.mz_values_neg)} 条")
         print(f"  - 正离子质谱: {len(self.ms_positive)} 条记录")
         print(f"  - 负离子质谱: {len(self.ms_negative)} 条记录")
-        print(f"  - 诊断性离子库: {len(self.diagnostic_ions)} 类")
+        print(f"  - 诊断离子库: {len(self.diagnostic_ions_by_type)} 个化合物类型")
         print(f"  - 并行处理: {'启用' if self.use_parallel else '禁用'}")
         print("="*80)
 
@@ -649,23 +704,21 @@ def deduplicate_report(input_file, output_file):
     changes = (df['分子式'] != df['分子式_标准化']).sum()
     print(f'  分子式标准化变化数: {changes}')
     
-    # 合并同一化合物（保留所有行，序号重新分配）
-    print('\n步骤2: 合并同一化合物（保留多行，序号共用）')
-    df['化合物ID'] = df['化合物中文名'].str.strip() + '_' + df['分子式_标准化'].str.strip()
-    
-    # 按评级、ppm排序
-    df = df.sort_values(by=['评级', 'ppm'], ascending=[True, True]).reset_index(drop=True)
+    # 按观测m/z分组，分配序号
+    print('\n步骤2: 按观测m/z分组，分配序号')
+    # 按观测m/z、评级、ppm排序
+    df = df.sort_values(by=['观测m/z', '评级', 'ppm'], ascending=[True, True, True]).reset_index(drop=True)
     
     # 分配序号（每组相同）
-    unique_ids = df['化合物ID'].unique()
-    id_to_seq = {uid: i+1 for i, uid in enumerate(unique_ids)}
-    df['序号'] = df['化合物ID'].map(id_to_seq)
+    unique_obs = df['观测m/z'].unique()
+    obs_to_seq = {obs: i+1 for i, obs in enumerate(unique_obs)}
+    df['序号'] = df['观测m/z'].map(obs_to_seq)
     
     df_dedup = df.sort_values(by=['序号', '评级', 'ppm'], ascending=[True, True, True]).reset_index(drop=True)
     print(f'  合并后记录数: {len(df_dedup)}')
     
     # 清理临时列
-    for col in ['化合物ID', '分子式_标准化']:
+    for col in ['分子式_标准化']:
         if col in df_dedup.columns:
             df_dedup = df_dedup.drop(columns=[col])
     
@@ -784,7 +837,7 @@ def find_diagnostic_ion_path():
 
 
 def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_mode=None):
-    """匹配诊断离子"""
+    """匹配诊断离子（用于筛查页面）"""
     if diagnostic_df.empty or not user_mz_values:
         return pd.DataFrame()
     
@@ -835,7 +888,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 # ============================================================================
 
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v4.8",
+    page_title="中药化合物智能鉴定平台 v5.0",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -859,7 +912,7 @@ def create_header():
     st.markdown("""
     <div class="main-header">
         <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于高分辨质谱数据库的化合物鉴定工具 v4.8（云端版）</p>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于高分辨质谱数据库的化合物鉴定工具 v5.0（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -880,10 +933,10 @@ def create_sidebar():
     st.sidebar.markdown("---")
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v4.8（云端版）
+    - 程序版本：v5.0（云端版）
     - 数据库规模：35,828条化合物记录
-    - 诊断离子：84,433条记录
-    - 核心特点：同一化合物共用序号、不同加和离子分行、支持单模式上传、取消候选数限制
+    - 诊断离子：84,433条记录（来自外部文件）
+    - 核心特点：诊断离子基于外部文件、同一观测m/z共用序号、支持单模式上传
     """)
     st.sidebar.markdown("""
     <div style="text-align: center; color: #999; font-size: 0.7rem; padding: 1rem 0;">
@@ -963,11 +1016,11 @@ def show_home_page():
         st.markdown("""
         <div class="feature-card"><h4>🔍 智能化合物鉴定</h4><p>基于高分辨质谱数据，在35,828条数据库记录中进行精准匹配，支持正负离子模式。</p></div>
         <div class="feature-card"><h4>📈 六级评级标准</h4><p>确证级、高置信级、推定级、提示级、参考级、排除级，科学评估鉴定结果可靠性。</p></div>
-        <div class="feature-card"><h4>🧪 诊断离子分析</h4><p>集成84,433条诊断离子数据，支持快速筛查化合物类别。</p></div>
+        <div class="feature-card"><h4>🧪 诊断离子分析</h4><p>诊断离子比对基于外部“诊断离子.xlsx”文件，支持自定义离子库。</p></div>
         """, unsafe_allow_html=True)
     with col2:
         st.markdown("""
-        <div class="feature-card"><h4>🔗 同一化合物共用序号</h4><p>同一化合物（中文名+分子式）下不同加和离子分行显示，序号相同。</p></div>
+        <div class="feature-card"><h4>🔗 同一观测m/z共用序号</h4><p>同一观测m/z下的不同候选化合物分行显示，序号相同，便于识别来自同一母离子的多种可能。</p></div>
         <div class="feature-card"><h4>🌱 药材来源分析</h4><p>详细统计鉴定结果的药材来源分布，帮助筛选特征化合物。</p></div>
         <div class="feature-card"><h4>⚡ 高性能处理</h4><p>采用二分查找索引和多进程并行处理，支持大规模数据库高效检索。</p></div>
         """, unsafe_allow_html=True)
@@ -975,7 +1028,7 @@ def show_home_page():
     st.markdown("## 🚀 快速开始")
     st.info("""
     ### 使用步骤
-    1. **准备数据**：准备好质谱数据文件（Excel格式）
+    1. **准备数据**：准备好质谱数据文件（Excel格式）、数据库文件（TCM-SM-MS DB.xlsx）和诊断离子文件（诊断离子.xlsx）
     2. **上传文件**：在"开始鉴定"页面上传正负离子质谱数据（可以只上传一种模式）
     3. **配置参数**：设置ppm容差、碎片离子容差等参数
     4. **运行鉴定**：点击"开始鉴定"按钮进行分析
@@ -1043,7 +1096,7 @@ def show_analysis_page():
         fragment_tolerance = st.number_input("碎片离子匹配容差 (Da)", min_value=0.00, max_value=1.50, value=0.05, step=0.01, format="%.2f",
                                               help="碎片离子匹配的m/z容差（单位：Da）")
         diagnostic_tolerance = st.number_input("诊断离子匹配容差 (Da)", min_value=0.00, max_value=1.50, value=0.05, step=0.01, format="%.2f",
-                                                help="诊断离子匹配的m/z容差（单位：Da）")
+                                                help="诊断离子匹配的m/z容差（单位：Da，基于外部诊断离子文件）")
     with col2:
         herb_filter = st.selectbox("药材筛选模式", options=["使用全部数据库", "筛选特定药材"], index=0,
                                    help="选择是否仅使用特定药材的数据进行鉴定")
@@ -1066,53 +1119,75 @@ def show_analysis_page():
                         neg_path = os.path.join(temp_dir, ms_negative_file.name)
                         with open(neg_path, 'wb') as f:
                             f.write(ms_negative_file.getbuffer())
+                    
+                    # 查找数据库文件
                     db_path = find_database_path()
                     if not db_path:
                         st.error("未找到数据库文件！请确保数据库文件已上传到项目目录。")
                         st.info("请将数据库文件 (TCM-SM-MS DB.xlsx) 放置在项目根目录、data/ 或 user_input_files/ 文件夹。")
                         return
                     st.info(f"✅ 已找到数据库文件: {db_path}")
+                    
+                    # 查找诊断离子文件
+                    diag_path = find_diagnostic_ion_path()
+                    if diag_path:
+                        st.info(f"✅ 已找到诊断离子文件: {diag_path}")
+                    else:
+                        st.warning("⚠️ 未找到诊断离子文件，将使用内置诊断离子库（部分功能可能受限）。")
+                    
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     status_text.text("【1/6】正在加载数据库...")
                     progress_bar.progress(15)
                     time.sleep(0.5)
+                    
                     config = {
                         'tolerance_ppm': tolerance_ppm,
                         'min_intensity': min_intensity,
                         'fragment_tolerance': fragment_tolerance,
                         'diagnostic_tolerance': diagnostic_tolerance
                     }
+                    
                     identifier = UltimateGardeniaIdentifier(
                         database_path=db_path,
                         ms_positive_path=pos_path,
                         ms_negative_path=neg_path,
                         herb_name=herb_name,
                         config=config,
-                        use_parallel=use_parallel
+                        use_parallel=use_parallel,
+                        diagnostic_ion_path=diag_path  # 传递诊断离子文件路径
                     )
+                    
                     status_text.text("【5/6】正在处理质谱数据...")
                     progress_bar.progress(40)
                     time.sleep(0.3)
+                    
                     status_text.text("【5/6】正在生成鉴定报告...")
                     progress_bar.progress(60)
                     report = identifier.generate_report('样品')
+                    
                     progress_bar.progress(80)
+                    
                     status_text.text("【6/6】正在进行智能去重...")
                     time.sleep(0.3)
+                    
                     raw_output = os.path.join(temp_dir, "鉴定报告_raw.xlsx")
                     identifier.save_report(report, raw_output)
                     final_output = os.path.join(temp_dir, "鉴定报告_最终版.xlsx")
                     final_report = deduplicate_report(raw_output, final_output)
+                    
                     progress_bar.progress(100)
                     status_text.text("鉴定完成！")
+                    
                     st.session_state['analysis_results'] = final_report
                     st.session_state['raw_results'] = report
                     st.session_state['identifier'] = identifier
+                    
                     st.success("✅ 化合物鉴定完成！")
                     if st.button("查看鉴定结果 →"):
                         st.session_state['page'] = '结果分析'
                         st.rerun()
+                    
                 except Exception as e:
                     st.error(f"鉴定过程中出错：{str(e)}")
                     st.exception(e)
@@ -1233,7 +1308,7 @@ def show_guide_page():
     st.markdown("## 📖 使用指南")
     st.info("""
     ### 使用步骤
-    1. **准备数据**：准备好质谱数据文件（Excel格式）和数据库文件
+    1. **准备数据**：准备好质谱数据文件（Excel格式）、数据库文件（TCM-SM-MS DB.xlsx）和诊断离子文件（诊断离子.xlsx）
     2. **上传文件**：在"开始鉴定"页面上传正负离子质谱数据（可以只上传一种模式）
     3. **配置参数**：设置ppm容差、碎片离子容差等参数
     4. **运行鉴定**：点击"开始鉴定"按钮进行分析
@@ -1250,7 +1325,8 @@ def show_guide_page():
     
     ### 重要说明
     - 碎片离子和诊断离子匹配仅使用绝对容差 (Da)，不计算 ppm
-    - 同一化合物（中文名+分子式）共用序号，不同加和离子分行显示
+    - 诊断离子匹配基于外部文件“诊断离子.xlsx”，按化合物类型分组
+    - 同一观测 m/z 下的所有候选化合物共用序号，不同加和离子分行显示
     - 容差范围可调 0.00-1.50 Da
     """)
     st.markdown("---")
@@ -1341,7 +1417,7 @@ def show_results_page():
     if not confirmed_df.empty:
         st.dataframe(confirmed_df[['化合物中文名', '化合物英文名', '分子式', 'ppm', '药材名称', '诊断离子']],
                      use_container_width=True, hide_index=True)
-    st.markdown("### 📋 完整鉴定结果（同一化合物共用序号）")
+    st.markdown("### 📋 完整鉴定结果（同一观测m/z共用序号）")
     all_columns = report.columns.tolist()
     default_cols = ['序号', '观测m/z', '化合物中文名', '分子式', 'ppm', '评级名称', '药材名称',
                     '与文献中匹配的碎片离子个数', '与文献中匹配的碎片离子', '诊断离子个数', '诊断离子']
