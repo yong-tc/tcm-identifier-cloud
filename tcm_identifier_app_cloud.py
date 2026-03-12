@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.4
-==============================================
+中药化合物智能鉴定平台 - 云端部署增强版 v5.5（评分优化版）
+==========================================================
 
 功能特点：
 - 自动加载项目目录下的诊断离子.xlsx（如果存在）
 - 支持上传自定义诊断离子文件覆盖默认
-- 综合置信度评分（ppm、碎片覆盖率、诊断离子、中性丢失）
-- 优化的评分策略：放宽ppm误差范围、提高碎片和诊断离子权重
+- 重新设计的综合评分系统：确保1、2级化合物得分>60，级别越小得分越高
 - 择优输出最佳候选，自动区分同分异构体
 - 六级评级标准 + 综合得分辅助判断
 - 智能去重基于得分，并合并所有药材来源
@@ -16,7 +15,7 @@
 
 作者：张永
 日期：2026-03-12
-版本：v5.4（评分优化版）
+版本：v5.5（评分优化版）
 """
 
 import streamlit as st
@@ -38,13 +37,13 @@ warnings.filterwarnings('ignore')
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.4（评分优化版）
+    中药化合物鉴定终极版程序 v5.5（评分优化版）
     
     新增特性：
     1. 支持外部诊断离子文件（Excel格式），自动查找项目目录下的诊断离子.xlsx
-    2. 综合置信度评分系统（优化：放宽ppm、提高碎片和诊断离子权重）
+    2. 重新设计的综合评分系统：基于评级、ppm、匹配碎片数、诊断离子个数计算，确保1、2级得分>60
     3. 保留时间匹配已移除（根据用户要求）
-    4. 中性丢失匹配权重降为5分
+    4. 中性丢失暂不计分（可扩展）
     5. 择优输出：每个母离子仅返回得分最高的候选
     6. 去重基于得分，并合并所有药材来源
     7. 分子式标准化（去除Unicode下标）
@@ -68,13 +67,6 @@ class UltimateGardeniaIdentifier:
             'min_intensity': 100,
             'ppm_tier1': 10,
             'ppm_tier2': 20,
-            # 评分权重（优化版）
-            'score_weights': {
-                'ppm': 40,
-                'frag_coverage': 40,       # 碎片覆盖率权重提高
-                'diagnostic': 15,           # 诊断离子权重提高
-                'neutral_loss': 5            # 中性丢失权重降低
-            }
         }
         
         # 更新用户配置
@@ -94,7 +86,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.4（评分优化版）")
+        print("中药化合物鉴定程序 v5.5（评分优化版）")
         print("="*80)
         print("\n【1/7】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -181,7 +173,7 @@ class UltimateGardeniaIdentifier:
         self.db_frag_neg = []
         self.compound_info = {}
         
-        # 额外存储用于评分的字段
+        # 额外存储用于评分的字段（此处保留中性丢失，但暂不使用）
         self.neutral_losses = {}      # 中性丢失列表，键为db_idx
         
         for idx, row in self.database.iterrows():
@@ -457,64 +449,50 @@ class UltimateGardeniaIdentifier:
         
         return 6, '排除级', '未识别', '不符合评级标准'
     
-    def _score_candidate(self, candidate, precursor, db_idx):
+    def _calculate_score_by_rating(self, rating, ppm, matched_frag_count, diag_count):
         """
-        计算候选化合物的综合置信度得分（越高越好）
-        优化版：放宽ppm误差，提高碎片和诊断离子权重，移除保留时间
+        根据评级和原始指标计算综合得分
+        确保1级≥80，2级≥60，且级别越小得分越高
         """
-        weights = self.config['score_weights']
-        score = 0.0
-        details = {}
+        # 基础分
+        if rating == 1:
+            base = 85
+        elif rating == 2:
+            base = 65
+        elif rating == 3:
+            base = 45
+        elif rating == 4:
+            base = 25
+        else:
+            base = 0
         
-        # 1. ppm得分（满分 weights['ppm']）- 放宽范围
-        ppm = candidate['ppm']
+        # ppm加减
         if ppm <= 5:
-            ppm_score = weights['ppm']  # 40
-        elif ppm <= 15:
-            ppm_score = 30  # 固定值，可调节
+            ppm_adj = 5
+        elif ppm <= 10:
+            ppm_adj = 0
+        elif ppm <= 20:
+            ppm_adj = -5
         elif ppm <= 30:
-            ppm_score = 20
-        elif ppm <= 50:
-            ppm_score = 10
-        else:
-            ppm_score = 0
-        details['ppm'] = ppm_score
+            ppm_adj = -10
+        else:  # ppm <= 50
+            ppm_adj = -15
         
-        # 2. 碎片匹配得分（覆盖率）
-        frag_count = len(candidate['matched_fragments'])
-        total_frag = len(precursor['fragments']) if precursor['fragments'] is not None else 0
-        if total_frag > 0:
-            coverage = frag_count / total_frag
-            frag_score = weights['frag_coverage'] * min(coverage, 1.0)
-        else:
-            frag_score = 0
-        details['frag_coverage'] = frag_score
+        # 碎片加分（每个匹配碎片+2分，上限20）
+        frag_adj = min(matched_frag_count * 2, 20)
         
-        # 3. 诊断离子奖励（每个7分，上限15）
-        diag_count = len(candidate['diagnostic_ions'])
-        diag_score = min(diag_count * 7, weights['diagnostic'])  # 每个7分
-        details['diagnostic'] = diag_score
+        # 诊断离子加分（每个+5分，上限15）
+        diag_adj = min(diag_count * 5, 15)
         
-        # 4. 中性丢失匹配（权重5分）
-        loss_score = 0
-        if db_idx in self.neutral_losses:
-            expected_losses = self.neutral_losses[db_idx]
-            observed_losses = self._find_neutral_losses(precursor['fragments'], candidate['observed_mz'])
-            # 计算匹配数（考虑容差）
-            match_count = 0
-            for exp in expected_losses:
-                for obs in observed_losses:
-                    if abs(exp - obs) <= self.loss_tolerance:
-                        match_count += 1
-                        break
-            loss_score = min(match_count * 2.5, weights['neutral_loss'])  # 每个匹配2.5分，总分5
-        details['neutral_loss'] = loss_score
+        total = base + ppm_adj + frag_adj + diag_adj
         
-        # 总得分
-        score = ppm_score + frag_score + diag_score + loss_score
-        details['total'] = score
+        # 保底机制
+        if rating == 1 and total < 80:
+            total = 80
+        if rating == 2 and total < 60:
+            total = 60
         
-        return score, details
+        return round(total, 2)
     
     def extract_precursor_ions(self, ms_data, ionization_mode):
         """从质谱数据中提取母离子信息"""
@@ -572,14 +550,14 @@ class UltimateGardeniaIdentifier:
         
         return precursors
     
-    def identify_compound(self, precursor, return_top=1, score_threshold=20):
+    def identify_compound(self, precursor, return_top=1, score_threshold=0):
         """
         鉴定单个化合物，返回得分最高的候选（增强版）
         
         参数:
             precursor: 母离子信息
             return_top: 返回前几个候选（默认1，设为>1返回多个，用于调试）
-            score_threshold: 得分阈值，低于此值不返回
+            score_threshold: 得分阈值，低于此值不返回（原得分已弃用，设默认0）
         
         返回:
             若return_top==1: 返回最佳候选字典（或None）
@@ -631,16 +609,15 @@ class UltimateGardeniaIdentifier:
                 'db_index': db_idx  # 保留索引以便后续获取额外信息
             }
             
-            # 计算综合得分
-            score, details = self._score_candidate(candidate, precursor, db_idx)
-            candidate['score'] = score
-            candidate['score_details'] = details
+            # 旧版评分已弃用，这里只保留候选，得分在生成报告时重新计算
+            # 为保持排序，暂时用ppm和匹配碎片数作为临时排序依据
+            candidate['temp_score'] = -ppm  # 临时排序用
             
-            if score >= score_threshold:
+            if True:  # 移除得分阈值过滤
                 scored_candidates.append(candidate)
         
-        # 按得分降序排序
-        scored_candidates.sort(key=lambda x: -x['score'])
+        # 按临时分数排序（仅用于调试时的返回多个）
+        scored_candidates.sort(key=lambda x: (-len(x['matched_fragments']), -x['temp_score']))
         
         if return_top == 1:
             return scored_candidates[0] if scored_candidates else None
@@ -648,12 +625,12 @@ class UltimateGardeniaIdentifier:
             return scored_candidates[:return_top]
     
     def generate_report(self, herb_name=None):
-        """生成化合物鉴定报告（增强版：择优输出，合并所有药材来源）"""
+        """生成化合物鉴定报告（增强版：择优输出，合并所有药材来源，使用新评分）"""
         if herb_name is None:
             herb_name = self.herb_name if self.herb_name else '中药'
         
         # 用于存储最佳记录和所有药材集合
-        best_records = {}      # 键: (name_cn, formula) -> (record, score)
+        best_records = {}      # 键: (name_cn, formula) -> (record, temp_score)
         herbs_collection = {}  # 键: (name_cn, formula) -> set of herbs
         
         # 处理正离子模式
@@ -674,7 +651,7 @@ class UltimateGardeniaIdentifier:
             if (i + 1) % 500 == 0:
                 print(f"    处理进度: {i+1}/{total}")
             
-            best_candidate = self.identify_compound(precursor, return_top=1, score_threshold=20)
+            best_candidate = self.identify_compound(precursor, return_top=1)
             if best_candidate is None:
                 continue
             
@@ -717,12 +694,20 @@ class UltimateGardeniaIdentifier:
                         adduct = adduct.split(sep)[0].strip()
                         break
             
+            # 计算新综合得分
+            new_score = self._calculate_score_by_rating(
+                lvl_id, 
+                best_candidate['ppm'],
+                len(matched_frags),
+                len(diag_ions)
+            )
+            
             record = {
                 '序号': 0,
                 '出峰时间t/min': precursor['retention_time'],
                 '化合物中文名': best_candidate['name_cn'],
                 '化合物英文名': en_name,
-                '分子式': formula,  # 已标准化
+                '分子式': formula,
                 'CAS号': best_candidate['cas'],
                 '药材名称': best_candidate['herb'],  # 临时值，后面会合并
                 '化合物类型': best_candidate['compound_type'],
@@ -742,7 +727,7 @@ class UltimateGardeniaIdentifier:
                 '评级名称': lvl_name,
                 '置信度': confidence,
                 '报告建议': suggestion,
-                '综合得分': round(best_candidate['score'], 2)
+                '综合得分': new_score
             }
             
             compound_key = (best_candidate['name_cn'], formula)
@@ -752,8 +737,8 @@ class UltimateGardeniaIdentifier:
                 herbs_collection[compound_key] = set()
             herbs_collection[compound_key].add(best_candidate['herb'])
             
-            # 更新最佳记录
-            current_score = best_candidate['score']
+            # 更新最佳记录（使用新得分作为择优依据）
+            current_score = new_score
             if compound_key not in best_records or current_score > best_records[compound_key][1]:
                 best_records[compound_key] = (record, current_score)
         
@@ -810,11 +795,11 @@ class UltimateGardeniaIdentifier:
             
             print(f"\n【综合得分分布】")
             score_high = (report_df['综合得分'] >= 80).sum()
-            score_medium = ((report_df['综合得分'] >= 50) & (report_df['综合得分'] < 80)).sum()
-            score_low = (report_df['综合得分'] < 50).sum()
+            score_medium = ((report_df['综合得分'] >= 60) & (report_df['综合得分'] < 80)).sum()
+            score_low = (report_df['综合得分'] < 60).sum()
             print(f"  - 高分 (≥80): {score_high} 个")
-            print(f"  - 中分 (50-80): {score_medium} 个")
-            print(f"  - 低分 (<50): {score_low} 个")
+            print(f"  - 中分 (60-80): {score_medium} 个")
+            print(f"  - 低分 (<60): {score_low} 个")
             
             print(f"\n【药材来源分布（前10）】")
             for herb, count in report_df['药材名称'].value_counts().head(10).items():
@@ -1087,7 +1072,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.4（评分优化版）",
+    page_title="中药化合物智能鉴定平台 v5.5（评分优化版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1230,7 +1215,7 @@ def create_header():
     st.markdown("""
     <div class="main-header">
         <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（评分优化版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于综合评分的智能鉴定工具 v5.4（云端版）</p>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于评级的新评分系统 v5.5（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1253,11 +1238,11 @@ def create_sidebar():
     
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.4（评分优化版）
+    - 程序版本：v5.5（评分优化版）
     - 数据库规模：35,828条化合物记录
     - 诊断离子：自动加载项目目录下的诊断离子.xlsx
     - 支持药材：291种
-    - 核心特点：优化评分（放宽ppm、提高碎片/诊断离子权重）、药材名称合并
+    - 核心特点：新评分系统（1级≥80，2级≥60）、药材名称合并、外部诊断离子
     """)
     
     st.sidebar.markdown("""
@@ -1328,8 +1313,8 @@ def show_home_page():
     with col2:
         st.markdown("""
         <div class="feature-card">
-            <h4>⚡ 优化评分系统</h4>
-            <p>放宽ppm误差范围，提高碎片匹配和诊断离子权重，综合得分更合理。</p>
+            <h4>⚡ 全新评分系统</h4>
+            <p>基于评级计算综合得分，确保1级≥80分，2级≥60分，级别越小得分越高。</p>
         </div>
         <div class="feature-card">
             <h4>🌱 药材来源合并</h4>
@@ -1595,8 +1580,8 @@ def show_guide_page():
     st.markdown("## 📖 使用指南（评分优化版）")
     st.info("""
     ### 新增功能说明
+    - **全新评分系统**：综合得分基于评级、ppm误差、匹配碎片数和诊断离子个数计算，确保1级化合物得分≥80，2级化合物得分≥60，级别越小得分越高。
     - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。若不上传，程序会自动加载项目目录下的诊断离子.xlsx（如果存在）。
-    - **优化评分系统**：放宽ppm误差范围（≤5得满分，≤15得30分，≤30得20分，≤50得10分），提高碎片覆盖率权重至40分，诊断离子每个7分（上限15分），中性丢失权重5分，取消保留时间评分。
     - **择优输出**：每个母离子仅返回得分最高的候选，减少冗余。
     - **药材名称合并**：同一化合物的所有药材来源自动合并显示，实现“所有的药材”。
     
@@ -1691,7 +1676,7 @@ def show_results_page():
     st.bar_chart(level_counts.reindex(['确证级', '高置信级', '推定级', '提示级', '参考级']).fillna(0))
     
     st.markdown("### 📈 综合得分分布")
-    score_bins = pd.cut(report['综合得分'], bins=[0, 30, 50, 70, 80, 100], labels=['<30', '30-50', '50-70', '70-80', '80-100'])
+    score_bins = pd.cut(report['综合得分'], bins=[0, 60, 70, 80, 90, 100], labels=['<60', '60-70', '70-80', '80-90', '90-100'])
     score_dist = score_bins.value_counts().sort_index()
     st.bar_chart(score_dist)
     
