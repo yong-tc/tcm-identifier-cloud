@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.5（评分优化版）
+中药化合物智能鉴定平台 - 云端部署增强版 v5.6
 ==========================================================
 
 功能特点：
 - 自动加载项目目录下的诊断离子.xlsx（如果存在）
 - 支持上传自定义诊断离子文件覆盖默认
-- 重新设计的综合评分系统：确保1、2级化合物得分>60，级别越小得分越高
+- 重新设计的综合评分系统：基于评级计算得分，确保1、2级≥60且总分≤100
+- 支持只上传正离子或负离子单个文件进行鉴定
 - 择优输出最佳候选，自动区分同分异构体
 - 六级评级标准 + 综合得分辅助判断
 - 智能去重基于得分，并合并所有药材来源
@@ -15,7 +16,7 @@
 
 作者：张永
 日期：2026-03-12
-版本：v5.5（评分优化版）
+版本：v5.6（评分优化版 + 单文件支持）
 """
 
 import streamlit as st
@@ -32,22 +33,21 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 鉴定程序核心代码（评分优化版）
+# 鉴定程序核心代码（评分优化版 + 单文件支持）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.5（评分优化版）
+    中药化合物鉴定终极版程序 v5.6（评分优化版 + 单文件支持）
     
     新增特性：
     1. 支持外部诊断离子文件（Excel格式），自动查找项目目录下的诊断离子.xlsx
-    2. 重新设计的综合评分系统：基于评级、ppm、匹配碎片数、诊断离子个数计算，确保1、2级得分>60
-    3. 保留时间匹配已移除（根据用户要求）
-    4. 中性丢失暂不计分（可扩展）
-    5. 择优输出：每个母离子仅返回得分最高的候选
-    6. 去重基于得分，并合并所有药材来源
-    7. 分子式标准化（去除Unicode下标）
-    8. 加和离子字段清洗（多值时只取第一个）
+    2. 重新设计的综合评分系统：基于评级、ppm、匹配碎片数、诊断离子个数计算，总分≤100
+    3. 支持只上传正离子或负离子单个文件进行鉴定
+    4. 择优输出：每个母离子仅返回得分最高的候选
+    5. 去重基于得分，并合并所有药材来源
+    6. 分子式标准化（去除Unicode下标）
+    7. 加和离子字段清洗（多值时只取第一个）
     """
     
     def __init__(self, database_path, ms_positive_path, ms_negative_path, 
@@ -86,7 +86,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.5（评分优化版）")
+        print("中药化合物鉴定程序 v5.6（评分优化版 + 单文件支持）")
         print("="*80)
         print("\n【1/7】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -103,8 +103,11 @@ class UltimateGardeniaIdentifier:
         
         # 加载质谱数据
         print("【3/7】正在加载质谱数据...")
-        self.ms_positive = self._load_data(ms_positive_path)
-        self.ms_negative = self._load_data(ms_negative_path)
+        self.ms_positive = self._load_data(ms_positive_path) if ms_positive_path else pd.DataFrame()
+        self.ms_negative = self._load_data(ms_negative_path) if ms_negative_path else pd.DataFrame()
+        
+        print(f"  正离子数据: {len(self.ms_positive)} 条记录")
+        print(f"  负离子数据: {len(self.ms_negative)} 条记录")
         
         # 构建优化索引
         print("【4/7】正在构建索引...")
@@ -120,7 +123,7 @@ class UltimateGardeniaIdentifier:
                 external_diagnostic_file = default_diag_path
         self._build_diagnostic_ion_library(external_diagnostic_file)
         
-        # 加载辅助数据（保留时间、裂解规则等）
+        # 加载辅助数据
         print("【6/7】正在加载辅助数据...")
         self._load_auxiliary_data()
         
@@ -452,7 +455,7 @@ class UltimateGardeniaIdentifier:
     def _calculate_score_by_rating(self, rating, ppm, matched_frag_count, diag_count):
         """
         根据评级和原始指标计算综合得分
-        确保1级≥80，2级≥60，且级别越小得分越高
+        确保1级≥80，2级≥60，且总分不超过100
         """
         # 基础分
         if rating == 1:
@@ -492,10 +495,16 @@ class UltimateGardeniaIdentifier:
         if rating == 2 and total < 60:
             total = 60
         
+        # 限制最高分为100
+        total = min(total, 100)
+        
         return round(total, 2)
     
     def extract_precursor_ions(self, ms_data, ionization_mode):
         """从质谱数据中提取母离子信息"""
+        if ms_data.empty:
+            return []
+        
         precursors = []
         mz_columns = [col for col in ms_data.columns if 'Peak_' in col and '_m/z' in col]
         min_intensity = self.config['min_intensity']
@@ -633,18 +642,30 @@ class UltimateGardeniaIdentifier:
         best_records = {}      # 键: (name_cn, formula) -> (record, temp_score)
         herbs_collection = {}  # 键: (name_cn, formula) -> set of herbs
         
-        # 处理正离子模式
+        # 处理正离子模式（如果有数据）
         print(f"\n【6/7】正在处理 {herb_name} 正离子模式质谱数据...")
-        pos_precursors = self.extract_precursor_ions(self.ms_positive, '正离子')
-        print(f"  - 共提取 {len(pos_precursors)} 个母离子")
+        if not self.ms_positive.empty:
+            pos_precursors = self.extract_precursor_ions(self.ms_positive, '正离子')
+            print(f"  - 共提取 {len(pos_precursors)} 个母离子")
+        else:
+            pos_precursors = []
+            print("  - 未上传正离子数据")
         
-        # 处理负离子模式
+        # 处理负离子模式（如果有数据）
         print(f"\n【7/7】正在处理 {herb_name} 负离子模式质谱数据...")
-        neg_precursors = self.extract_precursor_ions(self.ms_negative, '负离子')
-        print(f"  - 共提取 {len(neg_precursors)} 个母离子")
+        if not self.ms_negative.empty:
+            neg_precursors = self.extract_precursor_ions(self.ms_negative, '负离子')
+            print(f"  - 共提取 {len(neg_precursors)} 个母离子")
+        else:
+            neg_precursors = []
+            print("  - 未上传负离子数据")
         
         all_precursors = pos_precursors + neg_precursors
         total = len(all_precursors)
+        
+        if total == 0:
+            print("警告: 没有提取到任何母离子，请检查质谱数据文件格式。")
+            return pd.DataFrame()
         
         for i, precursor in enumerate(all_precursors):
             self.stats['total_precursors'] += 1
@@ -794,12 +815,16 @@ class UltimateGardeniaIdentifier:
             print(f"  - 20-50ppm: {ppm_50} 个")
             
             print(f"\n【综合得分分布】")
-            score_high = (report_df['综合得分'] >= 80).sum()
-            score_medium = ((report_df['综合得分'] >= 60) & (report_df['综合得分'] < 80)).sum()
-            score_low = (report_df['综合得分'] < 60).sum()
-            print(f"  - 高分 (≥80): {score_high} 个")
-            print(f"  - 中分 (60-80): {score_medium} 个")
-            print(f"  - 低分 (<60): {score_low} 个")
+            score_90_100 = (report_df['综合得分'] >= 90).sum()
+            score_80_89 = ((report_df['综合得分'] >= 80) & (report_df['综合得分'] < 90)).sum()
+            score_70_79 = ((report_df['综合得分'] >= 70) & (report_df['综合得分'] < 80)).sum()
+            score_60_69 = ((report_df['综合得分'] >= 60) & (report_df['综合得分'] < 70)).sum()
+            score_below_60 = (report_df['综合得分'] < 60).sum()
+            print(f"  - 90-100分: {score_90_100} 个")
+            print(f"  - 80-89分: {score_80_89} 个")
+            print(f"  - 70-79分: {score_70_79} 个")
+            print(f"  - 60-69分: {score_60_69} 个")
+            print(f"  - <60分: {score_below_60} 个")
             
             print(f"\n【药材来源分布（前10）】")
             for herb, count in report_df['药材名称'].value_counts().head(10).items():
@@ -810,7 +835,7 @@ class UltimateGardeniaIdentifier:
     def _print_initialization_info(self):
         """打印初始化信息"""
         print("\n" + "="*80)
-        print("程序初始化完成（评分优化版）")
+        print("程序初始化完成（评分优化版 + 单文件支持）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -818,7 +843,6 @@ class UltimateGardeniaIdentifier:
         print(f"  - 正离子质谱: {len(self.ms_positive)} 条记录")
         print(f"  - 负离子质谱: {len(self.ms_negative)} 条记录")
         print(f"  - 诊断性离子库: {len(self.diagnostic_ions)} 类")
-        print(f"  - 中性丢失数据: {len(self.neutral_losses)} 条")
         print(f"  - 并行处理: {'启用' if self.use_parallel else '禁用'}")
         print("="*80)
 
@@ -1072,7 +1096,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.5（评分优化版）",
+    page_title="中药化合物智能鉴定平台 v5.6（评分优化版 + 单文件支持）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1215,7 +1239,7 @@ def create_header():
     st.markdown("""
     <div class="main-header">
         <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（评分优化版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于评级的新评分系统 v5.5（云端版）</p>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于评级的新评分系统 v5.6（支持单文件上传）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1238,11 +1262,11 @@ def create_sidebar():
     
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.5（评分优化版）
+    - 程序版本：v5.6（评分优化版 + 单文件支持）
     - 数据库规模：35,828条化合物记录
     - 诊断离子：自动加载项目目录下的诊断离子.xlsx
     - 支持药材：291种
-    - 核心特点：新评分系统（1级≥80，2级≥60）、药材名称合并、外部诊断离子
+    - 核心特点：新评分系统（1级≥80，2级≥60，总分≤100）、药材名称合并、支持单文件上传
     """)
     
     st.sidebar.markdown("""
@@ -1314,15 +1338,15 @@ def show_home_page():
         st.markdown("""
         <div class="feature-card">
             <h4>⚡ 全新评分系统</h4>
-            <p>基于评级计算综合得分，确保1级≥80分，2级≥60分，级别越小得分越高。</p>
+            <p>基于评级计算综合得分，确保1级≥80分，2级≥60分，总分不超过100分，级别越小得分越高。</p>
         </div>
         <div class="feature-card">
             <h4>🌱 药材来源合并</h4>
             <p>同一化合物的所有药材来源自动合并显示，实现“所有的药材”。</p>
         </div>
         <div class="feature-card">
-            <h4>🚀 云端优化</h4>
-            <p>采用缓存和并行处理，支持Streamlit Community Cloud一键部署。</p>
+            <h4>📁 单文件支持</h4>
+            <p>可只上传正离子或负离子单个文件进行鉴定，灵活适配不同实验数据。</p>
         </div>
         """, unsafe_allow_html=True)
     
@@ -1331,7 +1355,7 @@ def show_home_page():
     st.info("""
     ### 使用步骤
     1. **准备数据**：准备好质谱数据文件（Excel格式）和数据库文件（TCM-SM-MS DB.xlsx）
-    2. **上传文件**：在"开始鉴定"页面上传正负离子质谱数据
+    2. **上传文件**：在"开始鉴定"页面上传正离子和/或负离子质谱数据（至少上传一个）
     3. **可选**：上传自定义诊断离子文件（若不传，将自动加载项目目录下的诊断离子.xlsx）
     4. **配置参数**：设置ppm容差、保留时间容差等参数
     5. **运行鉴定**：点击"开始鉴定"按钮进行分析
@@ -1344,20 +1368,24 @@ def show_home_page():
 
 
 def show_analysis_page():
-    """鉴定分析页面（增强版：增加外部诊断离子上传）"""
+    """鉴定分析页面（增强版：支持单文件上传）"""
     create_header()
     
     st.markdown("## 📁 上传质谱数据")
+    st.markdown("**至少上传一个文件（正离子或负离子）**")
     
     col1, col2 = st.columns(2)
     with col1:
-        ms_positive_file = st.file_uploader("上传正离子模式质谱数据 (.xlsx)", type=['xlsx'], key='ms_positive')
+        ms_positive_file = st.file_uploader("上传正离子模式质谱数据 (.xlsx，可选)", type=['xlsx'], key='ms_positive')
         if ms_positive_file:
             st.success(f"✅ 已上传: {ms_positive_file.name}")
     with col2:
-        ms_negative_file = st.file_uploader("上传负离子模式质谱数据 (.xlsx)", type=['xlsx'], key='ms_negative')
+        ms_negative_file = st.file_uploader("上传负离子模式质谱数据 (.xlsx，可选)", type=['xlsx'], key='ms_negative')
         if ms_negative_file:
             st.success(f"✅ 已上传: {ms_negative_file.name}")
+    
+    if not ms_positive_file and not ms_negative_file:
+        st.warning("⚠️ 请至少上传一个质谱数据文件")
     
     st.markdown("---")
     st.markdown("## 🧪 外部诊断离子（可选）")
@@ -1395,18 +1423,23 @@ def show_analysis_page():
     
     st.markdown("---")
     
-    if ms_positive_file and ms_negative_file:
+    if ms_positive_file or ms_negative_file:
         if st.button("🚀 开始化合物鉴定", type="primary", use_container_width=True):
             with st.spinner("正在初始化鉴定程序..."):
                 try:
                     temp_dir = tempfile.gettempdir()
-                    pos_path = os.path.join(temp_dir, ms_positive_file.name)
-                    neg_path = os.path.join(temp_dir, ms_negative_file.name)
+                    pos_path = None
+                    neg_path = None
                     
-                    with open(pos_path, 'wb') as f:
-                        f.write(ms_positive_file.getbuffer())
-                    with open(neg_path, 'wb') as f:
-                        f.write(ms_negative_file.getbuffer())
+                    if ms_positive_file:
+                        pos_path = os.path.join(temp_dir, ms_positive_file.name)
+                        with open(pos_path, 'wb') as f:
+                            f.write(ms_positive_file.getbuffer())
+                    
+                    if ms_negative_file:
+                        neg_path = os.path.join(temp_dir, ms_negative_file.name)
+                        with open(neg_path, 'wb') as f:
+                            f.write(ms_negative_file.getbuffer())
                     
                     # 保存诊断离子文件（如果有）
                     diag_path = None
@@ -1463,7 +1496,7 @@ def show_analysis_page():
                     st.error(f"鉴定过程中出错：{str(e)}")
                     st.exception(e)
     else:
-        st.warning("⚠️ 请先上传正负离子模式的质谱数据文件")
+        st.warning("⚠️ 请至少上传一个质谱数据文件")
 
 
 def show_diagnostic_ion_page():
@@ -1580,7 +1613,8 @@ def show_guide_page():
     st.markdown("## 📖 使用指南（评分优化版）")
     st.info("""
     ### 新增功能说明
-    - **全新评分系统**：综合得分基于评级、ppm误差、匹配碎片数和诊断离子个数计算，确保1级化合物得分≥80，2级化合物得分≥60，级别越小得分越高。
+    - **全新评分系统**：综合得分基于评级、ppm误差、匹配碎片数和诊断离子个数计算，确保1级化合物得分≥80，2级化合物得分≥60，总分不超过100分，级别越小得分越高。
+    - **单文件支持**：可只上传正离子或负离子单个文件进行鉴定，灵活适配不同实验数据。
     - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。若不上传，程序会自动加载项目目录下的诊断离子.xlsx（如果存在）。
     - **择优输出**：每个母离子仅返回得分最高的候选，减少冗余。
     - **药材名称合并**：同一化合物的所有药材来源自动合并显示，实现“所有的药材”。
@@ -1589,7 +1623,7 @@ def show_guide_page():
     - 确证级、高置信级、推定级、提示级、参考级、排除级
     
     ### 使用步骤
-    1. 上传正负离子质谱数据（Excel）
+    1. 上传正离子和/或负离子质谱数据（至少一个）
     2. （可选）上传自定义诊断离子文件
     3. 设置参数（ppm容差、保留时间容差等）
     4. 点击开始鉴定
@@ -1665,8 +1699,8 @@ def show_results_page():
         confirmed = (report['评级名称'] == '确证级').sum()
         st.metric("确证级化合物", confirmed)
     with col3:
-        high_score = (report['综合得分'] >= 80).sum()
-        st.metric("高分化合物 (≥80)", high_score)
+        high_score = (report['综合得分'] >= 90).sum()
+        st.metric("90分以上", high_score)
     with col4:
         avg_score = report['综合得分'].mean()
         st.metric("平均综合得分", f"{avg_score:.1f}")
@@ -1676,7 +1710,7 @@ def show_results_page():
     st.bar_chart(level_counts.reindex(['确证级', '高置信级', '推定级', '提示级', '参考级']).fillna(0))
     
     st.markdown("### 📈 综合得分分布")
-    score_bins = pd.cut(report['综合得分'], bins=[0, 60, 70, 80, 90, 100], labels=['<60', '60-70', '70-80', '80-90', '90-100'])
+    score_bins = pd.cut(report['综合得分'], bins=[0, 60, 70, 80, 90, 100], labels=['<60', '60-69', '70-79', '80-89', '90-100'])
     score_dist = score_bins.value_counts().sort_index()
     st.bar_chart(score_dist)
     
