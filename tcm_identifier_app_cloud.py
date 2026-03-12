@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.1
+中药化合物智能鉴定平台 - 云端部署增强版 v5.2
 ==============================================
 
 功能特点：
-- 支持外部诊断离子文件（诊断离子.xlsx）
+- 自动加载项目目录下的诊断离子.xlsx（如果存在）
+- 支持上传自定义诊断离子文件覆盖默认
 - 综合置信度评分（ppm、碎片覆盖率、诊断离子、保留时间、中性丢失）
 - 择优输出最佳候选，自动区分同分异构体
 - 六级评级标准 + 综合得分辅助判断
 - 智能去重基于得分
-- 完全兼容原数据库格式，额外字段可选项
+- 报告列优化：删除冗余列、完整显示匹配碎片和诊断离子、正确统计文献来源数
 
 作者：MiniMax Agent
 日期：2026-03-12
-版本：v5.1（增强版 + 外部诊断离子）
+版本：v5.2（增强版 + 自动加载诊断离子）
 """
 
 import streamlit as st
@@ -30,15 +31,15 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 鉴定程序核心代码（增强版 + 外部诊断离子）
+# 鉴定程序核心代码（增强版 + 自动加载诊断离子）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.1（增强版 + 外部诊断离子）
+    中药化合物鉴定终极版程序 v5.2（增强版 + 自动加载诊断离子）
     
     新增特性：
-    1. 支持外部诊断离子文件（Excel格式）
+    1. 支持外部诊断离子文件（Excel格式），自动查找项目目录下的诊断离子.xlsx
     2. 综合置信度评分系统
     3. 保留时间匹配（需数据库含'保留时间(min)'列）
     4. 中性丢失匹配（需数据库含'中性丢失'列或外部规则文件）
@@ -90,7 +91,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.1（增强版 + 外部诊断离子）")
+        print("中药化合物鉴定程序 v5.2（增强版 + 自动加载诊断离子）")
         print("="*80)
         print("\n【1/7】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -116,6 +117,12 @@ class UltimateGardeniaIdentifier:
         
         # 构建诊断性离子库（支持外部文件）
         print("【5/7】正在加载诊断离子库...")
+        # 如果未提供外部文件，尝试自动查找项目目录下的诊断离子.xlsx
+        if external_diagnostic_file is None:
+            default_diag_path = find_diagnostic_ion_path()
+            if default_diag_path:
+                print(f"  自动找到默认诊断离子文件: {default_diag_path}")
+                external_diagnostic_file = default_diag_path
         self._build_diagnostic_ion_library(external_diagnostic_file)
         
         # 加载辅助数据（保留时间、裂解规则等）
@@ -284,7 +291,7 @@ class UltimateGardeniaIdentifier:
                 print(f"  加载外部诊断离子文件失败：{e}，将使用内置库")
                 self._build_default_diagnostic_ions()
         else:
-            print("  未提供外部诊断离子文件，使用内置诊断离子库")
+            print("  未找到外部诊断离子文件，使用内置诊断离子库")
             self._build_default_diagnostic_ions()
     
     def _build_default_diagnostic_ions(self):
@@ -651,7 +658,7 @@ class UltimateGardeniaIdentifier:
             return scored_candidates[:return_top]
     
     def generate_report(self, herb_name=None):
-        """生成化合物鉴定报告（增强版：择优输出，基于得分去重）"""
+        """生成化合物鉴定报告（增强版：择优输出，基于得分去重，报告列优化）"""
         if herb_name is None:
             herb_name = self.herb_name if self.herb_name else '中药'
         
@@ -697,6 +704,21 @@ class UltimateGardeniaIdentifier:
             formula = best_candidate['formula'] if best_candidate['formula'] and best_candidate['formula'] != 'nan' else '待确定'
             en_name = best_candidate['name_en'] if best_candidate['name_en'] and best_candidate['name_en'] != 'nan' else ''
             
+            # 处理文献来源：拆分并计数
+            source_str = best_candidate.get('source', '')
+            if pd.notna(source_str) and source_str:
+                # 假设来源以分号分隔，可根据实际调整
+                source_list = [s.strip() for s in str(source_str).split(';') if s.strip()]
+                source_count = len(source_list)
+                source_display = '; '.join(source_list)
+            else:
+                source_count = 0
+                source_display = ''
+            
+            # 匹配上的碎片和诊断离子
+            matched_frags = best_candidate['matched_fragments']
+            diag_ions = best_candidate['diagnostic_ions']
+            
             record = {
                 '序号': 0,
                 '出峰时间t/min': precursor['retention_time'],
@@ -704,7 +726,7 @@ class UltimateGardeniaIdentifier:
                 '化合物英文名': en_name,
                 '分子式': formula,
                 'CAS号': best_candidate['cas'],
-                '药材名称': best_candidate['herb'],
+                '药材名称': best_candidate['herb'],  # 数据库中的原始字段，可能已包含多个药材
                 '化合物类型': best_candidate['compound_type'],
                 '离子化方式': best_candidate['mode'],
                 '加和离子': best_candidate['adduct'],
@@ -712,18 +734,18 @@ class UltimateGardeniaIdentifier:
                 'm/z理论值': round(best_candidate['theoretical_mz'], 4),
                 'ppm': round(best_candidate['ppm'], 4),
                 '是否有碎片数据': '是' if precursor['fragments'].size > 0 else '否',
-                '碎片离子数量': len(best_candidate['matched_fragments']),
-                '主要碎片离子': '; '.join([f'{f:.4f}' for f in precursor['fragments'][:5] if f]),
-                '匹配碎片数': len(best_candidate['matched_fragments']),
-                '诊断性离子个数': len(best_candidate['diagnostic_ions']),
-                '诊断性离子': '; '.join([f'{f:.4f}' for f in best_candidate['diagnostic_ions'][:3] if f]),
-                '文献来源数': 1,
-                '文献来源': best_candidate['source'],
+                # 删除冗余的'碎片离子数量'列
+                '主要碎片离子': '; '.join([f'{f:.4f}' for f in matched_frags]) if matched_frags else '',
+                '匹配碎片数': len(matched_frags),
+                '诊断性离子个数': len(diag_ions),
+                '诊断性离子': '; '.join([f'{f:.4f}' for f in diag_ions]) if diag_ions else '',
+                '文献来源数': source_count,
+                '文献来源': source_display,
                 '评级': lvl_id,
                 '评级名称': lvl_name,
                 '置信度': confidence,
                 '报告建议': suggestion,
-                '综合得分': round(best_candidate['score'], 2)  # 新增得分列
+                '综合得分': round(best_candidate['score'], 2)
             }
             
             # 去重：基于得分保留最佳记录
@@ -1059,7 +1081,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.1（增强版）",
+    page_title="中药化合物智能鉴定平台 v5.2（增强版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1202,7 +1224,7 @@ def create_header():
     st.markdown("""
     <div class="main-header">
         <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（增强版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于综合评分和外部诊断离子的智能鉴定工具 v5.1（云端版）</p>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基于综合评分和外部诊断离子的智能鉴定工具 v5.2（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1225,9 +1247,9 @@ def create_sidebar():
     
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.1（增强版）
+    - 程序版本：v5.2（增强版）
     - 数据库规模：35,828条化合物记录
-    - 诊断离子：支持外部文件
+    - 诊断离子：自动加载项目目录下的诊断离子.xlsx
     - 支持药材：291种
     - 核心特点：综合评分、保留时间匹配、中性丢失分析、外部诊断离子
     """)
@@ -1294,7 +1316,7 @@ def show_home_page():
         </div>
         <div class="feature-card">
             <h4>🧪 外部诊断离子</h4>
-            <p>支持上传自定义诊断离子文件（诊断离子.xlsx），灵活适配各类化合物特征。</p>
+            <p>支持上传自定义诊断离子文件，也可自动加载项目目录下的诊断离子.xlsx。</p>
         </div>
         """, unsafe_allow_html=True)
     with col2:
@@ -1319,7 +1341,7 @@ def show_home_page():
     ### 使用步骤
     1. **准备数据**：准备好质谱数据文件（Excel格式）和数据库文件（TCM-SM-MS DB.xlsx）
     2. **上传文件**：在"开始鉴定"页面上传正负离子质谱数据
-    3. **可选**：上传自定义诊断离子文件（诊断离子.xlsx）
+    3. **可选**：上传自定义诊断离子文件（若不传，将自动加载项目目录下的诊断离子.xlsx）
     4. **配置参数**：设置ppm容差、保留时间容差等参数
     5. **运行鉴定**：点击"开始鉴定"按钮进行分析
     6. **查看结果**：在"结果分析"页面查看和导出鉴定报告
@@ -1348,6 +1370,7 @@ def show_analysis_page():
     
     st.markdown("---")
     st.markdown("## 🧪 外部诊断离子（可选）")
+    st.info("若不上传，将自动加载项目目录下的诊断离子.xlsx（如果存在）")
     diagnostic_file = st.file_uploader("上传自定义诊断离子文件 (.xlsx，格式：化合物类型、诊断碎片离子m/z)", type=['xlsx'], key='diagnostic')
     if diagnostic_file:
         st.success(f"✅ 已上传诊断离子文件: {diagnostic_file.name}")
@@ -1422,7 +1445,7 @@ def show_analysis_page():
                         use_parallel=use_parallel,
                         rt_tolerance=rt_tolerance,
                         loss_tolerance=loss_tolerance,
-                        external_diagnostic_file=diag_path
+                        external_diagnostic_file=diag_path  # 若为None，将在内部自动查找默认文件
                     )
                     
                     status_text.text("【6/7】正在处理质谱数据...")
@@ -1566,7 +1589,7 @@ def show_guide_page():
     st.markdown("## 📖 使用指南（增强版）")
     st.info("""
     ### 新增功能说明
-    - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。
+    - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。若不上传，程序会自动加载项目目录下的诊断离子.xlsx（如果存在）。
     - **综合评分**：根据ppm、碎片覆盖率、诊断离子、保留时间、中性丢失计算综合得分，得分越高置信度越高。
     - **保留时间匹配**：若数据库包含'保留时间(min)'列，程序将利用保留时间进行辅助筛选。
     - **中性丢失分析**：若数据库包含'中性丢失'列（如162.0528,176.0321），程序将匹配中性丢失，提高区分度。
