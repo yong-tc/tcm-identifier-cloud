@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.8
+中药化合物智能鉴定平台 - 云端部署增强版 v5.9
 ==========================================================
 
 功能特点：
@@ -8,8 +8,8 @@
 - 支持上传自定义诊断离子文件覆盖默认
 - 碎片匹配时自动排除母离子，避免母离子被计入碎片
 - 诊断离子匹配时自动排除母离子
-- 利用同一保留时间窗口内同一化合物的不同加和离子信息提升可信度
-- 重新设计的综合评分系统：基于评级计算得分，确保1、2级≥60且总分≤100
+- 利用同一保留时间窗口内同一化合物的不同加和离子信息提升可信度，并直接融入评分
+- 重新设计的综合评分系统：基础分 + ppm调整 + 碎片加分 + 诊断离子加分 + 多加和离子加分，总分≤100
 - 支持只上传正离子或负离子单个文件进行鉴定
 - 择优输出最佳候选，自动区分同分异构体
 - 六级评级标准 + 综合得分辅助判断
@@ -18,8 +18,8 @@
 - 加和离子字段清洗（多值时只取第一个）
 
 作者：张永
-日期：2026-03-12
-版本：v5.8（多加和离子融合版）
+日期：2026-03-13
+版本：v5.9（评分优化版）
 """
 
 import streamlit as st
@@ -36,19 +36,19 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 鉴定程序核心代码（多加和离子融合版）
+# 鉴定程序核心代码（评分优化版）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.8（多加和离子融合版）
+    中药化合物鉴定终极版程序 v5.9（评分优化版）
     
     新增特性：
     1. 支持外部诊断离子文件（Excel格式），自动查找项目目录下的诊断离子.xlsx
     2. 碎片匹配时自动排除母离子
     3. 诊断离子匹配时自动排除母离子
-    4. 利用同一保留时间窗口内同一化合物的不同加和离子信息提升可信度
-    5. 重新设计的综合评分系统：基于评级、ppm、匹配碎片数、诊断离子个数计算，总分≤100
+    4. 利用同一保留时间窗口内同一化合物的不同加和离子信息提升可信度，并直接融入评分
+    5. 重新设计的综合评分系统：基础分 + ppm调整 + 碎片加分 + 诊断离子加分 + 多加和离子加分
     6. 支持只上传正离子或负离子单个文件进行鉴定
     7. 择优输出：每个母离子仅返回得分最高的候选
     8. 去重基于得分，并合并所有药材来源
@@ -94,7 +94,7 @@ class UltimateGardeniaIdentifier:
         
         # 加载数据文件
         print("="*80)
-        print("中药化合物鉴定程序 v5.8（多加和离子融合版）")
+        print("中药化合物鉴定程序 v5.9（评分优化版）")
         print("="*80)
         print("\n【1/7】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -469,10 +469,16 @@ class UltimateGardeniaIdentifier:
         
         return 6, '排除级', '未识别', '不符合评级标准'
     
-    def _calculate_score_by_rating(self, rating, ppm, matched_frag_count, diag_count):
+    def _calculate_base_score(self, rating, ppm, matched_frag_count, diag_count):
         """
-        根据评级和原始指标计算综合得分
-        确保1级≥80，2级≥60，且总分不超过100
+        计算基础得分（不含多加和离子加分）
+        规则：
+        - 基础分：1级85，2级65，3级45，4级25，5级0
+        - ppm调整：≤5 +5，5-10 0，10-20 -5，20-30 -10，30-50 -15
+        - 碎片加分：每个匹配碎片+2，上限20
+        - 诊断离子加分：每个诊断离子+5，上限15
+        - 保底：1级不低于80，2级不低于60
+        - 上限100
         """
         # 基础分
         if rating == 1:
@@ -486,7 +492,7 @@ class UltimateGardeniaIdentifier:
         else:
             base = 0
         
-        # ppm加减
+        # ppm调整
         if ppm <= 5:
             ppm_adj = 5
         elif ppm <= 10:
@@ -498,10 +504,10 @@ class UltimateGardeniaIdentifier:
         else:  # ppm <= 50
             ppm_adj = -15
         
-        # 碎片加分（每个匹配碎片+2分，上限20）
+        # 碎片加分
         frag_adj = min(matched_frag_count * 2, 20)
         
-        # 诊断离子加分（每个+5分，上限15）
+        # 诊断离子加分
         diag_adj = min(diag_count * 5, 15)
         
         total = base + ppm_adj + frag_adj + diag_adj
@@ -741,8 +747,8 @@ class UltimateGardeniaIdentifier:
                         adduct = adduct.split(sep)[0].strip()
                         break
             
-            # 计算新综合得分
-            new_score = self._calculate_score_by_rating(
+            # 计算基础得分（不含多加和离子加分）
+            base_score = self._calculate_base_score(
                 lvl_id, 
                 best_candidate['ppm'],
                 len(matched_frags),
@@ -774,7 +780,8 @@ class UltimateGardeniaIdentifier:
                 '评级名称': lvl_name,
                 '置信度': confidence,
                 '报告建议': suggestion,
-                '综合得分': new_score
+                '基础得分': base_score,   # 用于融合计算，最终报告中可保留或删除
+                '综合得分': base_score    # 临时用基础得分，融合后会更新
             }
             
             compound_key = (best_candidate['name_cn'], formula)
@@ -784,8 +791,8 @@ class UltimateGardeniaIdentifier:
                 herbs_collection[compound_key] = set()
             herbs_collection[compound_key].add(best_candidate['herb'])
             
-            # 更新最佳记录（使用新得分作为择优依据）
-            current_score = new_score
+            # 更新最佳记录（使用基础得分作为择优依据）
+            current_score = base_score
             if compound_key not in best_records or current_score > best_records[compound_key][1]:
                 best_records[compound_key] = (record, current_score)
         
@@ -842,11 +849,15 @@ class UltimateGardeniaIdentifier:
             for comp_key, comp_recs in compound_groups.items():
                 if len(comp_recs) == 1:
                     # 只有一个记录，直接加入
-                    fused_records.append(comp_recs[0])
+                    rec = comp_recs[0].copy()
+                    # 删除临时字段
+                    if '基础得分' in rec:
+                        del rec['基础得分']
+                    fused_records.append(rec)
                 else:
                     # 多个记录（不同加和离子），进行融合
-                    # 找出得分最高的记录作为基础
-                    best_rec = max(comp_recs, key=lambda x: x['综合得分'])
+                    # 找出基础得分最高的记录作为基础
+                    best_rec = max(comp_recs, key=lambda x: x['基础得分']).copy()
                     # 收集所有加和离子（去重）
                     adducts = set()
                     modes = set()
@@ -859,10 +870,18 @@ class UltimateGardeniaIdentifier:
                     best_rec['加和离子'] = '; '.join(sorted(adducts))
                     best_rec['离子化方式'] = '/'.join(sorted(modes))
                     
-                    # 计算奖励分：每个额外加和离子加3分，上限15分
-                    bonus = min((len(comp_recs) - 1) * 3, 15)
-                    new_score = min(best_rec['综合得分'] + bonus, 100)
-                    best_rec['综合得分'] = new_score
+                    # 计算多加和离子加分：每个额外加和离子加5分，上限15分
+                    extra_count = len(adducts) - 1
+                    fusion_bonus = min(extra_count * 5, 15)
+                    final_score = min(best_rec['基础得分'] + fusion_bonus, 100)
+                    
+                    # 应用保底机制（但基础得分已保底，这里再次确保）
+                    if best_rec['评级'] == 1 and final_score < 80:
+                        final_score = 80
+                    if best_rec['评级'] == 2 and final_score < 60:
+                        final_score = 60
+                    
+                    best_rec['综合得分'] = final_score
                     
                     # 评级提升：如果所有记录评级均为2级或以上，且记录数≥2，则提升为1级
                     if len(comp_recs) >= 2 and all(rec['评级'] <= 2 for rec in comp_recs):
@@ -871,6 +890,9 @@ class UltimateGardeniaIdentifier:
                         best_rec['置信度'] = '最高'
                         best_rec['报告建议'] = '可直接报告'
                     
+                    # 删除临时字段
+                    if '基础得分' in best_rec:
+                        del best_rec['基础得分']
                     fused_records.append(best_rec)
             
             i = j  # 移动索引到下一组
@@ -939,7 +961,7 @@ class UltimateGardeniaIdentifier:
     def _print_initialization_info(self):
         """打印初始化信息"""
         print("\n" + "="*80)
-        print("程序初始化完成（多加和离子融合版）")
+        print("程序初始化完成（评分优化版）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -1201,7 +1223,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.8（多加和离子融合版）",
+    page_title="中药化合物智能鉴定平台 v5.9（评分优化版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1343,8 +1365,8 @@ def create_header():
     """创建应用头部"""
     st.markdown("""
     <div class="main-header">
-        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（多加和离子融合版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">自动融合多加和离子提升可信度 v5.8（云端版）</p>
+        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（评分优化版）</h1>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基础分 + 多项加分，总分≤100 v5.9（云端版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1354,7 +1376,7 @@ def create_sidebar():
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1rem 0;">
         <h2 style="color: #2E7D32; margin-bottom: 0.5rem;">🔬 TCM Identifier</h2>
-        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（多加和离子融合版）</p>
+        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（评分优化版）</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1367,11 +1389,11 @@ def create_sidebar():
     
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.8（多加和离子融合版）
+    - 程序版本：v5.9（评分优化版）
     - 数据库规模：35,828条化合物记录
     - 诊断离子：自动加载项目目录下的诊断离子.xlsx
     - 支持药材：291种
-    - 核心特点：多加和离子融合、自动排除母离子、药材名称合并、支持单文件上传
+    - 核心特点：基础分+ppm+碎片+诊断离子+多加和离子加分，总分≤100
     """)
     
     st.sidebar.markdown("""
@@ -1442,12 +1464,12 @@ def show_home_page():
     with col2:
         st.markdown("""
         <div class="feature-card">
-            <h4>⚡ 多加和离子融合</h4>
-            <p>同一保留时间窗口内同一化合物的不同加和离子证据自动融合，给予奖励分并可能提升评级。</p>
+            <h4>⚡ 综合评分系统</h4>
+            <p>基础分 + ppm调整 + 碎片加分 + 诊断离子加分 + 多加和离子加分，总分≤100，科学量化可信度。</p>
         </div>
         <div class="feature-card">
-            <h4>🌱 自动排除母离子</h4>
-            <p>碎片匹配和诊断离子识别时自动排除母离子，避免虚高，使结果更准确。</p>
+            <h4>🌱 药材来源合并</h4>
+            <p>同一化合物的所有药材来源自动合并显示，实现“所有的药材”。</p>
         </div>
         <div class="feature-card">
             <h4>📁 单文件支持</h4>
@@ -1717,10 +1739,19 @@ def show_diagnostic_ion_page():
 def show_guide_page():
     """使用指南页面"""
     create_header()
-    st.markdown("## 📖 使用指南（多加和离子融合版）")
+    st.markdown("## 📖 使用指南（评分优化版）")
     st.info("""
+    ### 综合评分规则
+    - **基础分**：1级85，2级65，3级45，4级25，5级0
+    - **ppm调整**：≤5ppm +5，5-10ppm 0，10-20ppm -5，20-30ppm -10，30-50ppm -15
+    - **碎片加分**：每个匹配碎片+2，上限20
+    - **诊断离子加分**：每个诊断离子+5，上限15
+    - **多加和离子加分**：每个额外加和离子+5，上限15（同一保留时间窗口内）
+    - **保底机制**：1级不低于80，2级不低于60
+    - **总分上限**：100
+
     ### 新增功能说明
-    - **多加和离子融合**：在设定的保留时间容差范围内，若同一化合物出现多个加和离子，程序将自动融合这些证据，给予额外奖励分（每个额外加和离子+3分，上限15分），并可能提升评级（若所有原始评级≥2级，则提升为1级确证级）。
+    - **多加和离子融合**：在设定的保留时间容差范围内，若同一化合物出现多个加和离子，程序将自动融合这些证据，给予额外加分，并可能提升评级（若所有原始评级≥2级，则提升为1级确证级）。
     - **自动排除母离子**：在碎片匹配和诊断离子识别时，自动排除与母离子接近的离子，避免虚高，使结果更准确。
     - **单文件支持**：可只上传正离子或负离子单个文件进行鉴定，灵活适配不同实验数据。
     - **外部诊断离子**：在“开始鉴定”页面上传自定义诊断离子文件（Excel格式，需包含“化合物类型”和“诊断碎片离子m/z”列），程序将使用该库替代内置库进行诊断离子匹配。若不上传，程序会自动加载项目目录下的诊断离子.xlsx（如果存在）。
@@ -1793,7 +1824,7 @@ def show_results_page():
     
     report = st.session_state['analysis_results']
     
-    st.markdown("## 📊 鉴定结果分析（多加和离子融合版）")
+    st.markdown("## 📊 鉴定结果分析（评分优化版）")
     
     if report.empty:
         st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
