@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.11（修正版）
-==========================================================
+中药化合物智能鉴定平台 - 云端部署增强版 v5.11（修正版 + 双诊断离子文件支持）
+=====================================================================
 修正说明：
 - 碎片离子解析支持分号、逗号、空格分隔符
 - 综合得分保证非负
+- 支持核心/辅助双诊断离子文件，核心离子权重2，辅助离子权重1
 """
 
 import streamlit as st
@@ -47,22 +48,40 @@ def normalize_formula(formula):
 
 
 # ============================================================================
+# 文件查找辅助函数
+# ============================================================================
+def find_file(filename):
+    """在常见路径查找文件"""
+    search_paths = [
+        filename,
+        f"data/{filename}",
+        f"user_input_files/{filename}",
+        os.path.join(os.getcwd(), filename)
+    ]
+    for path in search_paths:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+# ============================================================================
 # 鉴定程序核心代码（全能优化版）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.11（修正版）
+    中药化合物鉴定终极版程序 v5.11（修正版 + 双诊断离子文件）
     
     主要修正：
     1. 碎片离子解析支持分号、逗号、空格分隔符。
     2. 综合得分保证非负。
+    3. 支持核心/辅助双诊断离子文件，核心离子权重2，辅助离子权重1。
     """
     
     def __init__(self, database_path, ms_positive_path, ms_negative_path, 
                  herb_name=None, config=None, use_parallel=True,
                  rt_tolerance=0.3, loss_tolerance=0.02,
-                 external_diagnostic_file=None,
+                 external_diagnostic_files=None,   # 改为列表，支持多个文件
                  rt_fusion_tolerance=0.2,
                  intensity_relative_threshold=1.0,
                  tolerance_type='Da',
@@ -101,8 +120,9 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
         
         print("="*80)
-        print("中药化合物鉴定程序 v5.11（修正版）")
+        print("中药化合物鉴定程序 v5.11（修正版 + 双诊断离子文件）")
         print("="*80)
+        
         print("\n【1/8】正在加载数据库...")
         self.full_database = self._load_data(database_path)
         if custom_db_path and os.path.exists(custom_db_path):
@@ -129,12 +149,14 @@ class UltimateGardeniaIdentifier:
         self._build_or_load_index()
         
         print("【5/8】正在加载诊断离子库...")
-        if external_diagnostic_file is None:
-            default_diag_path = find_diagnostic_ion_path()
-            if default_diag_path:
-                print(f"  自动找到默认诊断离子文件: {default_diag_path}")
-                external_diagnostic_file = default_diag_path
-        self._build_diagnostic_ion_library(external_diagnostic_file)
+        if external_diagnostic_files is None:
+            # 自动查找默认文件（核心和辅助）
+            default_core = find_file('核心诊断离子库.xlsx')
+            default_aux = find_file('辅助诊断离子库.xlsx')
+            external_diagnostic_files = [f for f in [default_core, default_aux] if f]
+            if external_diagnostic_files:
+                print(f"  自动找到默认诊断离子文件: {external_diagnostic_files}")
+        self._build_diagnostic_ion_library(external_diagnostic_files)
         
         print("【6/8】正在加载辅助数据...")
         self._load_auxiliary_data()
@@ -318,41 +340,98 @@ class UltimateGardeniaIdentifier:
                     continue
         return np.array(fragments)
     
-    def _build_diagnostic_ion_library(self, external_file=None):
-        """构建诊断性离子库（支持外部Excel文件，自动去重合并权重）"""
-        if external_file and os.path.exists(external_file):
+    # ========== 修改点2：支持多个诊断离子文件，核心权重2，辅助权重1 ==========
+    def _build_diagnostic_ion_library(self, external_files=None):
+        """构建诊断性离子库（支持多个外部Excel文件，自动识别核心/辅助离子并分配权重）"""
+        self.diagnostic_ions = {}
+        all_rows = []
+        
+        if external_files is None:
+            external_files = []
+        if isinstance(external_files, str):
+            external_files = [external_files]
+        
+        # 默认权重
+        default_weights = {
+            '核心': 2,
+            '辅助': 1
+        }
+        
+        for file_path in external_files:
+            if not os.path.exists(file_path):
+                print(f"  警告: 诊断离子文件不存在，跳过: {file_path}")
+                continue
             try:
-                df = pd.read_excel(external_file)
-                required_cols = ['化合物类型', '诊断碎片离子m/z']
-                if not all(col in df.columns for col in required_cols):
-                    raise ValueError(f"外部诊断离子文件缺少必要列：{required_cols}")
-                
-                self.diagnostic_ions = {}
-                for category, group in df.groupby('化合物类型'):
-                    ions_dict = {}
-                    for _, row in group.iterrows():
-                        mz = row['诊断碎片离子m/z']
-                        if pd.notna(mz):
-                            mz = float(mz)
-                            weight = row.get('权重', 1)
-                            try:
-                                weight = float(weight)
-                            except:
-                                weight = 1
-                            ions_dict[mz] = ions_dict.get(mz, 0) + weight
-                    description = group['描述'].iloc[0] if '描述' in group.columns else f'来自外部文件，{len(ions_dict)}个离子'
-                    self.diagnostic_ions[category] = {
-                        'ions': list(ions_dict.keys()),
-                        'weights': list(ions_dict.values()),
-                        'description': description
-                    }
-                print(f"  成功加载外部诊断离子库：{len(self.diagnostic_ions)} 类，{len(df)} 条记录（去重后）")
+                xls = pd.ExcelFile(file_path)
+                sheets = xls.sheet_names
+                file_name = os.path.basename(file_path).lower()
+                for sheet in sheets:
+                    df = pd.read_excel(xls, sheet_name=sheet)
+                    # 检查必需列
+                    if '化合物类型' not in df.columns or '离子m/z' not in df.columns:
+                        print(f"    工作表 {sheet} 缺少必要列（化合物类型/离子m/z），跳过")
+                        continue
+                    
+                    # 提取数据子集
+                    sub = df[['化合物类型', '离子m/z']].copy()
+                    # 提取诊断离子类别列（用于分配权重）
+                    if '诊断离子类别' in df.columns:
+                        sub['类别'] = df['诊断离子类别'].astype(str).str.strip()
+                    else:
+                        # 尝试从文件名推测类别
+                        if '核心' in file_name:
+                            sub['类别'] = '核心诊断离子'
+                        elif '辅助' in file_name:
+                            sub['类别'] = '辅助诊断离子'
+                        else:
+                            sub['类别'] = '未知'
+                    
+                    # 提取权重列（如果有）
+                    if '权重' in df.columns:
+                        sub['权重'] = pd.to_numeric(df['权重'], errors='coerce').fillna(1)
+                    else:
+                        # 根据类别分配默认权重
+                        sub['权重'] = sub['类别'].apply(
+                            lambda x: default_weights['核心'] if '核心' in x else default_weights['辅助'] if '辅助' in x else 1
+                        )
+                    
+                    # 去除无效值
+                    sub = sub.dropna(subset=['离子m/z', '化合物类型'])
+                    sub['离子m/z'] = pd.to_numeric(sub['离子m/z'], errors='coerce')
+                    sub = sub.dropna(subset=['离子m/z'])
+                    sub['权重'] = sub['权重'].astype(float)
+                    
+                    all_rows.append(sub)
+                    print(f"    从 {file_name}[{sheet}] 加载 {len(sub)} 条记录")
             except Exception as e:
-                print(f"  加载外部诊断离子文件失败：{e}，将使用内置库")
-                self._build_default_diagnostic_ions()
-        else:
-            print("  未找到外部诊断离子文件，使用内置诊断离子库（无权重，默认权重1）")
+                print(f"  加载诊断离子文件 {file_path} 失败: {e}")
+        
+        if not all_rows:
+            print("  未加载到任何外部诊断离子，使用内置默认库")
             self._build_default_diagnostic_ions()
+            return
+        
+        combined_df = pd.concat(all_rows, ignore_index=True)
+        
+        # 按化合物类型分组，合并相同 m/z 的权重
+        self.diagnostic_ions = {}
+        for category, group in combined_df.groupby('化合物类型'):
+            ions_dict = {}
+            for _, row in group.iterrows():
+                mz = float(row['离子m/z'])
+                weight = float(row['权重'])
+                ions_dict[mz] = ions_dict.get(mz, 0) + weight
+            ions = list(ions_dict.keys())
+            weights = list(ions_dict.values())
+            description = f'来自外部文件，{len(ions)}个离子（去重后）'
+            self.diagnostic_ions[category] = {
+                'ions': ions,
+                'weights': weights,
+                'description': description
+            }
+        
+        total_ions = sum(len(v['ions']) for v in self.diagnostic_ions.values())
+        print(f"  成功加载外部诊断离子库：共 {len(self.diagnostic_ions)} 类，{len(combined_df)} 条原始记录，去重后 {total_ions} 个离子")
     
     def _build_default_diagnostic_ions(self):
         self.diagnostic_ions = {
@@ -514,7 +593,7 @@ class UltimateGardeniaIdentifier:
             return 5, '参考级', '受限', '信息受限'
         return 6, '排除级', '未识别', '不符合评级标准'
     
-    # ========== 修改点2：确保总分非负 ==========
+    # ========== 修改点3：确保总分非负 ==========
     def _calculate_base_score(self, rating, ppm, matched_frag_count, diag_count,
                               diag_weights=None, neutral_loss_match_count=0, rt_deviation=None):
         if rating == 1:
@@ -1043,7 +1122,7 @@ class UltimateGardeniaIdentifier:
     
     def _print_initialization_info(self):
         print("\n" + "="*80)
-        print("程序初始化完成（修正版）")
+        print("程序初始化完成（修正版 + 双诊断离子文件）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -1099,88 +1178,13 @@ def find_database_path():
     return None
 
 
-@st.cache_data
-def load_diagnostic_ions_cached():
-    diagnostic_ion_paths = [
-        "诊断离子.xlsx",
-        "data/诊断离子.xlsx",
-        "user_input_files/诊断离子.xlsx"
-    ]
-    for path in diagnostic_ion_paths:
-        if os.path.exists(path):
-            try:
-                df = pd.read_excel(path)
-                if '诊断碎片离子m/z' in df.columns:
-                    df['诊断碎片离子m/z'] = pd.to_numeric(df['诊断碎片离子m/z'], errors='coerce')
-                return df
-            except Exception as e:
-                st.warning(f"加载诊断离子文件时出错: {e}")
-                continue
-    return pd.DataFrame()
-
-
-def find_diagnostic_ion_path():
-    diagnostic_ion_paths = [
-        "诊断离子.xlsx",
-        "data/诊断离子.xlsx",
-        "user_input_files/诊断离子.xlsx"
-    ]
-    for path in diagnostic_ion_paths:
-        if os.path.exists(path):
-            return path
-    return None
-
-
-def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_mode=None):
-    if diagnostic_df.empty or not user_mz_values:
-        return pd.DataFrame()
-    if ion_mode and ion_mode != "全部":
-        filtered_df = diagnostic_df[diagnostic_df['离子模式'] == ion_mode].copy()
-    else:
-        filtered_df = diagnostic_df.copy()
-    if '诊断碎片离子m/z' not in filtered_df.columns:
-        return pd.DataFrame()
-    filtered_df = filtered_df.dropna(subset=['诊断碎片离子m/z'])
-    if filtered_df.empty:
-        return pd.DataFrame()
-    results = []
-    for user_mz in user_mz_values:
-        user_mz = float(user_mz)
-        tolerance = user_mz * tolerance_ppm / 1e6
-        mz_min = user_mz - tolerance
-        mz_max = user_mz + tolerance
-        matches = filtered_df[
-            (filtered_df['诊断碎片离子m/z'] >= mz_min) & 
-            (filtered_df['诊断碎片离子m/z'] <= mz_max)
-        ]
-        for _, row in matches.iterrows():
-            ref_mz = row['诊断碎片离子m/z']
-            ppm_error = abs(user_mz - ref_mz) / ref_mz * 1e6
-            results.append({
-                '输入m/z': user_mz,
-                '匹配诊断离子m/z': ref_mz,
-                '误差(ppm)': round(ppm_error, 4),
-                '化合物类型': row.get('化合物类型', ''),
-                '离子模式': row.get('离子模式', ''),
-                '中文名称': row.get('中文名称', ''),
-                '英文名称': row.get('英文名称', ''),
-                '分子式': row.get('分子式', ''),
-                '药材名': row.get('药材名', ''),
-                '准分子离子m/z': row.get('准分子离子m/z', ''),
-                '加合形式': row.get('加合形式', ''),
-                '相对丰度': row.get('相对丰度', ''),
-                '类特征性离子': row.get('类特征性离子', False)
-            })
-    return pd.DataFrame(results)
-
-
 # ============================================================================
 # Streamlit 网页应用部分
 # ============================================================================
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.11（修正版）",
+    page_title="中药化合物智能鉴定平台 v5.11（双诊断离子文件）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1369,7 +1373,7 @@ def create_header():
     """创建应用头部"""
     st.markdown("""
     <div class="main-header">
-        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（修正版）</h1>
+        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（双诊断离子文件版）</h1>
         <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">v5.11 | 登录用户: {}</p>
     </div>
     """.format(st.session_state.get('username', '')), unsafe_allow_html=True)
@@ -1395,9 +1399,9 @@ def create_sidebar():
     st.sidebar.markdown("---")
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.11（修正版）
+    - 程序版本：v5.11（双诊断离子文件版）
     - 数据库规模：35,828条化合物记录
-    - 诊断离子：支持权重，自动去重
+    - 诊断离子：支持核心/辅助双文件，权重自动分配
     - 核心特点：自动列名、双重阈值、中性丢失、RT得分、多数据库
     """)
     
@@ -1463,7 +1467,7 @@ def show_home_page():
         </div>
         <div class="feature-card">
             <h4>🧪 外部诊断离子</h4>
-            <p>支持上传自定义诊断离子文件，自动去重合并权重，避免重复。</p>
+            <p>支持上传核心/辅助双诊断离子文件，自动识别权重，核心权重2，辅助权重1。</p>
         </div>
         """, unsafe_allow_html=True)
     with col2:
@@ -1488,7 +1492,7 @@ def show_home_page():
     ### 使用步骤
     1. **准备数据**：准备好质谱数据文件（Excel格式）和数据库文件（TCM-SM-MS DB.xlsx）
     2. **上传文件**：在"开始鉴定"页面上传正离子和/或负离子质谱数据（至少上传一个）
-    3. **可选**：上传自定义诊断离子文件（若不传，将自动加载项目目录下的诊断离子.xlsx）
+    3. **可选**：上传核心诊断离子库.xlsx 和/或 辅助诊断离子库.xlsx（若不传，将自动查找项目目录下文件）
     4. **配置参数**：设置ppm容差、保留时间容差等参数
     5. **运行鉴定**：点击"开始鉴定"按钮进行分析
     6. **查看结果**：在"结果分析"页面查看和导出鉴定报告
@@ -1500,7 +1504,7 @@ def show_home_page():
 
 
 def show_analysis_page():
-    """鉴定分析页面（集成新参数）"""
+    """鉴定分析页面（集成新参数，支持双诊断离子文件）"""
     create_header()
     
     st.markdown("## 📁 上传质谱数据")
@@ -1520,11 +1524,18 @@ def show_analysis_page():
         st.warning("⚠️ 请至少上传一个质谱数据文件")
     
     st.markdown("---")
-    st.markdown("## 🧪 外部诊断离子（可选）")
-    st.info("若不上传，将自动加载项目目录下的诊断离子.xlsx（如果存在）")
-    diagnostic_file = st.file_uploader("上传自定义诊断离子文件 (.xlsx，可包含权重列)", type=['xlsx'], key='diagnostic')
-    if diagnostic_file:
-        st.success(f"✅ 已上传诊断离子文件: {diagnostic_file.name}")
+    st.markdown("## 🧪 外部诊断离子（可选，可同时上传核心和辅助文件）")
+    st.info("若不上传，将自动查找项目目录下的“核心诊断离子库.xlsx”和“辅助诊断离子库.xlsx”")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        core_diag_file = st.file_uploader("上传核心诊断离子文件 (.xlsx)", type=['xlsx'], key='core_diagnostic')
+        if core_diag_file:
+            st.success(f"✅ 已上传核心文件: {core_diag_file.name}")
+    with col2:
+        aux_diag_file = st.file_uploader("上传辅助诊断离子文件 (.xlsx)", type=['xlsx'], key='aux_diagnostic')
+        if aux_diag_file:
+            st.success(f"✅ 已上传辅助文件: {aux_diag_file.name}")
     
     st.markdown("---")
     st.markdown("## 📚 自定义数据库（可选）")
@@ -1632,7 +1643,7 @@ def show_analysis_page():
                     temp_dir = tempfile.gettempdir()
                     pos_path = None
                     neg_path = None
-                    diag_path = None
+                    diag_paths = []
                     custom_db_path = None
                     
                     if ms_positive_file:
@@ -1643,10 +1654,16 @@ def show_analysis_page():
                         neg_path = os.path.join(temp_dir, ms_negative_file.name)
                         with open(neg_path, 'wb') as f:
                             f.write(ms_negative_file.getbuffer())
-                    if diagnostic_file:
-                        diag_path = os.path.join(temp_dir, diagnostic_file.name)
-                        with open(diag_path, 'wb') as f:
-                            f.write(diagnostic_file.getbuffer())
+                    if core_diag_file:
+                        core_path = os.path.join(temp_dir, core_diag_file.name)
+                        with open(core_path, 'wb') as f:
+                            f.write(core_diag_file.getbuffer())
+                        diag_paths.append(core_path)
+                    if aux_diag_file:
+                        aux_path = os.path.join(temp_dir, aux_diag_file.name)
+                        with open(aux_path, 'wb') as f:
+                            f.write(aux_diag_file.getbuffer())
+                        diag_paths.append(aux_path)
                     if custom_db_file:
                         custom_db_path = os.path.join(temp_dir, custom_db_file.name)
                         with open(custom_db_path, 'wb') as f:
@@ -1682,7 +1699,7 @@ def show_analysis_page():
                         use_parallel=use_parallel,
                         rt_tolerance=rt_tolerance,
                         loss_tolerance=loss_tolerance,
-                        external_diagnostic_file=diag_path,
+                        external_diagnostic_files=diag_paths,   # 注意参数名已改
                         rt_fusion_tolerance=rt_tolerance,
                         intensity_relative_threshold=intensity_rel_threshold,
                         tolerance_type=tolerance_type,
@@ -1719,12 +1736,13 @@ def show_analysis_page():
 
 
 def show_diagnostic_ion_page():
-    """诊断离子筛查页面"""
+    """诊断离子筛查页面（保留原有功能）"""
     create_header()
     
     st.markdown("## 🔬 诊断离子筛查")
     st.markdown("根据输入的m/z值，在诊断离子数据库中查找匹配的化合物特征离子，帮助快速识别化合物类别。")
     
+    # 加载诊断离子数据库（这里仍使用原来的诊断离子.xlsx文件，可单独处理）
     diagnostic_df = load_diagnostic_ions_cached()
     
     if diagnostic_df.empty:
@@ -1829,13 +1847,13 @@ def show_diagnostic_ion_page():
 def show_guide_page():
     """使用指南页面"""
     create_header()
-    st.markdown("## 📖 使用指南（修正版）")
+    st.markdown("## 📖 使用指南（修正版 + 双诊断离子文件）")
     st.info("""
     ### 综合评分规则
     - **基础分**：1级85，2级65，3级45，4级25，5级0
     - **ppm调整**：≤5ppm +5，5-10ppm 0，10-20ppm -5，20-30ppm -10，30-50ppm -15
     - **碎片加分**：每个匹配碎片+2，上限20
-    - **诊断离子加分**：根据权重累计（每个权重单位+5），上限15，重复离子自动合并
+    - **诊断离子加分**：根据权重累计（每个权重单位+5），上限15，核心离子权重2，辅助离子权重1，重复离子自动合并
     - **中性丢失加分**：每个匹配中性丢失+2，上限10
     - **RT得分**：偏差<0.2 +5，<0.5 +2
     - **多加和离子加分**：每个额外加和离子基础+5，根据碎片相似度调整，上限15
@@ -1843,9 +1861,9 @@ def show_guide_page():
     - **总分上限**：100
 
     ### 新增功能说明
-    - **诊断离子去重**：外部诊断离子文件中的重复 m/z 自动合并，权重累加，避免报告中重复。
-    - **加和离子显示优化**：无加和离子时显示空白，更整洁。
-    - 其他功能与 v5.10 相同。
+    - **双诊断离子文件支持**：可同时上传核心和辅助诊断离子库，核心离子权重2，辅助离子权重1，权重累加后计入诊断离子得分。
+    - **自动识别**：若文件中有“诊断离子类别”列，则根据值“核心诊断离子”/“辅助诊断离子”自动分配权重；若无，则根据文件名（包含“核心”或“辅助”）推测，否则默认权重1。
+    - **其他功能**与 v5.10 相同。
     """)
 
 
@@ -1904,7 +1922,7 @@ def show_results_page():
     
     report = st.session_state['analysis_results']
     
-    st.markdown("## 📊 鉴定结果分析（修正版）")
+    st.markdown("## 📊 鉴定结果分析（双诊断离子文件版）")
     
     if report.empty:
         st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
