@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.9
+中药化合物智能鉴定平台 - 云端部署增强版 v5.9（登录版）
 ==========================================================
 
 功能特点：
@@ -16,10 +16,11 @@
 - 智能去重基于得分，并合并所有药材来源
 - 分子式标准化（去除Unicode下标）
 - 加和离子字段清洗（多值时只取第一个）
+- **登录功能**：用户名 ZY，密码 513513
 
 作者：张永
 日期：2026-03-13
-版本：v5.9（评分优化版）
+版本：v5.9（登录版）
 """
 
 import streamlit as st
@@ -33,6 +34,13 @@ import tempfile
 from bisect import bisect_left, bisect_right
 import warnings
 warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+# 登录验证常量
+# ============================================================================
+VALID_USERNAME = "ZY"
+VALID_PASSWORD = "513513"
 
 
 # ============================================================================
@@ -1223,7 +1231,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.9（评分优化版）",
+    page_title="中药化合物智能鉴定平台 v5.9（登录版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1287,6 +1295,22 @@ st.markdown("""
     div[data-testid="stExpander"] {
         border: 1px solid #e0e0e0;
         border-radius: 8px;
+    }
+    
+    /* 登录框样式 */
+    .login-container {
+        max-width: 400px;
+        margin: 100px auto;
+        padding: 2rem;
+        background: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+    }
+    .login-title {
+        text-align: center;
+        color: #2E7D32;
+        font-size: 2rem;
+        margin-bottom: 1rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -1361,12 +1385,43 @@ def load_css():
     """, unsafe_allow_html=True)
 
 
+def login_page():
+    """显示登录页面"""
+    st.markdown("""
+    <div class="login-container">
+        <div class="login-title">🔬 中药化合物智能鉴定平台</div>
+    """, unsafe_allow_html=True)
+    
+    with st.form("login_form"):
+        username = st.text_input("用户名", value="ZY")
+        password = st.text_input("密码", type="password", value="513513")
+        submitted = st.form_submit_button("登录", use_container_width=True)
+        
+        if submitted:
+            if username == VALID_USERNAME and password == VALID_PASSWORD:
+                st.session_state.logged_in = True
+                st.session_state.username = username
+                st.rerun()  # 重新运行以显示主界面
+            else:
+                st.error("用户名或密码错误")
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def logout_button():
+    """在侧边栏显示登出按钮"""
+    if st.sidebar.button("🚪 登出", use_container_width=True):
+        st.session_state.logged_in = False
+        st.session_state.pop('username', None)
+        st.rerun()
+
+
 def create_header():
     """创建应用头部"""
     st.markdown("""
     <div class="main-header">
         <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（评分优化版）</h1>
-        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基础分 + 多项加分，总分≤100 v5.9（云端版）</p>
+        <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">基础分 + 多项加分，总分≤100 v5.9（登录版）</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1379,6 +1434,10 @@ def create_sidebar():
         <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统（评分优化版）</p>
     </div>
     """, unsafe_allow_html=True)
+    
+    # 显示当前登录用户
+    if st.session_state.get('logged_in'):
+        st.sidebar.markdown(f"**当前用户**: {st.session_state.username}")
     
     page = st.sidebar.radio(
         "导航菜单",
@@ -1893,8 +1952,20 @@ def main():
     """主函数"""
     load_css()
     
+    # 检查登录状态
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+    
+    if not st.session_state.logged_in:
+        login_page()
+        return
+    
+    # 已登录，显示主界面
     if 'page' not in st.session_state:
         st.session_state['page'] = '首页'
+    
+    # 显示登出按钮
+    logout_button()
     
     page = create_sidebar()
     st.session_state['page'] = page
