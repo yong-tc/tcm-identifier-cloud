@@ -1,16 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 完整版 v5.12（双诊断离子文件 + 碎片直接比对）
+中药化合物智能鉴定平台 - 最终版 v5.11（双诊断离子文件支持）
 =====================================================================
-功能模块：
-1. 用户登录验证
-2. 智能化合物鉴定（基于数据库匹配，六级评级，综合评分）
-3. 碎片直接比对诊断离子库（快速推测化合物类别）
-4. 诊断离子筛查（输入m/z值检索特征离子）
-5. 数据库预览
-6. 结果分析及报告导出
-
-诊断离子库支持核心/辅助双文件，核心离子权重2，辅助离子权重1。
+主要特点：
+- 使用核心诊断离子库.xlsx 和 辅助诊断离子库.xlsx 替换内置诊断离子库
+- 核心离子权重2，辅助离子权重1，自动识别并累加
+- 保留原有所有鉴定逻辑和评级标准
+- 无新增模块，界面与最初版本一致（首页、开始鉴定、诊断离子筛查、使用指南、数据库预览、结果分析）
 """
 
 import streamlit as st
@@ -67,129 +63,11 @@ def find_file(filename):
 
 
 # ============================================================================
-# 诊断离子库加载（缓存）
-# ============================================================================
-@st.cache_data
-def load_diagnostic_ions_from_files(file_paths):
-    """
-    从多个 Excel 文件加载诊断离子库，合并去重，自动识别核心/辅助离子并分配权重
-    返回字典: {化合物类型: {'ions': list, 'weights': list, 'description': str}}
-    """
-    all_rows = []
-    default_weights = {'核心': 2, '辅助': 1}
-
-    for file_path in file_paths:
-        if not os.path.exists(file_path):
-            continue
-        try:
-            xls = pd.ExcelFile(file_path)
-            sheets = xls.sheet_names
-            file_name = os.path.basename(file_path).lower()
-            for sheet in sheets:
-                df = pd.read_excel(xls, sheet_name=sheet)
-                if '化合物类型' not in df.columns or '离子m/z' not in df.columns:
-                    continue
-
-                sub = df[['化合物类型', '离子m/z']].copy()
-                # 提取诊断离子类别列
-                if '诊断离子类别' in df.columns:
-                    sub['类别'] = df['诊断离子类别'].astype(str).str.strip()
-                else:
-                    # 从文件名推测
-                    if '核心' in file_name:
-                        sub['类别'] = '核心诊断离子'
-                    elif '辅助' in file_name:
-                        sub['类别'] = '辅助诊断离子'
-                    else:
-                        sub['类别'] = '未知'
-
-                # 提取权重列（若有）
-                if '权重' in df.columns:
-                    sub['权重'] = pd.to_numeric(df['权重'], errors='coerce').fillna(1)
-                else:
-                    # 根据类别分配默认权重
-                    sub['权重'] = sub['类别'].apply(
-                        lambda x: default_weights['核心'] if '核心' in x else default_weights['辅助'] if '辅助' in x else 1
-                    )
-
-                sub = sub.dropna(subset=['离子m/z', '化合物类型'])
-                sub['离子m/z'] = pd.to_numeric(sub['离子m/z'], errors='coerce')
-                sub = sub.dropna(subset=['离子m/z'])
-                sub['权重'] = sub['权重'].astype(float)
-                all_rows.append(sub)
-        except Exception:
-            continue
-
-    if not all_rows:
-        return {}
-
-    combined = pd.concat(all_rows, ignore_index=True)
-    diagnostic_ions = {}
-    for cat, group in combined.groupby('化合物类型'):
-        ions_dict = {}
-        for _, row in group.iterrows():
-            mz = float(row['离子m/z'])
-            w = float(row['权重'])
-            ions_dict[mz] = ions_dict.get(mz, 0) + w
-        ions = list(ions_dict.keys())
-        weights = list(ions_dict.values())
-        diagnostic_ions[cat] = {
-            'ions': ions,
-            'weights': weights,
-            'description': f'来自外部文件，{len(ions)}个离子（去重后）'
-        }
-    return diagnostic_ions
-
-
-# ============================================================================
-# 直接比对碎片与诊断离子库
-# ============================================================================
-def match_fragments_to_diagnostic(fragments, diagnostic_ions, mode=None, tolerance=0.05, tolerance_type='Da'):
-    """
-    将碎片离子列表与诊断离子库直接比对
-    fragments: list of float, 样本碎片离子m/z
-    diagnostic_ions: 诊断离子库字典（由 load_diagnostic_ions_from_files 返回）
-    mode: '正离子' 或 '负离子'，若提供则根据离子来源过滤（暂未实现，可扩展）
-    tolerance: 容差值
-    tolerance_type: 'Da' 或 'ppm'
-    返回: dict {类别: {'matched_ions': list, 'total_weight': float, 'matched_weights': list}}
-    """
-    results = {}
-    if not fragments or not diagnostic_ions:
-        return results
-
-    fragments = np.array(fragments)
-    for cat, data in diagnostic_ions.items():
-        matched = []
-        matched_weights = []
-        for ion, w in zip(data['ions'], data['weights']):
-            if tolerance_type == 'Da':
-                deltas = np.abs(fragments - ion)
-                if np.any(deltas <= tolerance):
-                    matched.append(ion)
-                    matched_weights.append(w)
-            else:  # ppm
-                deltas = np.abs(fragments - ion) / ion * 1e6
-                if np.any(deltas <= tolerance):
-                    matched.append(ion)
-                    matched_weights.append(w)
-        if matched:
-            results[cat] = {
-                'matched_ions': matched,
-                'total_weight': sum(matched_weights),
-                'matched_weights': matched_weights
-            }
-    # 按总权重排序
-    results = dict(sorted(results.items(), key=lambda x: x[1]['total_weight'], reverse=True))
-    return results
-
-
-# ============================================================================
-# 鉴定程序核心类（全能优化版，支持双诊断离子文件）
+# 鉴定程序核心类（支持双诊断离子文件）
 # ============================================================================
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.12（支持核心/辅助双诊断离子文件）
+    中药化合物鉴定终极版程序（支持核心/辅助双诊断离子文件）
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -234,7 +112,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v5.12（双诊断离子文件版）")
+        print("中药化合物鉴定程序 v5.11（双诊断离子文件版）")
         print("="*80)
 
         print("\n【1/8】正在加载数据库...")
@@ -531,6 +409,7 @@ class UltimateGardeniaIdentifier:
         print(f"  成功加载外部诊断离子库：共 {len(self.diagnostic_ions)} 类，{len(combined_df)} 条原始记录，去重后 {total_ions} 个离子")
 
     def _build_default_diagnostic_ions(self):
+        # 备用内置库（权重均为1）
         self.diagnostic_ions = {
             '环烯醚萜类': {
                 'ions': [138.055, 124.039, 110.023, 96.008, 82.029, 67.029, 127.039],
@@ -1343,24 +1222,17 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 def load_css():
     st.markdown("""
     <style>
-        /* 整体应用样式 */
         .stApp {
             background: linear-gradient(180deg, #f8f9fa 0%, #ffffff 100%);
         }
-        
-        /* 标题样式 */
         h1, h2, h3 {
             color: #2E7D32 !important;
             font-weight: 600 !important;
         }
-        
-        /* 侧边栏样式 */
         [data-testid="stSidebar"] {
             background: linear-gradient(180deg, #ffffff 0%, #f5f7fa 100%);
             border-right: 1px solid #e0e0e0;
         }
-        
-        /* 按钮样式 */
         .stButton > button {
             background: linear-gradient(135deg, #2E7D32 0%, #1976D2 100%);
             color: white;
@@ -1370,41 +1242,29 @@ def load_css():
             font-weight: 500;
             transition: all 0.3s ease;
         }
-        
         .stButton > button:hover {
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(46, 125, 50, 0.4);
         }
-        
-        /* 进度条样式 */
         .stProgress > div > div {
             background: linear-gradient(90deg, #2E7D32 0%, #1976D2 100%);
         }
-        
-        /* 文件上传样式 */
         [data-testid="stFileUploader"] {
             border: 2px dashed #2E7D32;
             border-radius: 10px;
             padding: 2rem;
             background: rgba(46, 125, 50, 0.05);
         }
-        
-        /* 表格样式 */
         .dataframe {
             font-size: 0.9rem;
         }
-        
-        /* 指标卡片 */
         [data-testid="stMetricValue"] {
             font-size: 1.5rem !important;
             color: #2E7D32;
         }
-        
-        /* 警告和信息框 */
         .stAlert {
             border-radius: 8px;
         }
-        
         .main-header {
             background: linear-gradient(135deg, #2E7D32 0%, #1976D2 100%);
             padding: 2rem;
@@ -1412,7 +1272,6 @@ def load_css():
             margin-bottom: 2rem;
             color: white;
         }
-        
         .feature-card {
             background: white;
             border-radius: 10px;
@@ -1421,7 +1280,6 @@ def load_css():
             margin-bottom: 1rem;
             border-left: 4px solid #2E7D32;
         }
-        
         .stat-box {
             background: linear-gradient(135deg, #f5f7fa 0%, #e4e8eb 100%);
             border-radius: 8px;
@@ -1429,13 +1287,11 @@ def load_css():
             text-align: center;
             margin: 0.5rem 0;
         }
-        
         .stat-number {
             font-size: 2rem;
             font-weight: 700;
             color: #2E7D32;
         }
-        
         .stat-label {
             font-size: 0.9rem;
             color: #666;
@@ -1476,7 +1332,7 @@ def logout_button():
 def create_header():
     st.markdown("""
     <div class="main-header">
-        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（完整版 v5.12）</h1>
+        <h1 style="color: white !important; margin: 0;">🌿 中药化合物智能鉴定平台（双诊断离子文件版）</h1>
         <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">登录用户: {}</p>
     </div>
     """.format(st.session_state.get('username', '')), unsafe_allow_html=True)
@@ -1486,7 +1342,7 @@ def create_sidebar():
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1rem 0;">
         <h2 style="color: #2E7D32; margin-bottom: 0.5rem;">🔬 TCM Identifier</h2>
-        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统 v5.12</p>
+        <p style="color: #666; font-size: 0.8rem;">中药化合物鉴定系统 v5.11</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1495,16 +1351,16 @@ def create_sidebar():
 
     page = st.sidebar.radio(
         "导航菜单",
-        ["首页", "开始鉴定", "碎片直接比对", "诊断离子筛查", "使用指南", "数据库预览", "结果分析"]
+        ["首页", "开始鉴定", "诊断离子筛查", "使用指南", "数据库预览", "结果分析"]
     )
 
     st.sidebar.markdown("---")
     st.sidebar.info("""
     **版本信息**
-    - 程序版本：v5.12（完整版）
+    - 程序版本：v5.11（双诊断离子文件版）
     - 数据库规模：35,828条化合物记录
     - 诊断离子：支持核心/辅助双文件，核心权重2，辅助权重1
-    - 核心特点：直接比对、智能鉴定、自动列名、双重阈值、中性丢失、RT得分、多数据库
+    - 核心特点：自动列名、双重阈值、中性丢失、RT得分、多数据库
     """)
 
     st.sidebar.markdown("""
@@ -1517,14 +1373,9 @@ def create_sidebar():
     return page
 
 
-# ============================================================================
-# 各页面函数
-# ============================================================================
 def show_home_page():
     create_header()
-
     st.markdown("## 📊 系统概览")
-
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.markdown("""
@@ -1557,7 +1408,6 @@ def show_home_page():
 
     st.markdown("---")
     st.markdown("## ✨ 核心功能")
-
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("""
@@ -1585,8 +1435,8 @@ def show_home_page():
             <p>同一化合物的所有药材来源自动合并显示，实现“所有的药材”。</p>
         </div>
         <div class="feature-card">
-            <h4>📁 碎片直接比对</h4>
-            <p>新增功能：将样本碎片离子与诊断离子库直接匹配，快速推测化合物类别。</p>
+            <h4>📁 单文件支持</h4>
+            <p>可只上传正离子或负离子单个文件进行鉴定，灵活适配不同实验数据。</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1834,133 +1684,6 @@ def show_analysis_page():
         st.warning("⚠️ 请至少上传一个质谱数据文件")
 
 
-def show_fragment_match_page():
-    create_header()
-    st.markdown("## 🔬 碎片直接比对诊断离子库")
-    st.markdown("将样本的碎片离子列表与核心/辅助诊断离子库直接比对，按化合物类型输出匹配结果，快速推测样本中可能存在的化合物类别。")
-
-    st.markdown("### 📁 加载诊断离子库")
-    col1, col2 = st.columns(2)
-    with col1:
-        core_file = st.file_uploader("上传核心诊断离子库 (.xlsx)", type=['xlsx'], key='core_match')
-    with col2:
-        aux_file = st.file_uploader("上传辅助诊断离子库 (.xlsx)", type=['xlsx'], key='aux_match')
-
-    temp_dir = tempfile.gettempdir()
-    diag_paths = []
-    if core_file:
-        core_path = os.path.join(temp_dir, core_file.name)
-        with open(core_path, 'wb') as f:
-            f.write(core_file.getbuffer())
-        diag_paths.append(core_path)
-    if aux_file:
-        aux_path = os.path.join(temp_dir, aux_file.name)
-        with open(aux_path, 'wb') as f:
-            f.write(aux_file.getbuffer())
-        diag_paths.append(aux_path)
-
-    if not diag_paths:
-        default_core = find_file('核心诊断离子库.xlsx')
-        default_aux = find_file('辅助诊断离子库.xlsx')
-        if default_core:
-            diag_paths.append(default_core)
-        if default_aux:
-            diag_paths.append(default_aux)
-
-    if not diag_paths:
-        st.warning("未找到诊断离子库文件，请上传或确保项目目录下存在默认文件。")
-        return
-
-    with st.spinner("正在加载诊断离子库..."):
-        diagnostic_ions = load_diagnostic_ions_from_files(diag_paths)
-
-    if not diagnostic_ions:
-        st.error("诊断离子库加载失败，请检查文件格式。")
-        return
-
-    st.success(f"✅ 成功加载诊断离子库，包含 {len(diagnostic_ions)} 个化合物类型，{sum(len(v['ions']) for v in diagnostic_ions.values())} 个去重离子。")
-
-    st.markdown("---")
-    st.markdown("### 📤 上传质谱数据")
-
-    ms_file = st.file_uploader("上传质谱数据文件 (.xlsx)", type=['xlsx'], key='ms_match')
-    if not ms_file:
-        st.info("请上传质谱数据文件。")
-        return
-
-    with st.spinner("正在解析质谱数据..."):
-        df = pd.read_excel(ms_file)
-        mz_columns = [col for col in df.columns if 'm/z' in col.lower() or 'mass' in col.lower()]
-        if not mz_columns:
-            st.error("未找到包含 m/z 的列，请确保列名包含 'm/z' 或 'mass'。")
-            return
-
-        fragments = []
-        for col in mz_columns:
-            vals = df[col].dropna().tolist()
-            for v in vals:
-                try:
-                    fragments.append(float(v))
-                except:
-                    continue
-        fragments = sorted(set(fragments))
-        st.info(f"共提取到 {len(fragments)} 个碎片离子（去重后）。")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        tolerance_type = st.selectbox("容差类型", options=["Da", "ppm"], index=0)
-    with col2:
-        if tolerance_type == "Da":
-            tolerance = st.number_input("容差 (Da)", min_value=0.001, max_value=1.0, value=0.05, step=0.01)
-        else:
-            tolerance = st.number_input("容差 (ppm)", min_value=1, max_value=100, value=20, step=1)
-    with col3:
-        min_weight = st.number_input("最小总权重", min_value=0, value=0, help="仅显示总权重大于此值的类型")
-
-    if st.button("🚀 开始比对", type="primary"):
-        with st.spinner("正在匹配诊断离子..."):
-            results = match_fragments_to_diagnostic(
-                fragments, diagnostic_ions,
-                tolerance=tolerance, tolerance_type=tolerance_type
-            )
-
-        if not results:
-            st.warning("未匹配到任何诊断离子，请尝试调整容差。")
-            return
-
-        filtered = {k: v for k, v in results.items() if v['total_weight'] >= min_weight}
-        if not filtered:
-            st.warning(f"无总权重大于 {min_weight} 的匹配结果。")
-            return
-
-        st.markdown("### 📊 匹配结果")
-
-        rows = []
-        for cat, data in filtered.items():
-            rows.append({
-                '化合物类型': cat,
-                '匹配离子数': len(data['matched_ions']),
-                '总权重': data['total_weight'],
-                '匹配离子列表': '; '.join([f"{x:.4f}" for x in data['matched_ions']])
-            })
-        result_df = pd.DataFrame(rows)
-        result_df = result_df.sort_values('总权重', ascending=False).reset_index(drop=True)
-
-        st.dataframe(result_df, use_container_width=True)
-
-        st.bar_chart(result_df.set_index('化合物类型')['总权重'])
-
-        col1, col2 = st.columns(2)
-        with col1:
-            csv = result_df.to_csv(index=False, encoding='utf-8-sig')
-            st.download_button("📥 导出CSV", data=csv, file_name=f"直接比对_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
-        with col2:
-            buffer = BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                result_df.to_excel(writer, index=False, sheet_name='直接比对结果')
-            st.download_button("📥 导出Excel", data=buffer.getvalue(), file_name=f"直接比对_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
 def show_diagnostic_ion_page():
     create_header()
 
@@ -2070,7 +1793,7 @@ def show_diagnostic_ion_page():
 
 def show_guide_page():
     create_header()
-    st.markdown("## 📖 使用指南（完整版 v5.12）")
+    st.markdown("## 📖 使用指南（双诊断离子文件版）")
     st.info("""
     ### 综合评分规则
     - **基础分**：1级85，2级65，3级45，4级25，5级0
@@ -2082,11 +1805,6 @@ def show_guide_page():
     - **多加和离子加分**：每个额外加和离子基础+5，根据碎片相似度调整，上限15
     - **保底机制**：1级不低于80，2级不低于60
     - **总分上限**：100
-
-    ### 新增功能：碎片直接比对
-    - 上传质谱数据文件，程序自动提取碎片离子，与核心/辅助诊断离子库直接匹配。
-    - 按化合物类型统计匹配离子数和累计权重（核心离子权重2，辅助离子权重1），帮助快速推测样本中可能含有的化合物类别。
-    - 可调整容差类型和大小，设置最小总权重过滤。
 
     ### 诊断离子文件说明
     - 核心诊断离子库：文件名为“核心诊断离子库.xlsx”，应包含“化合物类型”、“离子m/z”列，以及可选的“诊断离子类别”列（值为“核心诊断离子”），若无此列则根据文件名自动分配权重2。
@@ -2212,9 +1930,6 @@ def show_results_page():
         st.download_button(label="📥 导出Excel", data=buffer.getvalue(), file_name=f"鉴定报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-# ============================================================================
-# 主函数
-# ============================================================================
 def main():
     load_css()
 
@@ -2236,8 +1951,6 @@ def main():
         show_home_page()
     elif page == "开始鉴定":
         show_analysis_page()
-    elif page == "碎片直接比对":
-        show_fragment_match_page()
     elif page == "诊断离子筛查":
         show_diagnostic_ion_page()
     elif page == "使用指南":
