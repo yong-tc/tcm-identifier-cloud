@@ -1,27 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.11
+中药化合物智能鉴定平台 - 云端部署增强版 v5.11（修正版）
 ==========================================================
-
-功能特点：
-- 登录验证（用户名 ZY，密码 513513），无默认填充，需手动输入
-- 自动检测列名，兼容多种质谱数据格式
-- 绝对/相对强度阈值双重过滤
-- 可切换碎片匹配容差类型（Da/ppm）
-- 中性丢失匹配得分
-- 诊断离子动态权重（基于外部文件），自动去重合并
-- 评级替代条件（高精度无诊断离子也可1级）
-- 多加和离子融合时考虑碎片相似度
-- 保留时间匹配得分
-- 去重键扩展（中文名、英文名、CAS）
-- 索引序列化缓存，加速启动
-- 参数预设（快速/高精度）及自动保存
-- 详细的错误提示及示例文件
-- 支持上传自定义数据库联合检索
-
-作者：张永
-日期：2026-03-13
-版本：v5.11（完整版）
+修正说明：
+- 碎片离子解析支持分号、逗号、空格分隔符
+- 综合得分保证非负
 """
 
 import streamlit as st
@@ -72,8 +55,8 @@ class UltimateGardeniaIdentifier:
     中药化合物鉴定终极版程序 v5.11（修正版）
     
     主要修正：
-    1. 诊断离子库构建时对同一 m/z 去重合并权重，避免报告中诊断离子重复。
-    2. 加和离子字段清洗时，将 nan 替换为空字符串。
+    1. 碎片离子解析支持分号、逗号、空格分隔符。
+    2. 综合得分保证非负。
     """
     
     def __init__(self, database_path, ms_positive_path, ms_negative_path, 
@@ -309,20 +292,30 @@ class UltimateGardeniaIdentifier:
         self.db_frag_pos = [x[2] for x in self.sorted_idx_pos]
         self.db_frag_neg = [x[2] for x in self.sorted_idx_neg]
     
+    # ========== 修改点1：支持多种分隔符 ==========
     def _parse_fragments_fast(self, fragment_string):
+        """解析碎片离子字符串，支持分号、逗号、空格分隔符"""
         if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
             return np.array([])
         fragments = []
-        try:
-            for part in str(fragment_string).split(','):
-                part = part.strip()
-                if part:
-                    try:
-                        fragments.append(float(part))
-                    except ValueError:
-                        continue
-        except Exception:
-            pass
+        # 尝试多种分隔符
+        s = str(fragment_string)
+        # 如果包含分号，按分号分割
+        if ';' in s:
+            parts = s.split(';')
+        elif ',' in s:
+            parts = s.split(',')
+        elif ' ' in s:
+            parts = s.split()
+        else:
+            parts = [s]
+        for part in parts:
+            part = part.strip()
+            if part:
+                try:
+                    fragments.append(float(part))
+                except ValueError:
+                    continue
         return np.array(fragments)
     
     def _build_diagnostic_ion_library(self, external_file=None):
@@ -521,8 +514,9 @@ class UltimateGardeniaIdentifier:
             return 5, '参考级', '受限', '信息受限'
         return 6, '排除级', '未识别', '不符合评级标准'
     
+    # ========== 修改点2：确保总分非负 ==========
     def _calculate_base_score(self, rating, ppm, matched_frag_count, diag_count,
-                               diag_weights=None, neutral_loss_match_count=0, rt_deviation=None):
+                              diag_weights=None, neutral_loss_match_count=0, rt_deviation=None):
         if rating == 1:
             base = 85
         elif rating == 2:
@@ -562,6 +556,9 @@ class UltimateGardeniaIdentifier:
                 rt_adj = 2
         
         total = base + ppm_adj + frag_adj + diag_score + loss_adj + rt_adj
+        
+        # 保证非负
+        total = max(0, total)
         
         if rating == 1 and total < 80:
             total = 80
