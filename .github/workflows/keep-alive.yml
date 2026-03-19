@@ -1,0 +1,22 @@
+name: Keep Streamlit App Alive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-streamlit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Streamlit App
+        run: |
+          echo "正在Ping Streamlit应用..."
+          response=$(curl -s -o /dev/null -w "%{http_code}" https://tcm-sm-msdb.streamlit.app/)
+          echo "HTTP状态码: $response"
+          if [ "$response" = "200" ]; then
+            echo "✅ 应用正常运行"
+          else
+            echo "⚠️ 应用可能休眠"
+            curl -s https://tcm-sm-msdb.streamlit.app/ > /dev/null
+          fi
