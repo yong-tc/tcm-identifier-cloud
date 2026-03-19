@@ -1,0 +1,18 @@
+[server]
+fasterSockets = true
+maxUploadSize = 200
+
+[browser]
+serverHeadless = true
+
+[client]
+showErrorDetails = true
+
+[client.toolbarMode]
+value = "minimal"
+
+[runner]
+magicEnabled = true
+
+[runner.fastReruns]
+enabled = true
