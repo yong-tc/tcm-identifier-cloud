@@ -1,0 +1,2439 @@
+# -*- coding: utf-8 -*-
+"""
+中药化合物智能鉴定平台 - 云端部署增强版 v5.11（优化版）
+==========================================================
+界面优化说明：
+- 采用现代卡片式设计，视觉层次更清晰
+- 优化配色方案，增加生机感
+- 改进数据可视化，增加交互性
+- 优化加载和状态反馈体验
+- 改善移动端适配
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+import time
+import pickle
+import hashlib
+from datetime import datetime
+from io import BytesIO
+import tempfile
+from bisect import bisect_left, bisect_right
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+# 登录验证常量
+# ============================================================================
+VALID_USERNAME = "ZY"
+VALID_PASSWORD = "513513"
+
+
+# ============================================================================
+# 辅助函数：标准化分子式
+# ============================================================================
+def normalize_formula(formula):
+    """标准化分子式（去除Unicode下标）"""
+    if pd.isna(formula) or not formula:
+        return 'unknown'
+    formula = str(formula)
+    subscripts = {'₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
+                  '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
+                  'ₐ': 'a', 'ₑ': 'e', 'ₕ': 'h', 'ₖ': 'k', 'ₙ': 'n',
+                  'ₒ': 'o', 'ₚ': 'p', 'ₛ': 's', 'ₜ': 't', 'ᵢ': 'i', 'ᵣ': 'r'}
+    for sub, norm in subscripts.items():
+        formula = formula.replace(sub, norm)
+    return formula.strip()
+
+
+# ============================================================================
+# 鉴定程序核心代码（全能优化版）
+# ============================================================================
+
+class UltimateGardeniaIdentifier:
+    """
+    中药化合物鉴定终极版程序 v5.11（修正版）
+
+    主要修正：
+    1. 碎片离子解析支持分号、逗号、空格分隔符。
+    2. 综合得分保证非负。
+    """
+
+    def __init__(self, database_path, ms_positive_path, ms_negative_path,
+                 herb_name=None, config=None, use_parallel=True,
+                 rt_tolerance=0.3, loss_tolerance=0.02,
+                 external_diagnostic_file=None,
+                 rt_fusion_tolerance=0.2,
+                 intensity_relative_threshold=1.0,
+                 tolerance_type='Da',
+                 use_rt_score=True,
+                 custom_db_path=None,
+                 cache_index=True):
+        """初始化鉴定程序（增强版）"""
+        self.config = {
+            'gradient_time': 30.0,
+            'cid_min': 0.5,
+            'cid_max': 1.0,
+            'fragment_tolerance': 0.05,
+            'fragment_tolerance_ppm': 20,
+            'tolerance_ppm': 50,
+            'max_candidates': 3,
+            'min_fragment_count': 1,
+            'min_intensity': 100,
+            'ppm_tier1': 10,
+            'ppm_tier2': 20,
+            'max_ppm': 100,  # 新增：允许的最大ppm误差
+        }
+
+        if config:
+            self.config.update(config)
+
+        self.rt_tolerance = rt_tolerance
+        self.loss_tolerance = loss_tolerance
+        self.rt_fusion_tolerance = rt_fusion_tolerance
+        self.intensity_relative_threshold = intensity_relative_threshold / 100.0
+        self.tolerance_type = tolerance_type
+        self.use_rt_score = use_rt_score
+        self.custom_db_path = custom_db_path
+        self.cache_index = cache_index
+        self.herb_name = herb_name
+
+        self.use_parallel = use_parallel and os.cpu_count() > 1
+        self.num_workers = min(os.cpu_count(), 8)
+
+        print("="*80)
+        print("中药化合物鉴定程序 v5.11（修正版）")
+        print("="*80)
+        print("\n【1/8】正在加载数据库...")
+        self.full_database = self._load_data(database_path)
+        if custom_db_path and os.path.exists(custom_db_path):
+            custom_db = self._load_data(custom_db_path)
+            if not custom_db.empty:
+                print(f"  加载自定义数据库: {len(custom_db)} 条记录")
+                self.full_database = pd.concat([self.full_database, custom_db], ignore_index=True)
+
+        if herb_name:
+            print(f"【2/8】正在筛选 {herb_name} 相关数据...")
+            self.database = self._filter_by_herb(herb_name)
+        else:
+            self.database = self.full_database.copy()
+            print("【2/8】使用全部数据库进行化合物鉴定")
+        print(f"  数据库记录数: {len(self.database)}")
+
+        print("【3/8】正在加载质谱数据...")
+        self.ms_positive = self._load_data(ms_positive_path) if ms_positive_path else pd.DataFrame()
+        self.ms_negative = self._load_data(ms_negative_path) if ms_negative_path else pd.DataFrame()
+        print(f"  正离子数据: {len(self.ms_positive)} 条记录")
+        print(f"  负离子数据: {len(self.ms_negative)} 条记录")
+
+        print("【4/8】正在构建索引...")
+        self._build_or_load_index()
+
+        print("【5/8】正在加载诊断离子库...")
+        if external_diagnostic_file is None:
+            default_diag_path = find_diagnostic_ion_path()
+            if default_diag_path:
+                print(f"  自动找到默认诊断离子文件: {default_diag_path}")
+                external_diagnostic_file = default_diag_path
+        self._build_diagnostic_ion_library(external_diagnostic_file)
+
+        print("【6/8】正在加载辅助数据...")
+        self._load_auxiliary_data()
+
+        self.stats = {
+            'total_precursors': 0,
+            'identified_compounds': 0,
+            'scored_candidates': 0
+        }
+
+        self._print_initialization_info()
+        print("【7/8】初始化完成，准备鉴定")
+
+    def _load_data(self, filepath):
+        if filepath and os.path.exists(filepath):
+            try:
+                if filepath.endswith('.xlsx'):
+                    df = pd.read_excel(filepath)
+                elif filepath.endswith('.csv'):
+                    return pd.read_csv(filepath)
+
+                # 修复列名不匹配问题 - 标准化列名
+                column_mapping = {
+                    '药材名': '药材名称',
+                    '文献': '文献来源',
+                    '保留时间(min)': '保留时间',
+                    '中丢失': '中性丢失'
+                }
+                for old_name, new_name in column_mapping.items():
+                    if old_name in df.columns and new_name not in df.columns:
+                        df.rename(columns={old_name: new_name}, inplace=True)
+
+                return df
+            except Exception as e:
+                print(f"警告: 无法加载文件 {filepath}: {e}")
+                return pd.DataFrame()
+        print(f"警告: 文件不存在或路径无效: {filepath}")
+        return pd.DataFrame()
+
+    def _filter_by_herb(self, herb_name):
+        if herb_name is None:
+            return self.full_database.copy()
+
+        # 兼容不同的药材列名
+        herb_col = '药材名称' if '药材名称' in self.full_database.columns else '药材名'
+        mask = self.full_database[herb_col].str.contains(herb_name, na=False, case=False)
+        filtered_db = self.full_database[mask].copy()
+        if len(filtered_db) == 0:
+            print(f"警告: 未找到 '{herb_name}' 相关数据，将使用全部数据")
+            return self.full_database.copy()
+        return filtered_db
+
+    def _build_or_load_index(self):
+        cache_file = "index_cache.pkl"
+        db_hash = hashlib.md5(pd.util.hash_pandas_object(self.database).values).hexdigest()
+
+        if self.cache_index and os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached = pickle.load(f)
+                if cached.get('db_hash') == db_hash:
+                    print("  从缓存加载索引...")
+                    self.sorted_idx_pos = cached['sorted_idx_pos']
+                    self.sorted_idx_neg = cached['sorted_idx_neg']
+                    self.mz_values_pos = cached['mz_values_pos']
+                    self.mz_values_neg = cached['mz_values_neg']
+                    self.db_frag_pos = cached['db_frag_pos']
+                    self.db_frag_neg = cached['db_frag_neg']
+                    self.compound_info = cached['compound_info']
+                    self.rt_values = cached.get('rt_values', {})
+                    self.neutral_losses = cached.get('neutral_losses', {})
+                    print("  缓存加载成功")
+                    return
+            except Exception as e:
+                print(f"  缓存加载失败，重新构建: {e}")
+
+        self._build_optimized_index()
+
+        if self.cache_index:
+            try:
+                cached = {
+                    'db_hash': db_hash,
+                    'sorted_idx_pos': self.sorted_idx_pos,
+                    'sorted_idx_neg': self.sorted_idx_neg,
+                    'mz_values_pos': self.mz_values_pos,
+                    'mz_values_neg': self.mz_values_neg,
+                    'db_frag_pos': self.db_frag_pos,
+                    'db_frag_neg': self.db_frag_neg,
+                    'compound_info': self.compound_info,
+                    'rt_values': self.rt_values,
+                    'neutral_losses': self.neutral_losses
+                }
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(cached, f)
+                print("  索引已缓存")
+            except Exception as e:
+                print(f"  缓存保存失败: {e}")
+
+    def _build_optimized_index(self):
+        self.sorted_idx_pos = []
+        self.sorted_idx_neg = []
+        self.mz_values_pos = []
+        self.mz_values_neg = []
+        self.db_frag_pos = []
+        self.db_frag_neg = []
+        self.compound_info = {}
+        self.rt_values = {}
+        self.neutral_losses = {}
+
+        for idx, row in self.database.iterrows():
+            mz_pos = row.get('准分子离子（正）', 0)
+            mz_neg = row.get('准分子离子（负）', 0)
+
+            cn_name = str(row.get('名称（中文）', ''))
+            en_name = str(row.get('名称（英文）', ''))
+            formula = str(row.get('分子式', ''))
+            if formula and formula != 'nan':
+                formula = normalize_formula(formula)
+            # 兼容不同的列名 - 药材名称
+            herb = str(row.get('药材名称') or row.get('药材名') or '')
+            compound_type = str(row.get('化合物类型', ''))
+            # 兼容文献来源列名
+            source = str(row.get('文献来源') or row.get('文献') or '')
+            cas = str(row.get('CAS', ''))
+
+            self.compound_info[idx] = {
+                'name_cn': cn_name,
+                'name_en': en_name,
+                'formula': formula,
+                'herb': herb,
+                'compound_type': compound_type,
+                'source': source,
+                'cas': cas if cas and cas != 'nan' else '',
+                'adduct_pos': str(row.get('加合物（正）', '')),
+                'adduct_neg': str(row.get('加合物（负）', ''))
+            }
+
+            if '保留时间(min)' in row and pd.notna(row['保留时间(min)']):
+                try:
+                    self.rt_values[idx] = float(row['保留时间(min)'])
+                except:
+                    pass
+
+            if '中性丢失' in row and pd.notna(row['中性丢失']):
+                losses = self._parse_losses(row['中性丢失'])
+                if losses:
+                    self.neutral_losses[idx] = losses
+
+            if pd.notna(mz_pos) and str(mz_pos).strip() != '':
+                try:
+                    mz_val = float(mz_pos)
+                    if mz_val > 0:
+                        fragments = self._parse_fragments_fast(row.get('碎片离子（正）', ''))
+                        self.sorted_idx_pos.append((mz_val, idx, fragments))
+                except (ValueError, TypeError):
+                    pass
+
+            if pd.notna(mz_neg) and str(mz_neg).strip() != '':
+                try:
+                    mz_val = float(mz_neg)
+                    if mz_val > 0:
+                        fragments = self._parse_fragments_fast(row.get('碎片离子（负）', ''))
+                        self.sorted_idx_neg.append((mz_val, idx, fragments))
+                except (ValueError, TypeError):
+                    pass
+
+        self.sorted_idx_pos.sort(key=lambda x: x[0])
+        self.sorted_idx_neg.sort(key=lambda x: x[0])
+
+        self.mz_values_pos = np.array([x[0] for x in self.sorted_idx_pos])
+        self.mz_values_neg = np.array([x[0] for x in self.sorted_idx_neg])
+
+        self.db_frag_pos = [x[2] for x in self.sorted_idx_pos]
+        self.db_frag_neg = [x[2] for x in self.sorted_idx_neg]
+
+    # ========== 修改点1：支持多种分隔符 ==========
+    def _parse_fragments_fast(self, fragment_string):
+        """解析碎片离子字符串，支持顿号、分号、逗号、空格分隔符"""
+        if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
+            return np.array([])
+        fragments = []
+        # 尝试多种分隔符 - 按优先级
+        s = str(fragment_string)
+        # 优先使用顿号（、）分割，这是中文最常用的
+        if '、' in s:
+            parts = s.split('、')
+        # 其次使用分号（;）
+        elif ';' in s:
+            parts = s.split(';')
+        # 然后使用逗号（,）
+        elif ',' in s:
+            parts = s.split(',')
+        # 最后使用空格
+        elif ' ' in s:
+            parts = s.split()
+        else:
+            parts = [s]
+
+        for part in parts:
+            part = part.strip()
+            if part:
+                try:
+                    fragments.append(float(part))
+                except ValueError:
+                    continue
+        return np.array(fragments)
+
+    def _build_diagnostic_ion_library(self, external_file=None):
+        """构建诊断性离子库（支持外部Excel文件，自动去重合并权重）"""
+        if external_file and os.path.exists(external_file):
+            try:
+                df = pd.read_excel(external_file)
+                required_cols = ['化合物类型', '诊断碎片离子m/z']
+                if not all(col in df.columns for col in required_cols):
+                    raise ValueError(f"外部诊断离子文件缺少必要列：{required_cols}")
+
+                self.diagnostic_ions = {}
+                for category, group in df.groupby('化合物类型'):
+                    ions_dict = {}
+                    for _, row in group.iterrows():
+                        mz = row['诊断碎片离子m/z']
+                        if pd.notna(mz):
+                            mz = float(mz)
+                            weight = row.get('权重', 1)
+                            try:
+                                weight = float(weight)
+                            except:
+                                weight = 1
+                            ions_dict[mz] = ions_dict.get(mz, 0) + weight
+                    description = group['描述'].iloc[0] if '描述' in group.columns else f'来自外部文件，{len(ions_dict)}个离子'
+                    self.diagnostic_ions[category] = {
+                        'ions': list(ions_dict.keys()),
+                        'weights': list(ions_dict.values()),
+                        'description': description
+                    }
+                print(f"  成功加载外部诊断离子库：{len(self.diagnostic_ions)} 类，{len(df)} 条记录（去重后）")
+            except Exception as e:
+                print(f"  加载外部诊断离子文件失败：{e}，将使用内置库")
+                self._build_default_diagnostic_ions()
+        else:
+            print("  未找到外部诊断离子文件，使用内置诊断离子库（无权重，默认权重1）")
+            self._build_default_diagnostic_ions()
+
+    def _build_default_diagnostic_ions(self):
+        self.diagnostic_ions = {
+            '环烯醚萜类': {
+                'ions': [138.055, 124.039, 110.023, 96.008, 82.029, 67.029, 127.039],
+                'weights': [1]*7,
+                'description': '环烯醚萜类特征脱水碎片'
+            },
+            '有机酸类': {
+                'ions': [191.056, 179.034, 173.045, 135.045, 93.034, 85.029],
+                'weights': [1]*6,
+                'description': '咖啡酰奎尼酸系列特征离子'
+            },
+            '黄酮类': {
+                'ions': [151.003, 137.024, 121.029, 107.049, 81.034, 65.039],
+                'weights': [1]*6,
+                'description': '黄酮苷元特征碎片'
+            },
+            '萜类': {
+                'ions': [127.076, 113.060, 99.044, 85.029, 71.013],
+                'weights': [1]*5,
+                'description': '萜类特征碎片'
+            },
+            '栀子特异': {
+                'ions': [127.039, 113.024, 101.024, 69.034, 97.028],
+                'weights': [1]*5,
+                'description': '栀子特有成分特征离子'
+            },
+            '生物碱类': {
+                'ions': [105.070, 91.054, 79.054, 65.039],
+                'weights': [1]*4,
+                'description': '生物碱特征碎片'
+            },
+            '酚酸类': {
+                'ions': [137.024, 123.044, 109.028, 95.049],
+                'weights': [1]*4,
+                'description': '酚酸类特征碎片'
+            }
+        }
+
+    def _load_auxiliary_data(self):
+        pass
+
+    def _parse_losses(self, loss_string):
+        if pd.isna(loss_string):
+            return []
+        losses = []
+        for part in str(loss_string).split(','):
+            part = part.strip()
+            try:
+                losses.append(float(part))
+            except ValueError:
+                continue
+        return losses
+
+    def _find_neutral_losses(self, fragments, precursor_mz):
+        if len(fragments) == 0:
+            return []
+        observed_losses = []
+        precursor_mz = float(precursor_mz)
+        for frag in fragments:
+            loss = precursor_mz - float(frag)
+            if 10 < loss < 500:
+                observed_losses.append(round(loss, 4))
+        return observed_losses
+
+    def _classify_compound(self, name, compound_type):
+        name = name.lower()
+        compound_type = str(compound_type).lower()
+
+        if any(keyword in compound_type for keyword in ['环烯醚', 'iridoid']):
+            return '环烯醚萜类'
+        if any(keyword in compound_type for keyword in ['有机酸', '酚酸']):
+            return '有机酸类'
+        if any(keyword in compound_type for keyword in ['黄酮', 'flavon']):
+            return '黄酮类'
+        if any(keyword in compound_type for keyword in ['萜', 'terpen']):
+            return '萜类'
+        if any(keyword in compound_type for keyword in ['生物碱', 'alkaloid']):
+            return '生物碱类'
+        if any(keyword in name for keyword in ['京尼平', '栀子', 'genipos', 'gardenia']):
+            return '栀子特异'
+        return '其他'
+
+    def _binary_search_range(self, mz_array, mz, tolerance_ppm):
+        if len(mz_array) == 0:
+            return range(0, 0)
+        mz = float(mz)
+        tolerance = mz * tolerance_ppm / 1e6
+        mz_min = mz - tolerance
+        mz_max = mz + tolerance
+        left = bisect_left(mz_array, mz_min)
+        right = bisect_right(mz_array, mz_max)
+        return range(left, right)
+
+    def _match_fragments_fast(self, observed, reference, tolerance_value, tolerance_type='Da', precursor_mz=None):
+        matched = []
+        if len(reference) == 0:
+            return matched
+        ref_arr = np.asarray(reference)
+        obs_arr = np.asarray(observed)
+        for ref_val in ref_arr:
+            if pd.notna(ref_val) and float(ref_val) > 0:
+                for obs_val in obs_arr:
+                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
+                        continue
+                    if tolerance_type == 'Da':
+                        if abs(obs_val - ref_val) <= tolerance_value:
+                            matched.append(obs_val)
+                            break
+                    else:
+                        ppm_error = abs(obs_val - ref_val) / ref_val * 1e6
+                        if ppm_error <= tolerance_value:
+                            matched.append(obs_val)
+                            break
+        return list(set(matched))
+
+    def _find_diagnostic_ions_fast(self, matched_fragments, category, precursor_mz=None):
+        if len(matched_fragments) == 0:
+            return [], []
+        if category not in self.diagnostic_ions:
+            return [], []
+
+        diag_data = self.diagnostic_ions[category]
+        diag_ions = np.array(diag_data['ions'])
+        diag_weights = diag_data['weights']
+        matched_arr = np.asarray(matched_fragments)
+        tolerance = self.config['fragment_tolerance']
+
+        diagnostic = []
+        weights_used = []
+        for diag_val, weight in zip(diag_ions, diag_weights):
+            for matched_val in matched_arr:
+                if abs(matched_val - diag_val) <= tolerance:
+                    if precursor_mz is not None and abs(matched_val - precursor_mz) <= tolerance:
+                        continue
+                    diagnostic.append(float(matched_val))
+                    weights_used.append(weight)
+                    break
+        return diagnostic, weights_used
+
+    def _determine_confidence_level(self, ppm, matched_count, diagnostic_count, has_fragment_data):
+        ppm_tier1 = self.config.get('ppm_tier1', 10)
+        ppm_tier2 = self.config.get('ppm_tier2', 20)
+        max_ppm = self.config.get('max_ppm', 100)  # 新增：允许的最大ppm
+
+        # 放宽ppm限制到max_ppm
+        if ppm > max_ppm:
+            return 6, '排除级', '未识别', f'ppm > {max_ppm}，不符合报告要求'
+        if ppm <= 5 and matched_count >= 3:
+            return 1, '确证级', '最高', '高精度+丰富碎片，可直接报告'
+        if ppm <= ppm_tier1 and matched_count >= 2 and diagnostic_count >= 1:
+            return 1, '确证级', '最高', '可直接报告'
+        if ppm <= ppm_tier2 and matched_count >= 2:
+            return 2, '高置信级', '良好', '建议复核后报告'
+        if ppm <= 50 and matched_count >= 1:
+            return 3, '推定级', '中等', '需验证后报告'
+        if ppm <= 50 and not has_fragment_data:
+            return 4, '提示级', '较低', '仅供筛查'
+        if ppm <= 50 and has_fragment_data and matched_count == 0:
+            return 5, '参考级', '受限', '信息受限'
+        # 新增：ppm在50-100之间的处理
+        if 50 < ppm <= 75:
+            return 4, '提示级', '较低', 'ppm稍大，仅供筛查参考'
+        if 75 < ppm <= max_ppm:
+            return 5, '参考级', '受限', 'ppm较大，需谨慎使用'
+        return 6, '排除级', '未识别', '不符合评级标准'
+
+    # ========== 修改点2：确保总分非负 ==========
+    def _calculate_base_score(self, rating, ppm, matched_frag_count, diag_count,
+                              diag_weights=None, neutral_loss_match_count=0, rt_deviation=None):
+        if rating == 1:
+            base = 85
+        elif rating == 2:
+            base = 65
+        elif rating == 3:
+            base = 45
+        elif rating == 4:
+            base = 25
+        else:
+            base = 0
+
+        if ppm <= 5:
+            ppm_adj = 5
+        elif ppm <= 10:
+            ppm_adj = 0
+        elif ppm <= 20:
+            ppm_adj = -5
+        elif ppm <= 30:
+            ppm_adj = -10
+        else:
+            ppm_adj = -15
+
+        frag_adj = min(matched_frag_count * 2, 20)
+
+        if diag_weights:
+            diag_score = min(sum(diag_weights) * 5, 15)
+        else:
+            diag_score = min(diag_count * 5, 15)
+
+        loss_adj = min(neutral_loss_match_count * 2, 10)
+
+        rt_adj = 0
+        if rt_deviation is not None and self.use_rt_score:
+            if rt_deviation < 0.2:
+                rt_adj = 5
+            elif rt_deviation < 0.5:
+                rt_adj = 2
+
+        total = base + ppm_adj + frag_adj + diag_score + loss_adj + rt_adj
+
+        # 保证非负
+        total = max(0, total)
+
+        if rating == 1 and total < 80:
+            total = 80
+        if rating == 2 and total < 60:
+            total = 60
+
+        total = min(total, 100)
+        return round(total, 2)
+
+    def extract_precursor_ions(self, ms_data, ionization_mode):
+        if ms_data.empty:
+            return []
+
+        precursor_col = None
+        possible_names = ['Precursor M/z', 'Precursor_mz', 'Precursor', 'precursor m/z', 'precursor_mz']
+        for col in ms_data.columns:
+            if col in possible_names:
+                precursor_col = col
+                break
+        if precursor_col is None:
+            for col in ms_data.columns:
+                if 'precursor' in col.lower() and 'm/z' in col.lower():
+                    precursor_col = col
+                    break
+        if precursor_col is None:
+            st.error("未找到母离子列（Precursor M/z），请检查文件格式或使用自定义列名功能。")
+            return []
+
+        mz_columns = []
+        for col in ms_data.columns:
+            if ('Peak_' in col and '_m/z' in col) or ('m/z' in col.lower() and col != precursor_col):
+                mz_columns.append(col)
+        if not mz_columns:
+            st.warning("未找到碎片离子列，将只进行一级匹配。")
+
+        min_intensity_abs = self.config['min_intensity']
+        rel_threshold = self.intensity_relative_threshold
+
+        precursors = []
+        for idx, row in ms_data.iterrows():
+            precursor_mz = row.get(precursor_col)
+            if pd.notna(precursor_mz) and float(precursor_mz) > 0:
+                fragments = []
+                fragments_dict = {}
+                base_peak = 0
+                for col in mz_columns:
+                    intensity = 0
+                    intensity_col = col.replace('_m/z', '_Intensity') if '_m/z' in col else None
+                    if intensity_col and intensity_col in row.index:
+                        intensity = float(row[intensity_col]) if pd.notna(row[intensity_col]) else 0
+                    else:
+                        intensity = 1
+                    if intensity > base_peak:
+                        base_peak = intensity
+
+                for col in mz_columns:
+                    fragment_mz = row[col]
+                    if pd.notna(fragment_mz) and float(fragment_mz) > 0:
+                        intensity = 0
+                        intensity_col = col.replace('_m/z', '_Intensity') if '_m/z' in col else None
+                        if intensity_col and intensity_col in row.index:
+                            intensity = float(row[intensity_col]) if pd.notna(row[intensity_col]) else 0
+                        else:
+                            intensity = 1
+
+                        if intensity >= min_intensity_abs:
+                            if base_peak > 0:
+                                rel_intensity = intensity / base_peak
+                                if rel_intensity >= rel_threshold:
+                                    mz_value = float(fragment_mz)
+                                    fragments.append(mz_value)
+                                    fragments_dict[mz_value] = intensity
+                            else:
+                                mz_value = float(fragment_mz)
+                                fragments.append(mz_value)
+                                fragments_dict[mz_value] = intensity
+
+                rt = row.get('出峰时间t/min', np.nan)
+                if pd.isna(rt):
+                    rt = row.get('出峰时间', np.nan)
+
+                if pd.isna(rt) and 'CID' in row.index:
+                    cid = row['CID']
+                    gt = self.config['gradient_time']
+                    cid_min = self.config['cid_min']
+                    cid_max = self.config['cid_max']
+                    if pd.isna(cid):
+                        rt = 0.5
+                    else:
+                        if cid >= cid_max:
+                            rt = gt
+                        else:
+                            rt = round(gt * (cid - cid_min) / (cid_max - cid_min), 2)
+
+                precursors.append({
+                    'precursor_mz': float(precursor_mz),
+                    'retention_time': rt if not pd.isna(rt) else None,
+                    'fragments': np.array(sorted(fragments, reverse=True)),
+                    'fragments_dict': fragments_dict,
+                    'mode': ionization_mode,
+                    'total_fragments': len(fragments),
+                    'base_peak': base_peak
+                })
+
+        return precursors
+
+    def identify_compound(self, precursor, return_top=1, score_threshold=0):
+        mode = precursor['mode']
+        if mode == '正离子':
+            sorted_idx = self.sorted_idx_pos
+            mz_array = self.mz_values_pos
+            db_frags = self.db_frag_pos
+        else:
+            sorted_idx = self.sorted_idx_neg
+            mz_array = self.mz_values_neg
+            db_frags = self.db_frag_neg
+
+        candidate_range = self._binary_search_range(mz_array, precursor['precursor_mz'], self.config['tolerance_ppm'])
+
+        scored_candidates = []
+        for idx in candidate_range:
+            mz_val, db_idx, ref_frags = sorted_idx[idx]
+            if db_idx not in self.compound_info:
+                continue
+
+            info = self.compound_info[db_idx]
+            category = self._classify_compound(info['name_cn'] + ' ' + info['name_en'], info['compound_type'])
+
+            if self.tolerance_type == 'Da':
+                tolerance_value = self.config['fragment_tolerance']
+            else:
+                tolerance_value = self.config['fragment_tolerance_ppm']
+
+            matched_fragments = self._match_fragments_fast(
+                precursor['fragments'],
+                ref_frags,
+                tolerance_value,
+                self.tolerance_type,
+                precursor['precursor_mz']
+            )
+
+            diagnostic_ions, diag_weights = self._find_diagnostic_ions_fast(
+                matched_fragments,
+                category,
+                precursor['precursor_mz']
+            )
+
+            neutral_loss_matches = 0
+            if db_idx in self.neutral_losses:
+                expected_losses = self.neutral_losses[db_idx]
+                observed_losses = self._find_neutral_losses(precursor['fragments'], precursor['precursor_mz'])
+                for exp in expected_losses:
+                    for obs in observed_losses:
+                        if abs(exp - obs) <= self.loss_tolerance:
+                            neutral_loss_matches += 1
+                            break
+
+            theoretical_mz = mz_val
+            ppm = abs(float(precursor['precursor_mz']) - theoretical_mz) / theoretical_mz * 1e6
+
+            rt_deviation = None
+            if self.use_rt_score and db_idx in self.rt_values and precursor['retention_time'] is not None:
+                rt_deviation = abs(precursor['retention_time'] - self.rt_values[db_idx])
+
+            candidate = {
+                'name_cn': info['name_cn'],
+                'name_en': info['name_en'],
+                'formula': info['formula'],
+                'cas': info['cas'],
+                'herb': info['herb'],
+                'compound_type': info['compound_type'],
+                'observed_mz': precursor['precursor_mz'],
+                'theoretical_mz': theoretical_mz,
+                'ppm': ppm,
+                'adduct': info['adduct_pos'] if mode == '正离子' else info['adduct_neg'],
+                'matched_fragments': matched_fragments,
+                'diagnostic_ions': diagnostic_ions,
+                'diag_weights': diag_weights,
+                'mode': mode,
+                'source': info['source'],
+                'category': category,
+                'db_index': db_idx,
+                'neutral_loss_matches': neutral_loss_matches,
+                'rt_deviation': rt_deviation
+            }
+
+            candidate['temp_score'] = -ppm
+            scored_candidates.append(candidate)
+
+        scored_candidates.sort(key=lambda x: (-len(x['matched_fragments']), -x['temp_score']))
+
+        if return_top == 1:
+            return scored_candidates[0] if scored_candidates else None
+        else:
+            return scored_candidates[:return_top]
+
+    def generate_report(self, herb_name=None):
+        if herb_name is None:
+            herb_name = self.herb_name if self.herb_name else '中药'
+
+        best_records = {}
+        herbs_collection = {}
+
+        pos_precursors = self.extract_precursor_ions(self.ms_positive, '正离子') if not self.ms_positive.empty else []
+        neg_precursors = self.extract_precursor_ions(self.ms_negative, '负离子') if not self.ms_negative.empty else []
+
+        all_precursors = pos_precursors + neg_precursors
+        total = len(all_precursors)
+
+        if total == 0:
+            print("警告: 没有提取到任何母离子，请检查质谱数据文件格式。")
+            return pd.DataFrame()
+
+        for i, precursor in enumerate(all_precursors):
+            self.stats['total_precursors'] += 1
+            if (i + 1) % 500 == 0:
+                print(f"    处理进度: {i+1}/{total}")
+
+            best_candidate = self.identify_compound(precursor, return_top=1)
+            if best_candidate is None:
+                continue
+
+            self.stats['identified_compounds'] += 1
+            self.stats['scored_candidates'] += 1
+
+            lvl_id, lvl_name, confidence, suggestion = self._determine_confidence_level(
+                best_candidate['ppm'],
+                len(best_candidate['matched_fragments']),
+                len(best_candidate['diagnostic_ions']),
+                len(precursor['fragments']) > 0
+            )
+
+            if lvl_id == 6:
+                continue
+
+            formula = best_candidate['formula'] if best_candidate['formula'] and best_candidate['formula'] != 'nan' else '待确定'
+            en_name = best_candidate['name_en'] if best_candidate['name_en'] and best_candidate['name_en'] != 'nan' else ''
+
+            source_str = best_candidate.get('source', '')
+            if pd.notna(source_str) and source_str:
+                source_list = [s.strip() for s in str(source_str).split(';') if s.strip()]
+                source_count = len(source_list)
+                source_display = '; '.join(source_list)
+            else:
+                source_count = 0
+                source_display = ''
+
+            matched_frags = best_candidate['matched_fragments']
+            diag_ions = best_candidate['diagnostic_ions']
+            diag_weights = best_candidate['diag_weights']
+
+            # 清洗加和离子：如果为nan或'nan'，替换为空字符串
+            adduct = best_candidate['adduct']
+            if pd.isna(adduct) or adduct == 'nan' or adduct == '':
+                adduct = ''
+            else:
+                for sep in [',', ';']:
+                    if sep in adduct:
+                        adduct = adduct.split(sep)[0].strip()
+                        break
+
+            base_score = self._calculate_base_score(
+                lvl_id,
+                best_candidate['ppm'],
+                len(matched_frags),
+                len(diag_ions),
+                diag_weights,
+                best_candidate['neutral_loss_matches'],
+                best_candidate['rt_deviation']
+            )
+
+            cas = best_candidate.get('cas', '')
+            if cas and cas != 'nan' and cas != '':
+                merge_key = cas
+            elif en_name and en_name != '':
+                merge_key = f"{en_name}_{formula}"
+            else:
+                merge_key = f"{best_candidate['name_cn']}_{formula}"
+
+            record = {
+                '序号': 0,
+                '出峰时间t/min': precursor['retention_time'],
+                '化合物中文名': best_candidate['name_cn'],
+                '化合物英文名': en_name,
+                '分子式': formula,
+                'CAS号': best_candidate['cas'],
+                '药材名称': best_candidate['herb'],
+                '化合物类型': best_candidate['compound_type'],
+                '离子化方式': best_candidate['mode'],
+                '加和离子': adduct,
+                'm/z实际值': round(best_candidate['observed_mz'], 4),
+                'm/z理论值': round(best_candidate['theoretical_mz'], 4),
+                'ppm': round(best_candidate['ppm'], 4),
+                '是否有碎片数据': '是' if precursor['fragments'].size > 0 else '否',
+                '主要碎片离子': '; '.join([f'{f:.4f}' for f in matched_frags]) if matched_frags else '',
+                '匹配碎片数': len(matched_frags),
+                '诊断性离子个数': len(diag_ions),
+                '诊断性离子': '; '.join([f'{f:.4f}' for f in diag_ions]) if diag_ions else '',
+                '文献来源数': source_count,
+                '文献来源': source_display,
+                '评级': lvl_id,
+                '评级名称': lvl_name,
+                '置信度': confidence,
+                '报告建议': suggestion,
+                '基础得分': base_score,
+                '综合得分': base_score,
+                '_merge_key': merge_key,
+                '_fragments_set': set(matched_frags)
+            }
+
+            if merge_key not in herbs_collection:
+                herbs_collection[merge_key] = set()
+            herbs_collection[merge_key].add(best_candidate['herb'])
+
+            current_score = base_score
+            if merge_key not in best_records or current_score > best_records[merge_key][1]:
+                best_records[merge_key] = (record, current_score)
+
+        records_list = []
+        for merge_key, (record, score) in best_records.items():
+            herbs = herbs_collection[merge_key]
+            record['药材名称'] = '; '.join(sorted(herbs))
+            records_list.append(record)
+
+        if not records_list:
+            return pd.DataFrame()
+
+        records_list.sort(key=lambda x: x['出峰时间t/min'] if x['出峰时间t/min'] is not None else 0)
+
+        rt_tol = self.rt_fusion_tolerance
+        fused_records = []
+        i = 0
+        n = len(records_list)
+        while i < n:
+            group = [records_list[i]]
+            j = i + 1
+            while j < n:
+                rt1 = group[0]['出峰时间t/min']
+                rt2 = records_list[j]['出峰时间t/min']
+                if rt1 is None or rt2 is None:
+                    break
+                if abs(rt1 - rt2) <= rt_tol:
+                    group.append(records_list[j])
+                    j += 1
+                else:
+                    break
+
+            compound_groups = {}
+            for rec in group:
+                key = rec['_merge_key']
+                if key not in compound_groups:
+                    compound_groups[key] = []
+                compound_groups[key].append(rec)
+
+            for comp_key, comp_recs in compound_groups.items():
+                if len(comp_recs) == 1:
+                    rec = comp_recs[0].copy()
+                    del rec['_merge_key']
+                    del rec['_fragments_set']
+                    if '基础得分' in rec:
+                        del rec['基础得分']
+                    fused_records.append(rec)
+                else:
+                    best_rec = max(comp_recs, key=lambda x: x['基础得分']).copy()
+                    adducts = set()
+                    modes = set()
+                    for rec in comp_recs:
+                        if rec['加和离子']:
+                            adducts.add(rec['加和离子'])
+                        if rec['离子化方式']:
+                            modes.add(rec['离子化方式'])
+                    best_rec['加和离子'] = '; '.join(sorted(adducts))
+                    best_rec['离子化方式'] = '/'.join(sorted(modes))
+
+                    all_frag_sets = [rec['_fragments_set'] for rec in comp_recs]
+                    similarities = []
+                    for a in range(len(all_frag_sets)):
+                        for b in range(a+1, len(all_frag_sets)):
+                            set_a = all_frag_sets[a]
+                            set_b = all_frag_sets[b]
+                            if len(set_a) == 0 and len(set_b) == 0:
+                                sim = 1.0
+                            elif len(set_a) == 0 or len(set_b) == 0:
+                                sim = 0.0
+                            else:
+                                intersection = len(set_a & set_b)
+                                union = len(set_a | set_b)
+                                sim = intersection / union if union > 0 else 0
+                            similarities.append(sim)
+                    avg_similarity = np.mean(similarities) if similarities else 1.0
+
+                    extra_count = len(adducts) - 1
+                    if extra_count > 0:
+                        base_bonus = extra_count * 5
+                        if avg_similarity < 0.5:
+                            fusion_bonus = base_bonus * 0.5
+                        else:
+                            fusion_bonus = base_bonus
+                        fusion_bonus = min(fusion_bonus, 15)
+                    else:
+                        fusion_bonus = 0
+
+                    final_score = min(best_rec['基础得分'] + fusion_bonus, 100)
+
+                    if best_rec['评级'] == 1 and final_score < 80:
+                        final_score = 80
+                    if best_rec['评级'] == 2 and final_score < 60:
+                        final_score = 60
+
+                    best_rec['综合得分'] = final_score
+
+                    if len(comp_recs) >= 2 and all(rec['评级'] <= 2 for rec in comp_recs):
+                        best_rec['评级'] = 1
+                        best_rec['评级名称'] = '确证级'
+                        best_rec['置信度'] = '最高'
+                        best_rec['报告建议'] = '可直接报告'
+
+                    del best_rec['_merge_key']
+                    del best_rec['_fragments_set']
+                    if '基础得分' in best_rec:
+                        del best_rec['基础得分']
+                    fused_records.append(best_rec)
+
+            i = j
+
+        report_df = pd.DataFrame(fused_records)
+
+        if not report_df.empty:
+            report_df = report_df.sort_values(by=['评级', '综合得分', 'ppm'], ascending=[True, False, True])
+            report_df = report_df.reset_index(drop=True)
+            report_df['序号'] = range(1, len(report_df) + 1)
+
+        return report_df
+
+    def save_report(self, report_df, output_path):
+        report_df.to_excel(output_path, index=False)
+        print(f"\n报告已保存至: {output_path}")
+
+    def print_summary(self, report_df, herb_name):
+        print("\n" + "="*100)
+        print(f"【{herb_name}化合物鉴定报告】")
+        print("="*100)
+        print(f"鉴定药材: {herb_name}")
+        print(f"鉴定时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"共鉴定出 {len(report_df)} 个化合物")
+
+        print(f"\n【处理统计】")
+        print(f"  - 总母离子数: {self.stats['total_precursors']}")
+        print(f"  - 鉴定化合物数: {self.stats['identified_compounds']}")
+        print(f"  - 数据库记录数: {len(self.database)}")
+
+        if not report_df.empty:
+            print(f"\n【评级分布】")
+            for level, count in report_df['评级名称'].value_counts().items():
+                print(f"  - {level}: {count} 个")
+
+            print(f"\n【ppm误差分布】")
+            ppm_10 = (report_df['ppm'] <= 10).sum()
+            ppm_20 = ((report_df['ppm'] > 10) & (report_df['ppm'] <= 20)).sum()
+            ppm_50 = ((report_df['ppm'] > 20) & (report_df['ppm'] <= 50)).sum()
+            print(f"  - ≤10ppm: {ppm_10} 个")
+            print(f"  - 10-20ppm: {ppm_20} 个")
+            print(f"  - 20-50ppm: {ppm_50} 个")
+
+            print(f"\n【综合得分分布】")
+            score_90_100 = (report_df['综合得分'] >= 90).sum()
+            score_80_89 = ((report_df['综合得分'] >= 80) & (report_df['综合得分'] < 90)).sum()
+            score_70_79 = ((report_df['综合得分'] >= 70) & (report_df['综合得分'] < 80)).sum()
+            score_60_69 = ((report_df['综合得分'] >= 60) & (report_df['综合得分'] < 70)).sum()
+            score_below_60 = (report_df['综合得分'] < 60).sum()
+            print(f"  - 90-100分: {score_90_100} 个")
+            print(f"  - 80-89分: {score_80_89} 个")
+            print(f"  - 70-79分: {score_70_79} 个")
+            print(f"  - 60-69分: {score_60_69} 个")
+            print(f"  - <60分: {score_below_60} 个")
+
+            print(f"\n【药材来源分布（前10）】")
+            for herb, count in report_df['药材名称'].value_counts().head(10).items():
+                print(f"  - {herb}: {count} 个")
+
+        print("\n" + "="*100)
+
+    def _print_initialization_info(self):
+        print("\n" + "="*80)
+        print("程序初始化完成（修正版）")
+        print("="*80)
+        print(f"  - 数据库记录数: {len(self.database)} 条")
+        print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
+        print(f"  - 负离子索引: {len(self.mz_values_neg)} 条")
+        print(f"  - 诊断性离子库: {len(self.diagnostic_ions)} 类")
+        print(f"  - 保留时间数据: {len(self.rt_values)} 条")
+        print(f"  - 中性丢失数据: {len(self.neutral_losses)} 条")
+        print(f"  - 容差类型: {self.tolerance_type}")
+        print(f"  - 强度相对阈值: {self.intensity_relative_threshold*100:.1f}%")
+        print(f"  - RT得分: {'启用' if self.use_rt_score else '禁用'}")
+        print(f"  - 并行处理: {'启用' if self.use_parallel else '禁用'}")
+        print("="*80)
+
+
+# ============================================================================
+# 数据库加载函数（带缓存）
+# ============================================================================
+
+@st.cache_data
+def load_database_cached(db_filename="TCM-SM-MS DB.xlsx"):
+    db_filenames = [
+        "TCM-SM-MS DB.xlsx",
+        "TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+        "data/TCM-SM-MS DB.xlsx",
+        "data/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+        "user_input_files/TCM-SM-MS DB.xlsx",
+        "user_input_files/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx"
+    ]
+    if db_filename:
+        db_filenames = [db_filename] + [f for f in db_filenames if f != db_filename]
+    for path in db_filenames:
+        if os.path.exists(path):
+            try:
+                df = pd.read_excel(path)
+                return df
+            except Exception as e:
+                continue
+    return pd.DataFrame()
+
+
+def find_database_path():
+    db_paths = [
+        "TCM-SM-MS DB.xlsx",
+        "TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+        "data/TCM-SM-MS DB.xlsx",
+        "data/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+        "user_input_files/TCM-SM-MS DB.xlsx",
+        "user_input_files/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx"
+    ]
+    for path in db_paths:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+@st.cache_data
+def load_diagnostic_ions_cached():
+    diagnostic_ion_paths = [
+        "诊断离子.xlsx",
+        "data/诊断离子.xlsx",
+        "user_input_files/诊断离子.xlsx"
+    ]
+    for path in diagnostic_ion_paths:
+        if os.path.exists(path):
+            try:
+                df = pd.read_excel(path)
+                if '诊断碎片离子m/z' in df.columns:
+                    df['诊断碎片离子m/z'] = pd.to_numeric(df['诊断碎片离子m/z'], errors='coerce')
+                return df
+            except Exception as e:
+                st.warning(f"加载诊断离子文件时出错: {e}")
+                continue
+    return pd.DataFrame()
+
+
+def find_diagnostic_ion_path():
+    diagnostic_ion_paths = [
+        "诊断离子.xlsx",
+        "data/诊断离子.xlsx",
+        "user_input_files/诊断离子.xlsx"
+    ]
+    for path in diagnostic_ion_paths:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_mode=None):
+    if diagnostic_df.empty or not user_mz_values:
+        return pd.DataFrame()
+    if ion_mode and ion_mode != "全部":
+        filtered_df = diagnostic_df[diagnostic_df['离子模式'] == ion_mode].copy()
+    else:
+        filtered_df = diagnostic_df.copy()
+    if '诊断碎片离子m/z' not in filtered_df.columns:
+        return pd.DataFrame()
+    filtered_df = filtered_df.dropna(subset=['诊断碎片离子m/z'])
+    if filtered_df.empty:
+        return pd.DataFrame()
+    results = []
+    for user_mz in user_mz_values:
+        user_mz = float(user_mz)
+        tolerance = user_mz * tolerance_ppm / 1e6
+        mz_min = user_mz - tolerance
+        mz_max = user_mz + tolerance
+        matches = filtered_df[
+            (filtered_df['诊断碎片离子m/z'] >= mz_min) &
+            (filtered_df['诊断碎片离子m/z'] <= mz_max)
+        ]
+        for _, row in matches.iterrows():
+            ref_mz = row['诊断碎片离子m/z']
+            ppm_error = abs(user_mz - ref_mz) / ref_mz * 1e6
+            results.append({
+                '输入m/z': user_mz,
+                '匹配诊断离子m/z': ref_mz,
+                '误差(ppm)': round(ppm_error, 4),
+                '化合物类型': row.get('化合物类型', ''),
+                '离子模式': row.get('离子模式', ''),
+                '中文名称': row.get('中文名称', ''),
+                '英文名称': row.get('英文名称', ''),
+                '分子式': row.get('分子式', ''),
+                '药材名': row.get('药材名', ''),
+                '准分子离子m/z': row.get('准分子离子m/z', ''),
+                '加合形式': row.get('加合形式', ''),
+                '相对丰度': row.get('相对丰度', ''),
+                '类特征性离子': row.get('类特征性离子', False)
+            })
+    return pd.DataFrame(results)
+
+
+# ============================================================================
+# Streamlit 网页应用部分 - 优化版界面
+# ============================================================================
+
+# 设置页面配置
+st.set_page_config(
+    page_title="中药化合物智能鉴定平台 v5.11",
+    page_icon="🌿",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+
+def load_optimized_css():
+    """加载优化后的CSS样式 - 现代卡片式设计"""
+    st.markdown("""
+    <style>
+        /* ========== 基础样式重置 ========== */
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap');
+
+        * {
+            font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif !important;
+        }
+
+        /* ========== 全局背景和主题 ========== */
+        .stApp {
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f1f5f9 100%);
+            min-height: 100vh;
+        }
+
+        /* ========== 主标题区域 - 增强设计 ========== */
+        .main-header {
+            background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%);
+            padding: 2.5rem 2rem;
+            border-radius: 20px;
+            margin-bottom: 2rem;
+            color: white;
+            box-shadow: 0 20px 40px rgba(5, 150, 105, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .main-header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            right: -50%;
+            width: 100%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+            animation: pulse 3s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.5; }
+            50% { transform: scale(1.1); opacity: 0.8; }
+        }
+
+        .main-header h1 {
+            color: white !important;
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin: 0;
+            position: relative;
+            z-index: 1;
+        }
+
+        .main-header p {
+            color: rgba(255,255,255,0.9);
+            font-size: 1.1rem;
+            margin-top: 0.5rem;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* ========== 统计卡片 - 玻璃态设计 ========== */
+        .stat-card {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 1.5rem;
+            text-align: center;
+            margin: 0.5rem;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.5);
+            transition: all 0.3s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 30px rgba(5, 150, 105, 0.2);
+        }
+
+        .stat-number {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #059669, #0891b2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            font-size: 0.95rem;
+            color: #64748b;
+            margin-top: 0.5rem;
+            font-weight: 500;
+        }
+
+        /* ========== 功能卡片 - 现代卡片设计 ========== */
+        .feature-card {
+            background: white;
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+            margin-bottom: 1.5rem;
+            border-left: 5px solid;
+            border-image: linear-gradient(to bottom, #059669, #0891b2) 1;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .feature-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background: linear-gradient(90deg, #059669, #0891b2, #7c3aed);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .feature-card:hover::before {
+            opacity: 1;
+        }
+
+        .feature-card:hover {
+            transform: translateX(5px);
+            box-shadow: 0 8px 30px rgba(5, 150, 105, 0.15);
+        }
+
+        .feature-card h4 {
+            color: #1e293b;
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .feature-card p {
+            color: #64748b;
+            font-size: 0.95rem;
+            line-height: 1.6;
+            margin: 0;
+        }
+
+        /* ========== 登录框 - 现代化设计 ========== */
+        .login-container {
+            max-width: 450px;
+            margin: 80px auto;
+            padding: 3rem;
+            background: white;
+            border-radius: 24px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .login-container::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 5px;
+            background: linear-gradient(90deg, #059669, #0891b2, #7c3aed);
+        }
+
+        .login-title {
+            text-align: center;
+            font-size: 1.75rem;
+            font-weight: 700;
+            margin-bottom: 2rem;
+            background: linear-gradient(135deg, #059669, #0891b2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        /* ========== 侧边栏增强 ========== */
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            border-right: 1px solid #e2e8f0;
+        }
+
+        [data-testid="stSidebarNav"] {
+            padding: 1rem 0;
+        }
+
+        /* ========== 按钮样式 - 渐变和动画 ========== */
+        .stButton > button {
+            background: linear-gradient(135deg, #059669 0%, #0891b2 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            padding: 0.75rem 1.5rem;
+            font-weight: 600;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(5, 150, 105, 0.3);
+        }
+
+        .stButton > button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 25px rgba(5, 150, 105, 0.4);
+        }
+
+        .stButton > button:active {
+            transform: translateY(-1px);
+        }
+
+        /* ========== 主要按钮 ========== */
+        .stButton > button[kind="primary"] {
+            background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%);
+        }
+
+        /* ========== 进度条 ========== */
+        .stProgress > div > div {
+            background: linear-gradient(90deg, #059669, #0891b2, #7c3aed);
+            border-radius: 10px;
+        }
+
+        /* ========== 文件上传区域 ========== */
+        [data-testid="stFileUploader"] {
+            border: 2px dashed #cbd5e1;
+            border-radius: 16px;
+            padding: 2rem;
+            background: rgba(5, 150, 105, 0.02);
+            transition: all 0.3s ease;
+        }
+
+        [data-testid="stFileUploader"]:hover {
+            border-color: #059669;
+            background: rgba(5, 150, 105, 0.05);
+        }
+
+        /* ========== 表格样式 ========== */
+        .dataframe {
+            font-size: 0.9rem;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        /* ========== 指标卡片 ========== */
+        [data-testid="stMetricValue"] {
+            font-size: 2rem !important;
+            font-weight: 700;
+            background: linear-gradient(135deg, #059669, #0891b2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        /* ========== 评级标签颜色 ========== */
+        .level-1 { background: linear-gradient(135deg, #10b981, #059669); }
+        .level-2 { background: linear-gradient(135deg, #06b6d4, #0891b2); }
+        .level-3 { background: linear-gradient(135deg, #f59e0b, #d97706); }
+        .level-4 { background: linear-gradient(135deg, #f97316, #ea580c); }
+        .level-5 { background: linear-gradient(135deg, #6b7280, #4b5563); }
+
+        /* ========== 信息框增强 ========== */
+        .stAlert {
+            border-radius: 12px;
+            border-left: 4px solid;
+        }
+
+        /* ========== 分隔线 ========== */
+        hr {
+            border: none;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, #e2e8f0, transparent);
+            margin: 2rem 0;
+        }
+
+        /* ========== 标题样式 ========== */
+        h1, h2, h3 {
+            color: #1e293b !important;
+            font-weight: 600 !important;
+        }
+
+        h2 {
+            font-size: 1.75rem;
+            margin-bottom: 1rem;
+        }
+
+        /* ========== 响应式调整 ========== */
+        @media (max-width: 768px) {
+            .main-header {
+                padding: 1.5rem 1rem;
+                border-radius: 16px;
+            }
+
+            .main-header h1 {
+                font-size: 1.75rem;
+            }
+
+            .stat-card {
+                padding: 1rem;
+                margin: 0.25rem;
+            }
+
+            .stat-number {
+                font-size: 2rem;
+            }
+        }
+
+        /* ========== 加载动画 ========== */
+        .loading-spinner {
+            display: inline-block;
+            width: 50px;
+            height: 50px;
+            border: 3px solid rgba(5, 150, 105, 0.2);
+            border-radius: 50%;
+            border-top-color: #059669;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* ========== 成功/警告/错误消息增强 ========== */
+        .success-box {
+            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
+            border-left: 4px solid #059669;
+            border-radius: 12px;
+            padding: 1rem;
+        }
+
+        .warning-box {
+            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
+            border-left: 4px solid #f59e0b;
+            border-radius: 12px;
+            padding: 1rem;
+        }
+
+        /* ========== 空状态设计 ========== */
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: #94a3b8;
+        }
+
+        .empty-state svg {
+            width: 80px;
+            height: 80px;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        /* ========== 工具提示 ========== */
+        .tooltip {
+            position: relative;
+            display: inline-block;
+        }
+
+        .tooltip .tooltiptext {
+            visibility: hidden;
+            background-color: #1e293b;
+            color: white;
+            text-align: center;
+            padding: 8px 12px;
+            border-radius: 6px;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            transform: translateX(-50%);
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .tooltip:hover .tooltiptext {
+            visibility: visible;
+            opacity: 1;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def login_page():
+    """显示优化后的登录页面"""
+    # Logo和标题
+    st.markdown("""
+    <div style="max-width: 450px; margin: 0 auto; padding: 3rem; background: white; border-radius: 24px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15); text-align: center;">
+        <div style="margin-bottom: 1rem;">
+            <svg width="60" height="60" viewBox="0 0 60 60" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="30" cy="30" r="28" stroke="url(#grad1)" stroke-width="4" fill="none"/>
+                <path d="M30 15C22 15 18 22 18 28C18 38 30 45 30 45C30 45 42 38 42 28C42 22 38 15 30 15Z" fill="url(#grad1)"/>
+                <defs>
+                    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" style="stop-color:#059669"/>
+                        <stop offset="50%" style="stop-color:#0891b2"/>
+                        <stop offset="100%" style="stop-color:#7c3aed"/>
+                    </linearGradient>
+                </defs>
+            </svg>
+        </div>
+        <h2 style="color: #059669; font-size: 1.75rem; font-weight: 700; margin-bottom: 2rem;">中药化合物智能鉴定平台</h2>
+    """, unsafe_allow_html=True)
+
+    with st.form("login_form"):
+        username = st.text_input(
+            "用户名",
+            placeholder="请输入用户名",
+            help="默认用户名: ZY"
+        )
+        password = st.text_input(
+            "密码",
+            type="password",
+            placeholder="请输入密码",
+            help="默认密码: 513513"
+        )
+        submitted = st.form_submit_button("登录", use_container_width=True)
+
+        if submitted:
+            if username == VALID_USERNAME and password == VALID_PASSWORD:
+                st.session_state.logged_in = True
+                st.session_state.username = username
+                st.success("登录成功！正在跳转...")
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.error("用户名或密码错误，请重试。")
+
+    st.markdown("""
+        <div style="margin-top: 2rem; color: #94a3b8; font-size: 0.85rem;">
+            <p>中药化合物智能鉴定平台 v5.11</p>
+            <p>支持高分辨质谱数据的智能分析和化合物鉴定</p>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def logout_button():
+    """在侧边栏显示登出按钮"""
+    if st.sidebar.button("🚪 登出", use_container_width=True):
+        st.session_state.logged_in = False
+        st.session_state.pop('username', None)
+        st.rerun()
+
+
+def create_header():
+    """创建优化后的应用头部"""
+    username = st.session_state.get('username', 'Guest')
+    st.markdown(f"""
+    <div class="main-header">
+        <h1>🌿 中药化合物智能鉴定平台</h1>
+        <p>v5.11 修正版 | 欢迎回来，{username}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def create_sidebar():
+    """创建优化后的侧边栏"""
+    # Logo和标题
+    st.sidebar.markdown("""
+    <div style="text-align: center; padding: 1.5rem 0; border-bottom: 2px solid #e2e8f0;">
+        <svg width="50" height="50" viewBox="0 0 60 60" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-bottom: 0.5rem;">
+            <circle cx="30" cy="30" r="28" stroke="url(#grad2)" stroke-width="4" fill="none"/>
+            <path d="M30 15C22 15 18 22 18 28C18 38 30 45 30 45C30 45 42 38 42 28C42 22 38 15 30 15Z" fill="url(#grad2)"/>
+            <defs>
+                <linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#059669"/>
+                    <stop offset="100%" style="stop-color:#0891b2"/>
+                </linearGradient>
+            </defs>
+        </svg>
+        <h3 style="color: #1e293b; margin: 0.5rem 0; font-weight: 700;">TCM Identifier</h3>
+        <p style="color: #64748b; font-size: 0.8rem; margin: 0;">中药化合物鉴定系统</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.session_state.get('logged_in'):
+        st.sidebar.markdown(f"""
+        <div style="background: linear-gradient(135deg, #ecfdf5, #d1fae5); padding: 1rem; border-radius: 12px; margin: 1rem 0; text-align: center;">
+            <p style="margin: 0; color: #059669; font-weight: 600;">👤 {st.session_state.username}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # 导航菜单 - 使用优化后的样式
+    st.sidebar.markdown("""
+    <div style="padding: 1rem 0;">
+        <p style="color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">导航菜单</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    page = st.sidebar.radio(
+        "选择功能",
+        ["🏠 首页", "🔬 开始鉴定", "🧪 诊断离子筛查", "📖 使用指南", "🗃️ 数据库预览", "📊 结果分析"],
+        index=0
+    )
+
+    # 移除"🏠"前缀用于session_state
+    page = page.split(' ', 1)[1] if ' ' in page else page
+
+    st.sidebar.markdown("---")
+
+    # 版本信息卡片
+    st.sidebar.markdown("""
+    <div style="background: white; border-radius: 12px; padding: 1rem; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
+        <h4 style="color: #1e293b; margin: 0 0 0.75rem 0; font-size: 0.95rem;">📋 版本信息</h4>
+        <ul style="color: #64748b; font-size: 0.85rem; padding-left: 1.2rem; margin: 0;">
+            <li>程序版本：v5.11</li>
+            <li>数据库：35,828条记录</li>
+            <li>支持药材：291种</li>
+            <li>化合物类型：400+类</li>
+        </ul>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.sidebar.markdown("---")
+
+    # 版权信息
+    st.sidebar.markdown("""
+    <div style="text-align: center; color: #94a3b8; font-size: 0.7rem; padding: 1rem 0;">
+        <p style="margin: 0;">© 2026 张永</p>
+        <p style="margin: 0.25rem 0 0 0;">中药化合物智能鉴定平台</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    return page
+
+
+def show_home_page():
+    """优化后的首页"""
+    create_header()
+
+    st.markdown("## 📊 系统概览")
+
+    # 使用优化后的统计卡片
+    cols = st.columns(4)
+    stats_data = [
+        ("35,828", "数据库化合物数", "📚"),
+        ("291", "支持药材种类", "🌱"),
+        ("6", "鉴定评级级别", "⭐"),
+        ("400+", "化合物类型", "🧪")
+    ]
+
+    for col, (number, label, icon) in zip(cols, stats_data):
+        with col:
+            st.markdown(f"""
+            <div class="stat-card">
+                <div style="font-size: 2rem; margin-bottom: 0.5rem;">{icon}</div>
+                <div class="stat-number">{number}</div>
+                <div class="stat-label">{label}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("## ✨ 核心功能")
+
+    # 使用两列布局展示功能卡片
+    col1, col2 = st.columns(2)
+
+    features_left = [
+        ("🔍", "智能化合物鉴定", "基于高分辨质谱数据，在35,828条数据库记录中进行精准匹配，支持正负离子模式。"),
+        ("📈", "六级评级标准", "确证级、高置信级、推定级、提示级、参考级、排除级，科学评估鉴定结果可靠性。"),
+        ("🧪", "外部诊断离子", "支持上传自定义诊断离子文件，自动去重合并权重，避免重复。")
+    ]
+
+    features_right = [
+        ("⚡", "综合评分系统", "基础分+ppm调整+碎片加分+诊断离子加分+中性丢失+RT得分+多加和离子融合。"),
+        ("🌱", "药材来源合并", "同一化合物的所有药材来源自动合并显示，实现“所有的药材”。"),
+        ("📁", "单文件支持", "可只上传正离子或负离子单个文件进行鉴定，灵活适配不同实验数据。")
+    ]
+
+    with col1:
+        for icon, title, desc in features_left:
+            st.markdown(f"""
+            <div class="feature-card">
+                <h4>{icon} {title}</h4>
+                <p>{desc}</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with col2:
+        for icon, title, desc in features_right:
+            st.markdown(f"""
+            <div class="feature-card">
+                <h4>{icon} {title}</h4>
+                <p>{desc}</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("## 🚀 快速开始")
+
+    # 使用更醒目的快速开始卡片
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #ecfdf5, #d1fae5); border-radius: 16px; padding: 2rem; border-left: 5px solid #059669;">
+        <h3 style="color: #059669; margin-top: 0;">使用步骤</h3>
+        <ol style="color: #1e293b; line-height: 2; font-size: 1.05rem;">
+            <li><strong>准备数据</strong>：准备好质谱数据文件（Excel格式）和数据库文件</li>
+            <li><strong>上传文件</strong>：在"开始鉴定"页面上传正离子和/或负离子质谱数据</li>
+            <li><strong>配置参数</strong>：设置ppm容差、保留时间容差等参数</li>
+            <li><strong>运行鉴定</strong>：点击"开始鉴定"按钮进行分析</li>
+            <li><strong>查看结果</strong>：在"结果分析"页面查看和导出鉴定报告</li>
+        </ol>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # CTA按钮
+    if st.button("🚀 立即开始鉴定", type="primary", use_container_width=True):
+        st.session_state['page'] = '开始鉴定'
+        st.rerun()
+
+
+def show_analysis_page():
+    """鉴定分析页面（集成新参数）- 优化版"""
+    create_header()
+
+    st.markdown("## 📁 上传质谱数据")
+    st.markdown("**至少上传一个文件（正离子或负离子）**")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        ms_positive_file = st.file_uploader(
+            "上传正离子模式质谱数据 (.xlsx，可选)",
+            type=['xlsx'],
+            key='ms_positive',
+            help="支持Excel格式的质谱数据文件"
+        )
+        if ms_positive_file:
+            st.success(f"✅ 已上传: {ms_positive_file.name}")
+    with col2:
+        ms_negative_file = st.file_uploader(
+            "上传负离子模式质谱数据 (.xlsx，可选)",
+            type=['xlsx'],
+            key='ms_negative',
+            help="支持Excel格式的质谱数据文件"
+        )
+        if ms_negative_file:
+            st.success(f"✅ 已上传: {ms_negative_file.name}")
+
+    if not ms_positive_file and not ms_negative_file:
+        st.markdown("""
+        <div class="warning-box" style="margin-top: 1rem;">
+            <p style="margin: 0; color: #92400e;">⚠️ 请至少上传一个质谱数据文件</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("## 🧪 外部诊断离子（可选）")
+
+    diagnostic_file = st.file_uploader(
+        "上传自定义诊断离子文件 (.xlsx，可包含权重列)",
+        type=['xlsx'],
+        key='diagnostic',
+        help="若不上传，将自动加载项目目录下的诊断离子.xlsx"
+    )
+    if diagnostic_file:
+        st.success(f"✅ 已上传诊断离子文件: {diagnostic_file.name}")
+
+    st.markdown("---")
+    st.markdown("## 📚 自定义数据库（可选）")
+
+    custom_db_file = st.file_uploader(
+        "上传自定义数据库 (.xlsx，需与主数据库列一致)",
+        type=['xlsx'],
+        key='custom_db'
+    )
+    if custom_db_file:
+        st.success(f"✅ 已上传自定义数据库: {custom_db_file.name}")
+
+    st.markdown("---")
+    st.markdown("## ⚙️ 鉴定参数配置")
+
+    # 参数预设
+    preset = st.radio(
+        "参数预设",
+        options=["自定义", "快速模式", "高精度模式"],
+        horizontal=True,
+        help="选择预设可以快速配置常用参数"
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        tolerance_ppm = st.number_input("ppm误差容限", min_value=10, max_value=100, value=50)
+    with col2:
+        max_candidates = st.number_input("最大候选数", min_value=1, max_value=10, value=3)
+    with col3:
+        min_intensity_abs = st.number_input("最小绝对强度", min_value=0, value=100)
+    with col4:
+        use_parallel = st.checkbox("启用多进程并行", value=True)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        tolerance_type = st.selectbox("碎片匹配容差类型", options=["Da", "ppm"], index=0)
+        if tolerance_type == "Da":
+            fragment_tolerance = st.number_input("碎片匹配容差 (Da)", min_value=0.01, max_value=1.0, value=0.05, step=0.01)
+            fragment_tolerance_ppm = 20
+        else:
+            fragment_tolerance_ppm = st.number_input("碎片匹配容差 (ppm)", min_value=1, max_value=100, value=20, step=1)
+            fragment_tolerance = 0.05
+    with col2:
+        rt_tolerance = st.number_input("保留时间容差 (min)", min_value=0.1, max_value=2.0, value=0.3, step=0.1)
+    with col3:
+        loss_tolerance = st.number_input("中性丢失容差 (Da)", min_value=0.01, max_value=0.5, value=0.02, step=0.01)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        intensity_rel_threshold = st.slider("相对强度阈值 (%)", min_value=0.0, max_value=100.0, value=1.0, step=0.1)
+    with col2:
+        use_rt_score = st.checkbox("启用保留时间得分", value=True)
+    with col3:
+        cache_index = st.checkbox("启用索引缓存（加速）", value=True)
+
+    herb_filter = st.selectbox("药材筛选模式", options=["使用全部数据库", "筛选特定药材"], index=0)
+    if herb_filter == "筛选特定药材":
+        herb_name = st.text_input("输入药材名称", placeholder="如：栀子、黄芩")
+    else:
+        herb_name = None
+
+    # 应用预设
+    if preset == "快速模式":
+        tolerance_ppm = 50
+        fragment_tolerance = 0.05
+        fragment_tolerance_ppm = 20
+        min_intensity_abs = 100
+        intensity_rel_threshold = 1.0
+        tolerance_type = "Da"
+    elif preset == "高精度模式":
+        tolerance_ppm = 10
+        fragment_tolerance = 0.02
+        fragment_tolerance_ppm = 5
+        min_intensity_abs = 50
+        intensity_rel_threshold = 0.5
+        tolerance_type = "ppm"
+
+    # 参数保存和加载
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💾 保存当前参数为默认", use_container_width=True):
+            st.session_state['saved_params'] = {
+                'tolerance_ppm': tolerance_ppm,
+                'fragment_tolerance': fragment_tolerance,
+                'fragment_tolerance_ppm': fragment_tolerance_ppm,
+                'tolerance_type': tolerance_type,
+                'min_intensity_abs': min_intensity_abs,
+                'intensity_rel_threshold': intensity_rel_threshold,
+                'rt_tolerance': rt_tolerance,
+                'loss_tolerance': loss_tolerance,
+                'use_rt_score': use_rt_score,
+                'cache_index': cache_index,
+            }
+            st.success("参数已保存")
+
+    with col2:
+        if 'saved_params' in st.session_state and st.button("🔄 加载已保存参数", use_container_width=True):
+            params = st.session_state['saved_params']
+            tolerance_ppm = params['tolerance_ppm']
+            fragment_tolerance = params['fragment_tolerance']
+            fragment_tolerance_ppm = params['fragment_tolerance_ppm']
+            tolerance_type = params['tolerance_type']
+            min_intensity_abs = params['min_intensity_abs']
+            intensity_rel_threshold = params['intensity_rel_threshold']
+            rt_tolerance = params['rt_tolerance']
+            loss_tolerance = params['loss_tolerance']
+            use_rt_score = params['use_rt_score']
+            cache_index = params['cache_index']
+            st.experimental_rerun()
+
+    st.markdown("---")
+
+    if ms_positive_file or ms_negative_file:
+        if st.button("🚀 开始化合物鉴定", type="primary", use_container_width=True):
+            with st.spinner("正在初始化鉴定程序..."):
+                try:
+                    temp_dir = tempfile.gettempdir()
+                    pos_path = None
+                    neg_path = None
+                    diag_path = None
+                    custom_db_path = None
+
+                    if ms_positive_file:
+                        pos_path = os.path.join(temp_dir, ms_positive_file.name)
+                        with open(pos_path, 'wb') as f:
+                            f.write(ms_positive_file.getbuffer())
+                    if ms_negative_file:
+                        neg_path = os.path.join(temp_dir, ms_negative_file.name)
+                        with open(neg_path, 'wb') as f:
+                            f.write(ms_negative_file.getbuffer())
+                    if diagnostic_file:
+                        diag_path = os.path.join(temp_dir, diagnostic_file.name)
+                        with open(diag_path, 'wb') as f:
+                            f.write(diagnostic_file.getbuffer())
+                    if custom_db_file:
+                        custom_db_path = os.path.join(temp_dir, custom_db_file.name)
+                        with open(custom_db_path, 'wb') as f:
+                            f.write(custom_db_file.getbuffer())
+
+                    db_path = find_database_path()
+                    if not db_path:
+                        st.error("未找到主数据库文件！请将 TCM-SM-MS DB.xlsx 放在项目目录下。")
+                        return
+
+                    st.info(f"✅ 已找到主数据库文件: {db_path}")
+
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    status_text.text("【1/8】正在加载数据库...")
+                    progress_bar.progress(10)
+
+                    config = {
+                        'min_intensity': min_intensity_abs,
+                        'fragment_tolerance': fragment_tolerance,
+                        'fragment_tolerance_ppm': fragment_tolerance_ppm,
+                        'tolerance_ppm': tolerance_ppm,
+                        'max_candidates': max_candidates,
+                    }
+
+                    identifier = UltimateGardeniaIdentifier(
+                        database_path=db_path,
+                        ms_positive_path=pos_path,
+                        ms_negative_path=neg_path,
+                        herb_name=herb_name,
+                        config=config,
+                        use_parallel=use_parallel,
+                        rt_tolerance=rt_tolerance,
+                        loss_tolerance=loss_tolerance,
+                        external_diagnostic_file=diag_path,
+                        rt_fusion_tolerance=rt_tolerance,
+                        intensity_relative_threshold=intensity_rel_threshold,
+                        tolerance_type=tolerance_type,
+                        use_rt_score=use_rt_score,
+                        custom_db_path=custom_db_path,
+                        cache_index=cache_index
+                    )
+
+                    status_text.text("【7/8】正在处理质谱数据...")
+                    progress_bar.progress(40)
+
+                    report = identifier.generate_report('样品')
+
+                    progress_bar.progress(80)
+                    status_text.text("【8/8】生成报告...")
+
+                    st.session_state['analysis_results'] = report
+                    st.session_state['identifier'] = identifier
+
+                    progress_bar.progress(100)
+                    status_text.text("鉴定完成！")
+
+                    st.success("✅ 化合物鉴定完成！")
+
+                    if st.button("📊 查看鉴定结果 →"):
+                        st.session_state['page'] = '结果分析'
+                        st.rerun()
+
+                except Exception as e:
+                    st.error(f"鉴定过程中出错：{str(e)}")
+                    st.exception(e)
+    else:
+        st.markdown("""
+        <div class="empty-state">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M9 13h6m-3-3v6m5 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+            </svg>
+            <h3>暂无上传文件</h3>
+            <p>请上传质谱数据文件以开始鉴定</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+def show_diagnostic_ion_page():
+    """诊断离子筛查页面 - 优化版"""
+    create_header()
+
+    st.markdown("## 🔬 诊断离子筛查")
+    st.markdown("根据输入的m/z值，在诊断离子数据库中查找匹配的化合物特征离子，帮助快速识别化合物类别。")
+
+    diagnostic_df = load_diagnostic_ions_cached()
+
+    if diagnostic_df.empty:
+        st.markdown("""
+        <div class="warning-box">
+            <p style="margin: 0;">⚠️ 未找到诊断离子数据库文件（诊断离子.xlsx），请将文件放在项目目录下。</p>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    st.success(f"✅ 已加载诊断离子数据库，包含 {len(diagnostic_df)} 条记录")
+
+    # 统计信息
+    cols = st.columns(4)
+    with cols[0]:
+        if '化合物类型' in diagnostic_df.columns:
+            st.metric("化合物类型", diagnostic_df['化合物类型'].nunique())
+    with cols[1]:
+        if '药材名' in diagnostic_df.columns:
+            st.metric("药材种类", diagnostic_df['药材名'].nunique())
+    with cols[2]:
+        if '诊断碎片离子m/z' in diagnostic_df.columns:
+            st.metric("诊断离子数", diagnostic_df['诊断碎片离子m/z'].nunique())
+    with cols[3]:
+        if '类特征性离子' in diagnostic_df.columns:
+            char_ions = diagnostic_df[diagnostic_df['类特征性离子'] == True].shape[0]
+            st.metric("类特征性离子", char_ions)
+
+    st.markdown("---")
+    st.markdown("### 📥 输入m/z值")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        mz_input = st.text_area(
+            "输入m/z值（每行一个值，或用逗号分隔）",
+            placeholder="例如：\n151.003\n137.024, 121.029",
+            height=150
+        )
+    with col2:
+        st.markdown("#### 参数设置")
+        tolerance_ppm = st.number_input("ppm容差", min_value=1, max_value=100, value=10)
+        ion_mode = st.selectbox("离子模式", options=["全部", "正离子", "负离子"], index=0)
+        show_only_class_specific = st.checkbox("仅显示类特征性离子", value=False)
+
+    def parse_mz_values(input_text):
+        if not input_text or not input_text.strip():
+            return []
+        for sep in [',', ';', '\t', ' ']:
+            if sep in input_text:
+                input_text = input_text.replace(sep, '\n')
+        mz_values = []
+        for line in input_text.strip().split('\n'):
+            line = line.strip()
+            if line:
+                try:
+                    mz_values.append(float(line))
+                except ValueError:
+                    continue
+        return mz_values
+
+    if mz_input:
+        user_mz_values = parse_mz_values(mz_input)
+        if not user_mz_values:
+            st.warning("⚠️ 无法解析输入的m/z值，请检查输入格式。")
+        else:
+            st.markdown("---")
+            with st.spinner("正在匹配诊断离子..."):
+                results_df = match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=tolerance_ppm, ion_mode=ion_mode)
+
+            if show_only_class_specific and not results_df.empty:
+                results_df = results_df[results_df['类特征性离子'] == True]
+
+            st.markdown("### 📊 匹配结果统计")
+            cols = st.columns(3)
+            with cols[0]:
+                st.metric("输入离子数", len(user_mz_values))
+            with cols[1]:
+                matched_ions = results_df['输入m/z'].nunique() if not results_df.empty else 0
+                st.metric("匹配离子数", matched_ions)
+            with cols[2]:
+                matched_compounds = results_df['化合物类型'].nunique() if not results_df.empty else 0
+                st.metric("化合物类型数", matched_compounds)
+
+            if not results_df.empty:
+                st.markdown("#### 化合物类型分布")
+                type_dist = results_df['化合物类型'].value_counts()
+                st.bar_chart(type_dist)
+
+                st.markdown("### 📋 匹配结果详情")
+                display_cols = ['输入m/z', '匹配诊断离子m/z', '误差(ppm)', '化合物类型', '离子模式', '中文名称', '英文名称', '药材名', '类特征性离子']
+                available_cols = [c for c in display_cols if c in results_df.columns]
+                st.dataframe(results_df[available_cols], use_container_width=True, hide_index=True)
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    csv = results_df.to_csv(index=False, encoding='utf-8-sig')
+                    st.download_button("📥 导出CSV", data=csv, file_name=f"诊断离子筛查_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
+                with col2:
+                    buffer = BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        results_df.to_excel(writer, index=False, sheet_name='诊断离子匹配结果')
+                    st.download_button("📥 导出Excel", data=buffer.getvalue(), file_name=f"诊断离子筛查_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                st.info("未找到匹配的诊断离子，请尝试增大ppm容差或更换离子模式。")
+
+
+def show_guide_page():
+    """使用指南页面 - 优化版"""
+    create_header()
+    st.markdown("## 📖 使用指南（修正版）")
+
+    st.markdown("""
+    <div style="background: white; border-radius: 16px; padding: 2rem; box-shadow: 0 4px 20px rgba(0,0,0,0.08);">
+        <h3 style="color: #1e293b; margin-top: 0;">📊 综合评分规则</h3>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin-top: 1.5rem;">
+            <div style="background: #f8fafc; padding: 1rem; border-radius: 12px;">
+                <h4 style="color: #059669; margin: 0 0 0.75rem 0;">基础分</h4>
+                <ul style="margin: 0; padding-left: 1.2rem; color: #64748b;">
+                    <li>1级（确证级）：85分</li>
+                    <li>2级（高置信级）：65分</li>
+                    <li>3级（推定级）：45分</li>
+                    <li>4级（提示级）：25分</li>
+                    <li>5级（参考级）：0分</li>
+                </ul>
+            </div>
+
+            <div style="background: #f8fafc; padding: 1rem; border-radius: 12px;">
+                <h4 style="color: #0891b2; margin: 0 0 0.75rem 0;">ppm调整</h4>
+                <ul style="margin: 0; padding-left: 1.2rem; color: #64748b;">
+                    <li>≤5ppm：+5分</li>
+                    <li>5-10ppm：0分</li>
+                    <li>10-20ppm：-5分</li>
+                    <li>20-30ppm：-10分</li>
+                    <li>30-50ppm：-15分</li>
+                </ul>
+            </div>
+
+            <div style="background: #f8fafc; padding: 1rem; border-radius: 12px;">
+                <h4 style="color: #7c3aed; margin: 0 0 0.75rem 0;">加分项</h4>
+                <ul style="margin: 0; padding-left: 1.2rem; color: #64748b;">
+                    <li>匹配碎片：每个+2分（上限20）</li>
+                    <li>诊断离子：根据权重累计（上限15）</li>
+                    <li>中性丢失：每个+2分（上限10）</li>
+                    <li>RT偏差<0.2：+5分</li>
+                    <li>RT偏差<0.5：+2分</li>
+                </ul>
+            </div>
+        </div>
+
+        <div style="margin-top: 1.5rem; padding: 1rem; background: linear-gradient(135deg, #ecfdf5, #d1fae5); border-radius: 12px;">
+            <h4 style="color: #059669; margin: 0 0 0.75rem 0;">特殊规则</h4>
+            <ul style="margin: 0; padding-left: 1.2rem; color: #1e293b;">
+                <li><strong>保底机制</strong>：1级不低于80分，2级不低于60分</li>
+                <li><strong>总分上限</strong>：100分</li>
+                <li><strong>多加和离子</strong>：每个额外+5分，根据碎片相似度调整（上限15）</li>
+            </ul>
+        </div>
+
+        <h3 style="color: #1e293b; margin-top: 2rem;">🆕 新增功能说明</h3>
+        <ul style="color: #64748b; line-height: 1.8;">
+            <li><strong>诊断离子去重</strong>：外部诊断离子文件中的重复 m/z 自动合并，权重累加</li>
+            <li><strong>加和离子显示优化</strong>：无加和离子时显示空白，更整洁</li>
+            <li><strong>碎片离子解析增强</strong>：支持顿号、分号、逗号、空格分隔符</li>
+            <li><strong>综合得分保底</strong>：确保评分为非负数</li>
+        </ul>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def show_database_page():
+    """数据库预览页面 - 优化版"""
+    create_header()
+    st.markdown("## 🗃️ 数据库预览")
+
+    db_path = find_database_path()
+    if not db_path:
+        st.markdown("""
+        <div class="warning-box">
+            <p style="margin: 0;">⚠️ 未找到数据库文件！请将 TCM-SM-MS DB.xlsx 放在项目目录下。</p>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    try:
+        with st.spinner("正在加载数据库..."):
+            df = load_database_cached()
+        if df.empty:
+            st.error("数据库文件为空或无法读取！")
+            return
+
+        st.success(f"✅ 成功加载数据库，包含 {len(df)} 条化合物记录")
+
+        # 统计信息卡片
+        cols = st.columns(4)
+        with cols[0]:
+            st.metric("总记录数", len(df))
+        with cols[1]:
+            herb_count = df['药材名称'].nunique() if '药材名称' in df.columns else 0
+            st.metric("药材种类", herb_count)
+        with cols[2]:
+            type_count = df['化合物类型'].nunique() if '化合物类型' in df.columns else 0
+            st.metric("化合物类型", type_count)
+        with cols[3]:
+            if '准分子离子（正）' in df.columns:
+                valid_mz = df['准分子离子（正）'].notna().sum()
+                st.metric("有效正离子记录", valid_mz)
+
+        st.info(f"📁 数据库文件路径: {db_path}")
+        st.markdown("### 数据库预览（前10行）")
+        st.dataframe(df.head(10), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"加载数据库时出错：{str(e)}")
+        st.exception(e)
+
+
+def show_results_page():
+    """结果分析页面 - 优化版"""
+    create_header()
+
+    if 'analysis_results' not in st.session_state:
+        st.markdown("""
+        <div class="empty-state">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+            </svg>
+            <h3>暂无鉴定结果</h3>
+            <p>请先进行化合物鉴定</p>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("前往鉴定页面"):
+            st.session_state['page'] = '开始鉴定'
+            st.rerun()
+        return
+
+    report = st.session_state['analysis_results']
+
+    st.markdown("## 📊 鉴定结果分析（修正版）")
+
+    if report.empty:
+        st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
+        return
+
+    # 统计概览
+    cols = st.columns(4)
+    with cols[0]:
+        st.metric("鉴定化合物总数", len(report))
+    with cols[1]:
+        confirmed = (report['评级名称'] == '确证级').sum()
+        st.metric("确证级化合物", confirmed)
+    with cols[2]:
+        high_score = (report['综合得分'] >= 90).sum()
+        st.metric("90分以上", high_score)
+    with cols[3]:
+        avg_score = report['综合得分'].mean()
+        st.metric("平均综合得分", f"{avg_score:.1f}")
+
+    st.markdown("### 📊 评级分布")
+    level_counts = report['评级名称'].value_counts()
+    st.bar_chart(level_counts.reindex(['确证级', '高置信级', '推定级', '提示级', '参考级']).fillna(0))
+
+    st.markdown("### 📈 综合得分分布")
+    score_bins = pd.cut(report['综合得分'], bins=[0, 60, 70, 80, 90, 100], labels=['<60', '60-69', '70-79', '80-89', '90-100'])
+    score_dist = score_bins.value_counts().sort_index()
+    st.bar_chart(score_dist)
+
+    st.markdown("### 📋 完整鉴定结果")
+
+    all_columns = report.columns.tolist()
+    default_cols = ['序号', '化合物中文名', '分子式', 'ppm', '评级名称', '药材名称', '综合得分']
+    selected_cols = st.multiselect("选择显示的列", all_columns, default=[c for c in default_cols if c in all_columns])
+
+    display_df = report[selected_cols] if selected_cols else report
+
+    page_size = st.number_input("每页显示行数", min_value=10, max_value=100, value=20)
+    page_num = st.number_input("当前页码", min_value=1, max_value=len(display_df)//page_size + 1, value=1)
+    start_idx = (page_num - 1) * page_size
+    end_idx = min(start_idx + page_size, len(display_df))
+
+    st.dataframe(
+        display_df.iloc[start_idx:end_idx],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            'ppm': st.column_config.NumberColumn("ppm误差", format="%.4f"),
+            '综合得分': st.column_config.NumberColumn("综合得分", format="%.2f")
+        }
+    )
+
+    st.markdown("---")
+    st.markdown("### 📥 导出报告")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        csv = report.to_csv(index=False, encoding='utf-8-sig')
+        st.download_button(label="📥 导出CSV", data=csv, file_name=f"鉴定报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
+    with col2:
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            report.to_excel(writer, index=False, sheet_name='鉴定结果')
+        st.download_button(label="📥 导出Excel", data=buffer.getvalue(), file_name=f"鉴定报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def main():
+    """主函数"""
+    load_optimized_css()
+
+    # 初始化登录状态
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+
+    if not st.session_state.logged_in:
+        login_page()
+        return
+
+    # 已登录，显示主界面
+    if 'page' not in st.session_state:
+        st.session_state['page'] = '首页'
+
+    logout_button()
+    page = create_sidebar()
+    st.session_state['page'] = page
+
+    if page == "首页":
+        show_home_page()
+    elif page == "开始鉴定":
+        show_analysis_page()
+    elif page == "诊断离子筛查":
+        show_diagnostic_ion_page()
+    elif page == "使用指南":
+        show_guide_page()
+    elif page == "数据库预览":
+        show_database_page()
+    elif page == "结果分析":
+        show_results_page()
+
+
+if __name__ == "__main__":
+    main()
