@@ -2,14 +2,14 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    - cron: "0 */11 * * *"  # 每11小时运行一次
-  workflow_dispatch:         # 允许手动触发
+    - cron: "0 */11 * * *"   # 每11小时运行一次
+  workflow_dispatch:          # 允许手动触发
 
 jobs:
   trigger-redeploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: write        # 需要写权限才能推送空提交
+      contents: write         # 需要写权限才能推送空提交
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
