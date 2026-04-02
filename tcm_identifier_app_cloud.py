@@ -1255,7 +1255,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# Streamlit 网页应用部分（与 v5.13 一致，但版本号更新）
+# Streamlit 网页应用部分
 # ============================================================================
 
 st.set_page_config(
@@ -1269,11 +1269,13 @@ st.set_page_config(
 def load_optimized_css():
     st.markdown("""
     <style>
-        /* 保持原有 CSS 样式，此处省略以节省篇幅，实际运行时应包含完整样式 */
         .stApp { background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f1f5f9 100%); }
-        .main-header { background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%); padding: 2rem; border-radius: 20px; }
+        .main-header { background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%); padding: 2rem; border-radius: 20px; margin-bottom: 2rem; }
+        .main-header h1, .main-header p { color: white; }
         .stat-card { background: rgba(255,255,255,0.95); border-radius: 16px; padding: 1.5rem; text-align: center; }
         .feature-card { background: white; border-radius: 16px; padding: 1.5rem; margin-bottom: 1rem; }
+        [data-testid="stSidebar"] { background: #ffffff; }
+        .stButton > button { background: linear-gradient(135deg, #059669, #0891b2); color: white; border-radius: 12px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1372,6 +1374,18 @@ def show_analysis_page():
         st.download_button("下载 CSV 模板", data=csv_data, file_name="ms_data_template.csv", mime="text/csv")
     
     st.markdown("---")
+    st.markdown("## 📚 自定义数据库（可选）")
+    custom_db_file = st.file_uploader("上传自定义数据库 (.xlsx，需与主数据库列一致)", type=['xlsx'], key='custom_db')
+    if custom_db_file:
+        st.success(f"✅ 已上传: {custom_db_file.name}")
+    
+    st.markdown("---")
+    st.markdown("## 🧪 外部诊断离子（可选）")
+    diagnostic_file = st.file_uploader("上传自定义诊断离子文件 (.xlsx，可包含权重列)", type=['xlsx'], key='diagnostic')
+    if diagnostic_file:
+        st.success(f"✅ 已上传: {diagnostic_file.name}")
+    
+    st.markdown("---")
     st.markdown("## ⚙️ 鉴定参数配置")
     
     with st.expander("📖 参数调优指南（点击展开）"):
@@ -1445,6 +1459,8 @@ def show_analysis_page():
                 temp_dir = tempfile.gettempdir()
                 pos_path = None
                 neg_path = None
+                diag_path = None
+                custom_db_path = None
                 if ms_positive_file:
                     pos_path = os.path.join(temp_dir, ms_positive_file.name)
                     with open(pos_path, 'wb') as f:
@@ -1455,6 +1471,16 @@ def show_analysis_page():
                     with open(neg_path, 'wb') as f:
                         f.write(ms_negative_file.getbuffer())
                     temp_files.append(neg_path)
+                if diagnostic_file:
+                    diag_path = os.path.join(temp_dir, diagnostic_file.name)
+                    with open(diag_path, 'wb') as f:
+                        f.write(diagnostic_file.getbuffer())
+                    temp_files.append(diag_path)
+                if custom_db_file:
+                    custom_db_path = os.path.join(temp_dir, custom_db_file.name)
+                    with open(custom_db_path, 'wb') as f:
+                        f.write(custom_db_file.getbuffer())
+                    temp_files.append(custom_db_path)
                 
                 db_path = find_database_path()
                 if not db_path:
@@ -1479,11 +1505,12 @@ def show_analysis_page():
                         use_parallel=st.session_state.use_parallel,
                         rt_tolerance=st.session_state.rt_tolerance,
                         loss_tolerance=st.session_state.loss_tolerance,
-                        external_diagnostic_file=None,
+                        external_diagnostic_file=diag_path,
                         rt_fusion_tolerance=st.session_state.rt_tolerance,
                         intensity_relative_threshold=st.session_state.intensity_rel_threshold,
                         tolerance_type=st.session_state.tolerance_type,
                         use_rt_score=st.session_state.use_rt_score,
+                        custom_db_path=custom_db_path,
                         cache_index=st.session_state.cache_index
                     )
                     report = identifier.generate_report('样品')
@@ -1557,7 +1584,7 @@ def show_guide_page():
     2. 上传文件，设置参数（新手可使用快速模式）。
     3. 点击开始鉴定，等待结果。
     4. 查看结果报告，根据评级和得分判断可靠性。
-    
+
     ### 评分规则（v5.14 新增文献匹配加分）
     - 基础分：确证级85，高置信级65，推定级45，提示级25，参考级0
     - 加分项：
@@ -1568,6 +1595,6 @@ def show_guide_page():
       - **文献匹配：每篇+3（上限12）**
     - 扣分项：ppm>10开始扣分
     - 保底：1级不低于80，2级不低于60
-    
+
     ### 碎片-文献映射格式
     在数据库的“碎片离子（正/负）”列中，可以为每个碎片指定文献索引：
