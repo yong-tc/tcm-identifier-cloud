@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.11（优化版）
+中药化合物智能鉴定平台 - 云端部署增强版 v5.12（修复版）
 ==========================================================
-界面优化说明：
-- 采用现代卡片式设计，视觉层次更清晰
-- 优化配色方案，增加生机感
-- 改进数据可视化，增加交互性
-- 优化加载和状态反馈体验
-- 改善移动端适配
+修复内容：
+- CSV文件列名标准化
+- 碎片离子混合分隔符解析
+- 参数预设联动
+- 临时文件自动清理
+- 登出按钮位置优化
+- 数据库缓存基于文件时间
+- 碎片匹配效率优化（二分查找）
+- RT计算边界裁剪
+- 文献来源多分隔符支持
+- 废弃API更新
 """
 
 import streamlit as st
@@ -17,6 +22,7 @@ import os
 import time
 import pickle
 import hashlib
+import re
 from datetime import datetime
 from io import BytesIO
 import tempfile
@@ -26,8 +32,23 @@ warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# 登录验证常量
+# 全局路径常量
 # ============================================================================
+DB_PATHS = [
+    "TCM-SM-MS DB.xlsx",
+    "TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+    "data/TCM-SM-MS DB.xlsx",
+    "data/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+    "user_input_files/TCM-SM-MS DB.xlsx",
+    "user_input_files/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx"
+]
+
+DIAGNOSTIC_PATHS = [
+    "诊断离子.xlsx",
+    "data/诊断离子.xlsx",
+    "user_input_files/诊断离子.xlsx"
+]
+
 VALID_USERNAME = "ZY"
 VALID_PASSWORD = "513513"
 
@@ -55,11 +76,7 @@ def normalize_formula(formula):
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.11（修正版）
-
-    主要修正：
-    1. 碎片离子解析支持分号、逗号、空格分隔符。
-    2. 综合得分保证非负。
+    中药化合物鉴定终极版程序 v5.12（修复版）
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -85,7 +102,7 @@ class UltimateGardeniaIdentifier:
             'min_intensity': 100,
             'ppm_tier1': 10,
             'ppm_tier2': 20,
-            'max_ppm': 100,  # 新增：允许的最大ppm误差
+            'max_ppm': 100,
         }
 
         if config:
@@ -105,7 +122,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v5.11（修正版）")
+        print("中药化合物鉴定程序 v5.12（修复版）")
         print("="*80)
         print("\n【1/8】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -152,25 +169,30 @@ class UltimateGardeniaIdentifier:
         self._print_initialization_info()
         print("【7/8】初始化完成，准备鉴定")
 
+    def _normalize_columns(self, df):
+        """标准化列名"""
+        column_mapping = {
+            '药材名': '药材名称',
+            '文献': '文献来源',
+            '保留时间(min)': '保留时间',
+            '中丢失': '中性丢失'
+        }
+        for old_name, new_name in column_mapping.items():
+            if old_name in df.columns and new_name not in df.columns:
+                df.rename(columns={old_name: new_name}, inplace=True)
+        return df
+
     def _load_data(self, filepath):
         if filepath and os.path.exists(filepath):
             try:
                 if filepath.endswith('.xlsx'):
                     df = pd.read_excel(filepath)
                 elif filepath.endswith('.csv'):
-                    return pd.read_csv(filepath)
-
-                # 修复列名不匹配问题 - 标准化列名
-                column_mapping = {
-                    '药材名': '药材名称',
-                    '文献': '文献来源',
-                    '保留时间(min)': '保留时间',
-                    '中丢失': '中性丢失'
-                }
-                for old_name, new_name in column_mapping.items():
-                    if old_name in df.columns and new_name not in df.columns:
-                        df.rename(columns={old_name: new_name}, inplace=True)
-
+                    df = pd.read_csv(filepath)
+                else:
+                    return pd.DataFrame()
+                # 统一标准化列名
+                df = self._normalize_columns(df)
                 return df
             except Exception as e:
                 print(f"警告: 无法加载文件 {filepath}: {e}")
@@ -181,8 +203,6 @@ class UltimateGardeniaIdentifier:
     def _filter_by_herb(self, herb_name):
         if herb_name is None:
             return self.full_database.copy()
-
-        # 兼容不同的药材列名
         herb_col = '药材名称' if '药材名称' in self.full_database.columns else '药材名'
         mask = self.full_database[herb_col].str.contains(herb_name, na=False, case=False)
         filtered_db = self.full_database[mask].copy()
@@ -191,15 +211,29 @@ class UltimateGardeniaIdentifier:
             return self.full_database.copy()
         return filtered_db
 
+    def _get_db_cache_key(self, db_path):
+        """基于文件修改时间和大小生成缓存键"""
+        if not db_path or not os.path.exists(db_path):
+            return None
+        try:
+            mtime = os.path.getmtime(db_path)
+            size = os.path.getsize(db_path)
+            return f"{db_path}_{mtime}_{size}"
+        except:
+            return None
+
     def _build_or_load_index(self):
         cache_file = "index_cache.pkl"
-        db_hash = hashlib.md5(pd.util.hash_pandas_object(self.database).values).hexdigest()
+        # 使用主数据库文件作为缓存键依据
+        db_key = self._get_db_cache_key(find_database_path())
+        if db_key is None:
+            db_key = "unknown"
 
         if self.cache_index and os.path.exists(cache_file):
             try:
                 with open(cache_file, 'rb') as f:
                     cached = pickle.load(f)
-                if cached.get('db_hash') == db_hash:
+                if cached.get('db_key') == db_key:
                     print("  从缓存加载索引...")
                     self.sorted_idx_pos = cached['sorted_idx_pos']
                     self.sorted_idx_neg = cached['sorted_idx_neg']
@@ -220,7 +254,7 @@ class UltimateGardeniaIdentifier:
         if self.cache_index:
             try:
                 cached = {
-                    'db_hash': db_hash,
+                    'db_key': db_key,
                     'sorted_idx_pos': self.sorted_idx_pos,
                     'sorted_idx_neg': self.sorted_idx_neg,
                     'mz_values_pos': self.mz_values_pos,
@@ -257,10 +291,8 @@ class UltimateGardeniaIdentifier:
             formula = str(row.get('分子式', ''))
             if formula and formula != 'nan':
                 formula = normalize_formula(formula)
-            # 兼容不同的列名 - 药材名称
             herb = str(row.get('药材名称') or row.get('药材名') or '')
             compound_type = str(row.get('化合物类型', ''))
-            # 兼容文献来源列名
             source = str(row.get('文献来源') or row.get('文献') or '')
             cas = str(row.get('CAS', ''))
 
@@ -314,29 +346,15 @@ class UltimateGardeniaIdentifier:
         self.db_frag_pos = [x[2] for x in self.sorted_idx_pos]
         self.db_frag_neg = [x[2] for x in self.sorted_idx_neg]
 
-    # ========== 修改点1：支持多种分隔符 ==========
+    # ========== 修复：支持混合分隔符 ==========
     def _parse_fragments_fast(self, fragment_string):
-        """解析碎片离子字符串，支持顿号、分号、逗号、空格分隔符"""
+        """解析碎片离子字符串，支持顿号、分号、逗号、空格混合分隔符"""
         if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
             return np.array([])
-        fragments = []
-        # 尝试多种分隔符 - 按优先级
         s = str(fragment_string)
-        # 优先使用顿号（、）分割，这是中文最常用的
-        if '、' in s:
-            parts = s.split('、')
-        # 其次使用分号（;）
-        elif ';' in s:
-            parts = s.split(';')
-        # 然后使用逗号（,）
-        elif ',' in s:
-            parts = s.split(',')
-        # 最后使用空格
-        elif ' ' in s:
-            parts = s.split()
-        else:
-            parts = [s]
-
+        # 使用正则匹配所有常见分隔符
+        parts = re.split(r'[、;，,\s]+', s)
+        fragments = []
         for part in parts:
             part = part.strip()
             if part:
@@ -361,11 +379,14 @@ class UltimateGardeniaIdentifier:
                     for _, row in group.iterrows():
                         mz = row['诊断碎片离子m/z']
                         if pd.notna(mz):
-                            mz = float(mz)
+                            try:
+                                mz = float(mz)
+                            except:
+                                continue
                             weight = row.get('权重', 1)
                             try:
                                 weight = float(weight)
-                            except:
+                            except (ValueError, TypeError):
                                 weight = 1
                             ions_dict[mz] = ions_dict.get(mz, 0) + weight
                     description = group['描述'].iloc[0] if '描述' in group.columns else f'来自外部文件，{len(ions_dict)}个离子'
@@ -476,26 +497,38 @@ class UltimateGardeniaIdentifier:
         right = bisect_right(mz_array, mz_max)
         return range(left, right)
 
+    # ========== 修复：使用二分查找优化碎片匹配 ==========
     def _match_fragments_fast(self, observed, reference, tolerance_value, tolerance_type='Da', precursor_mz=None):
+        """使用二分查找提高匹配效率"""
+        if len(reference) == 0 or len(observed) == 0:
+            return []
+        observed_sorted = np.sort(observed)
         matched = []
-        if len(reference) == 0:
-            return matched
-        ref_arr = np.asarray(reference)
-        obs_arr = np.asarray(observed)
-        for ref_val in ref_arr:
-            if pd.notna(ref_val) and float(ref_val) > 0:
-                for obs_val in obs_arr:
+        for ref_val in reference:
+            if pd.isna(ref_val) or ref_val <= 0:
+                continue
+            if tolerance_type == 'Da':
+                tol = tolerance_value
+                # 二分查找区间
+                left = np.searchsorted(observed_sorted, ref_val - tol)
+                right = np.searchsorted(observed_sorted, ref_val + tol)
+                for i in range(left, right):
+                    obs_val = observed_sorted[i]
                     if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
                         continue
-                    if tolerance_type == 'Da':
-                        if abs(obs_val - ref_val) <= tolerance_value:
-                            matched.append(obs_val)
-                            break
-                    else:
-                        ppm_error = abs(obs_val - ref_val) / ref_val * 1e6
-                        if ppm_error <= tolerance_value:
-                            matched.append(obs_val)
-                            break
+                    matched.append(obs_val)
+                    break
+            else:  # ppm
+                # ppm容差需要动态计算每个参考值的允许范围
+                tol = ref_val * tolerance_value / 1e6
+                left = np.searchsorted(observed_sorted, ref_val - tol)
+                right = np.searchsorted(observed_sorted, ref_val + tol)
+                for i in range(left, right):
+                    obs_val = observed_sorted[i]
+                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
+                        continue
+                    matched.append(obs_val)
+                    break
         return list(set(matched))
 
     def _find_diagnostic_ions_fast(self, matched_fragments, category, precursor_mz=None):
@@ -525,9 +558,8 @@ class UltimateGardeniaIdentifier:
     def _determine_confidence_level(self, ppm, matched_count, diagnostic_count, has_fragment_data):
         ppm_tier1 = self.config.get('ppm_tier1', 10)
         ppm_tier2 = self.config.get('ppm_tier2', 20)
-        max_ppm = self.config.get('max_ppm', 100)  # 新增：允许的最大ppm
+        max_ppm = self.config.get('max_ppm', 100)
 
-        # 放宽ppm限制到max_ppm
         if ppm > max_ppm:
             return 6, '排除级', '未识别', f'ppm > {max_ppm}，不符合报告要求'
         if ppm <= 5 and matched_count >= 3:
@@ -542,14 +574,12 @@ class UltimateGardeniaIdentifier:
             return 4, '提示级', '较低', '仅供筛查'
         if ppm <= 50 and has_fragment_data and matched_count == 0:
             return 5, '参考级', '受限', '信息受限'
-        # 新增：ppm在50-100之间的处理
         if 50 < ppm <= 75:
             return 4, '提示级', '较低', 'ppm稍大，仅供筛查参考'
         if 75 < ppm <= max_ppm:
             return 5, '参考级', '受限', 'ppm较大，需谨慎使用'
         return 6, '排除级', '未识别', '不符合评级标准'
 
-    # ========== 修改点2：确保总分非负 ==========
     def _calculate_base_score(self, rating, ppm, matched_frag_count, diag_count,
                               diag_weights=None, neutral_loss_match_count=0, rt_deviation=None):
         if rating == 1:
@@ -591,8 +621,6 @@ class UltimateGardeniaIdentifier:
                 rt_adj = 2
 
         total = base + ppm_adj + frag_adj + diag_score + loss_adj + rt_adj
-
-        # 保证非负
         total = max(0, total)
 
         if rating == 1 and total < 80:
@@ -686,7 +714,9 @@ class UltimateGardeniaIdentifier:
                         if cid >= cid_max:
                             rt = gt
                         else:
+                            # 修复：防止负值
                             rt = round(gt * (cid - cid_min) / (cid_max - cid_min), 2)
+                            rt = max(0, min(gt, rt))
 
                 precursors.append({
                     'precursor_mz': float(precursor_mz),
@@ -834,7 +864,8 @@ class UltimateGardeniaIdentifier:
 
             source_str = best_candidate.get('source', '')
             if pd.notna(source_str) and source_str:
-                source_list = [s.strip() for s in str(source_str).split(';') if s.strip()]
+                # 修复：支持多种分隔符
+                source_list = [s.strip() for s in re.split(r'[;,；，]+', str(source_str)) if s.strip()]
                 source_count = len(source_list)
                 source_display = '; '.join(source_list)
             else:
@@ -845,7 +876,6 @@ class UltimateGardeniaIdentifier:
             diag_ions = best_candidate['diagnostic_ions']
             diag_weights = best_candidate['diag_weights']
 
-            # 清洗加和离子：如果为nan或'nan'，替换为空字符串
             adduct = best_candidate['adduct']
             if pd.isna(adduct) or adduct == 'nan' or adduct == '':
                 adduct = ''
@@ -1098,18 +1128,14 @@ class UltimateGardeniaIdentifier:
 # ============================================================================
 
 @st.cache_data
-def load_database_cached(db_filename="TCM-SM-MS DB.xlsx"):
-    db_filenames = [
-        "TCM-SM-MS DB.xlsx",
-        "TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
-        "data/TCM-SM-MS DB.xlsx",
-        "data/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
-        "user_input_files/TCM-SM-MS DB.xlsx",
-        "user_input_files/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx"
-    ]
-    if db_filename:
-        db_filenames = [db_filename] + [f for f in db_filenames if f != db_filename]
-    for path in db_filenames:
+def load_database_cached(db_filename=None):
+    if db_filename and os.path.exists(db_filename):
+        try:
+            df = pd.read_excel(db_filename)
+            return df
+        except:
+            pass
+    for path in DB_PATHS:
         if os.path.exists(path):
             try:
                 df = pd.read_excel(path)
@@ -1120,15 +1146,7 @@ def load_database_cached(db_filename="TCM-SM-MS DB.xlsx"):
 
 
 def find_database_path():
-    db_paths = [
-        "TCM-SM-MS DB.xlsx",
-        "TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
-        "data/TCM-SM-MS DB.xlsx",
-        "data/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
-        "user_input_files/TCM-SM-MS DB.xlsx",
-        "user_input_files/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx"
-    ]
-    for path in db_paths:
+    for path in DB_PATHS:
         if os.path.exists(path):
             return path
     return None
@@ -1136,12 +1154,7 @@ def find_database_path():
 
 @st.cache_data
 def load_diagnostic_ions_cached():
-    diagnostic_ion_paths = [
-        "诊断离子.xlsx",
-        "data/诊断离子.xlsx",
-        "user_input_files/诊断离子.xlsx"
-    ]
-    for path in diagnostic_ion_paths:
+    for path in DIAGNOSTIC_PATHS:
         if os.path.exists(path):
             try:
                 df = pd.read_excel(path)
@@ -1155,12 +1168,7 @@ def load_diagnostic_ions_cached():
 
 
 def find_diagnostic_ion_path():
-    diagnostic_ion_paths = [
-        "诊断离子.xlsx",
-        "data/诊断离子.xlsx",
-        "user_input_files/诊断离子.xlsx"
-    ]
-    for path in diagnostic_ion_paths:
+    for path in DIAGNOSTIC_PATHS:
         if os.path.exists(path):
             return path
     return None
@@ -1215,7 +1223,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.11",
+    page_title="中药化合物智能鉴定平台 v5.12",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1606,7 +1614,6 @@ def load_optimized_css():
 
 def login_page():
     """显示优化后的登录页面"""
-    # Logo和标题
     st.markdown("""
     <div style="max-width: 450px; margin: 0 auto; padding: 3rem; background: white; border-radius: 24px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15); text-align: center;">
         <div style="margin-bottom: 1rem;">
@@ -1651,34 +1658,15 @@ def login_page():
 
     st.markdown("""
         <div style="margin-top: 2rem; color: #94a3b8; font-size: 0.85rem;">
-            <p>中药化合物智能鉴定平台 v5.11</p>
+            <p>中药化合物智能鉴定平台 v5.12</p>
             <p>支持高分辨质谱数据的智能分析和化合物鉴定</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
 
-def logout_button():
-    """在侧边栏显示登出按钮"""
-    if st.sidebar.button("🚪 登出", use_container_width=True):
-        st.session_state.logged_in = False
-        st.session_state.pop('username', None)
-        st.rerun()
-
-
-def create_header():
-    """创建优化后的应用头部"""
-    username = st.session_state.get('username', 'Guest')
-    st.markdown(f"""
-    <div class="main-header">
-        <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v5.11 修正版 | 欢迎回来，{username}</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-
 def create_sidebar():
-    """创建优化后的侧边栏"""
+    """创建优化后的侧边栏，包含登出按钮"""
     # Logo和标题
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1.5rem 0; border-bottom: 2px solid #e2e8f0;">
@@ -1704,7 +1692,7 @@ def create_sidebar():
         </div>
         """, unsafe_allow_html=True)
 
-    # 导航菜单 - 使用优化后的样式
+    # 导航菜单
     st.sidebar.markdown("""
     <div style="padding: 1rem 0;">
         <p style="color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem;">导航菜单</p>
@@ -1717,7 +1705,7 @@ def create_sidebar():
         index=0
     )
 
-    # 移除"🏠"前缀用于session_state
+    # 移除图标前缀
     page = page.split(' ', 1)[1] if ' ' in page else page
 
     st.sidebar.markdown("---")
@@ -1727,7 +1715,7 @@ def create_sidebar():
     <div style="background: white; border-radius: 12px; padding: 1rem; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
         <h4 style="color: #1e293b; margin: 0 0 0.75rem 0; font-size: 0.95rem;">📋 版本信息</h4>
         <ul style="color: #64748b; font-size: 0.85rem; padding-left: 1.2rem; margin: 0;">
-            <li>程序版本：v5.11</li>
+            <li>程序版本：v5.12</li>
             <li>数据库：35,828条记录</li>
             <li>支持药材：291种</li>
             <li>化合物类型：400+类</li>
@@ -1736,6 +1724,12 @@ def create_sidebar():
     """, unsafe_allow_html=True)
 
     st.sidebar.markdown("---")
+
+    # 登出按钮置于底部
+    if st.sidebar.button("🚪 登出", use_container_width=True):
+        st.session_state.logged_in = False
+        st.session_state.pop('username', None)
+        st.rerun()
 
     # 版权信息
     st.sidebar.markdown("""
@@ -1754,7 +1748,6 @@ def show_home_page():
 
     st.markdown("## 📊 系统概览")
 
-    # 使用优化后的统计卡片
     cols = st.columns(4)
     stats_data = [
         ("35,828", "数据库化合物数", "📚"),
@@ -1776,7 +1769,6 @@ def show_home_page():
     st.markdown("---")
     st.markdown("## ✨ 核心功能")
 
-    # 使用两列布局展示功能卡片
     col1, col2 = st.columns(2)
 
     features_left = [
@@ -1812,7 +1804,6 @@ def show_home_page():
     st.markdown("---")
     st.markdown("## 🚀 快速开始")
 
-    # 使用更醒目的快速开始卡片
     st.markdown("""
     <div style="background: linear-gradient(135deg, #ecfdf5, #d1fae5); border-radius: 16px; padding: 2rem; border-left: 5px solid #059669;">
         <h3 style="color: #059669; margin-top: 0;">使用步骤</h3>
@@ -1826,14 +1817,24 @@ def show_home_page():
     </div>
     """, unsafe_allow_html=True)
 
-    # CTA按钮
     if st.button("🚀 立即开始鉴定", type="primary", use_container_width=True):
         st.session_state['page'] = '开始鉴定'
         st.rerun()
 
 
+def create_header():
+    """创建优化后的应用头部"""
+    username = st.session_state.get('username', 'Guest')
+    st.markdown(f"""
+    <div class="main-header">
+        <h1>🌿 中药化合物智能鉴定平台</h1>
+        <p>v5.12 修复版 | 欢迎回来，{username}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 def show_analysis_page():
-    """鉴定分析页面（集成新参数）- 优化版"""
+    """鉴定分析页面（集成新参数）- 优化版，支持参数预设联动"""
     create_header()
 
     st.markdown("## 📁 上传质谱数据")
@@ -1892,45 +1893,96 @@ def show_analysis_page():
     st.markdown("---")
     st.markdown("## ⚙️ 鉴定参数配置")
 
-    # 参数预设
-    preset = st.radio(
-        "参数预设",
-        options=["自定义", "快速模式", "高精度模式"],
-        horizontal=True,
-        help="选择预设可以快速配置常用参数"
-    )
+    # 初始化 session_state 中的参数默认值
+    default_params = {
+        'tolerance_ppm': 50,
+        'fragment_tolerance': 0.05,
+        'fragment_tolerance_ppm': 20,
+        'tolerance_type': 'Da',
+        'min_intensity_abs': 100,
+        'intensity_rel_threshold': 1.0,
+        'rt_tolerance': 0.3,
+        'loss_tolerance': 0.02,
+        'use_rt_score': True,
+        'cache_index': True,
+        'max_candidates': 3,
+        'use_parallel': True
+    }
+    for key, val in default_params.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+    # 参数预设按钮
+    col_preset1, col_preset2, col_preset3 = st.columns(3)
+    with col_preset1:
+        if st.button("⚙️ 快速模式", use_container_width=True):
+            st.session_state.tolerance_ppm = 50
+            st.session_state.fragment_tolerance = 0.05
+            st.session_state.fragment_tolerance_ppm = 20
+            st.session_state.min_intensity_abs = 100
+            st.session_state.intensity_rel_threshold = 1.0
+            st.session_state.tolerance_type = 'Da'
+            st.session_state.use_parallel = True
+            st.rerun()
+    with col_preset2:
+        if st.button("🎯 高精度模式", use_container_width=True):
+            st.session_state.tolerance_ppm = 10
+            st.session_state.fragment_tolerance = 0.02
+            st.session_state.fragment_tolerance_ppm = 5
+            st.session_state.min_intensity_abs = 50
+            st.session_state.intensity_rel_threshold = 0.5
+            st.session_state.tolerance_type = 'ppm'
+            st.session_state.use_parallel = True
+            st.rerun()
+    with col_preset3:
+        if st.button("💾 保存当前参数为默认", use_container_width=True):
+            st.session_state['saved_params'] = {
+                'tolerance_ppm': st.session_state.tolerance_ppm,
+                'fragment_tolerance': st.session_state.fragment_tolerance,
+                'fragment_tolerance_ppm': st.session_state.fragment_tolerance_ppm,
+                'tolerance_type': st.session_state.tolerance_type,
+                'min_intensity_abs': st.session_state.min_intensity_abs,
+                'intensity_rel_threshold': st.session_state.intensity_rel_threshold,
+                'rt_tolerance': st.session_state.rt_tolerance,
+                'loss_tolerance': st.session_state.loss_tolerance,
+                'use_rt_score': st.session_state.use_rt_score,
+                'cache_index': st.session_state.cache_index,
+                'max_candidates': st.session_state.max_candidates,
+                'use_parallel': st.session_state.use_parallel,
+            }
+            st.success("参数已保存")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        tolerance_ppm = st.number_input("ppm误差容限", min_value=10, max_value=100, value=50)
+        st.number_input("ppm误差容限", min_value=10, max_value=100, value=st.session_state.tolerance_ppm, key='tolerance_ppm')
     with col2:
-        max_candidates = st.number_input("最大候选数", min_value=1, max_value=10, value=3)
+        st.number_input("最大候选数", min_value=1, max_value=10, value=st.session_state.max_candidates, key='max_candidates')
     with col3:
-        min_intensity_abs = st.number_input("最小绝对强度", min_value=0, value=100)
+        st.number_input("最小绝对强度", min_value=0, value=st.session_state.min_intensity_abs, key='min_intensity_abs')
     with col4:
-        use_parallel = st.checkbox("启用多进程并行", value=True)
+        st.checkbox("启用多进程并行", value=st.session_state.use_parallel, key='use_parallel')
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        tolerance_type = st.selectbox("碎片匹配容差类型", options=["Da", "ppm"], index=0)
+        tolerance_type = st.selectbox("碎片匹配容差类型", options=["Da", "ppm"], index=0 if st.session_state.tolerance_type == 'Da' else 1, key='tolerance_type')
         if tolerance_type == "Da":
-            fragment_tolerance = st.number_input("碎片匹配容差 (Da)", min_value=0.01, max_value=1.0, value=0.05, step=0.01)
-            fragment_tolerance_ppm = 20
+            st.number_input("碎片匹配容差 (Da)", min_value=0.01, max_value=1.0, value=st.session_state.fragment_tolerance, step=0.01, key='fragment_tolerance')
+            st.session_state.fragment_tolerance_ppm = 20
         else:
-            fragment_tolerance_ppm = st.number_input("碎片匹配容差 (ppm)", min_value=1, max_value=100, value=20, step=1)
-            fragment_tolerance = 0.05
+            st.number_input("碎片匹配容差 (ppm)", min_value=1, max_value=100, value=st.session_state.fragment_tolerance_ppm, step=1, key='fragment_tolerance_ppm')
+            st.session_state.fragment_tolerance = 0.05
     with col2:
-        rt_tolerance = st.number_input("保留时间容差 (min)", min_value=0.1, max_value=2.0, value=0.3, step=0.1)
+        st.number_input("保留时间容差 (min)", min_value=0.1, max_value=2.0, value=st.session_state.rt_tolerance, step=0.1, key='rt_tolerance')
     with col3:
-        loss_tolerance = st.number_input("中性丢失容差 (Da)", min_value=0.01, max_value=0.5, value=0.02, step=0.01)
+        st.number_input("中性丢失容差 (Da)", min_value=0.01, max_value=0.5, value=st.session_state.loss_tolerance, step=0.01, key='loss_tolerance')
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        intensity_rel_threshold = st.slider("相对强度阈值 (%)", min_value=0.0, max_value=100.0, value=1.0, step=0.1)
+        st.slider("相对强度阈值 (%)", min_value=0.0, max_value=100.0, value=st.session_state.intensity_rel_threshold, step=0.1, key='intensity_rel_threshold')
     with col2:
-        use_rt_score = st.checkbox("启用保留时间得分", value=True)
+        st.checkbox("启用保留时间得分", value=st.session_state.use_rt_score, key='use_rt_score')
     with col3:
-        cache_index = st.checkbox("启用索引缓存（加速）", value=True)
+        st.checkbox("启用索引缓存（加速）", value=st.session_state.cache_index, key='cache_index')
 
     herb_filter = st.selectbox("药材筛选模式", options=["使用全部数据库", "筛选特定药材"], index=0)
     if herb_filter == "筛选特定药材":
@@ -1938,61 +1990,13 @@ def show_analysis_page():
     else:
         herb_name = None
 
-    # 应用预设
-    if preset == "快速模式":
-        tolerance_ppm = 50
-        fragment_tolerance = 0.05
-        fragment_tolerance_ppm = 20
-        min_intensity_abs = 100
-        intensity_rel_threshold = 1.0
-        tolerance_type = "Da"
-    elif preset == "高精度模式":
-        tolerance_ppm = 10
-        fragment_tolerance = 0.02
-        fragment_tolerance_ppm = 5
-        min_intensity_abs = 50
-        intensity_rel_threshold = 0.5
-        tolerance_type = "ppm"
-
-    # 参数保存和加载
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 保存当前参数为默认", use_container_width=True):
-            st.session_state['saved_params'] = {
-                'tolerance_ppm': tolerance_ppm,
-                'fragment_tolerance': fragment_tolerance,
-                'fragment_tolerance_ppm': fragment_tolerance_ppm,
-                'tolerance_type': tolerance_type,
-                'min_intensity_abs': min_intensity_abs,
-                'intensity_rel_threshold': intensity_rel_threshold,
-                'rt_tolerance': rt_tolerance,
-                'loss_tolerance': loss_tolerance,
-                'use_rt_score': use_rt_score,
-                'cache_index': cache_index,
-            }
-            st.success("参数已保存")
-
-    with col2:
-        if 'saved_params' in st.session_state and st.button("🔄 加载已保存参数", use_container_width=True):
-            params = st.session_state['saved_params']
-            tolerance_ppm = params['tolerance_ppm']
-            fragment_tolerance = params['fragment_tolerance']
-            fragment_tolerance_ppm = params['fragment_tolerance_ppm']
-            tolerance_type = params['tolerance_type']
-            min_intensity_abs = params['min_intensity_abs']
-            intensity_rel_threshold = params['intensity_rel_threshold']
-            rt_tolerance = params['rt_tolerance']
-            loss_tolerance = params['loss_tolerance']
-            use_rt_score = params['use_rt_score']
-            cache_index = params['cache_index']
-            st.experimental_rerun()
-
     st.markdown("---")
 
     if ms_positive_file or ms_negative_file:
         if st.button("🚀 开始化合物鉴定", type="primary", use_container_width=True):
-            with st.spinner("正在初始化鉴定程序..."):
-                try:
+            temp_files = []
+            try:
+                with st.spinner("正在初始化鉴定程序..."):
                     temp_dir = tempfile.gettempdir()
                     pos_path = None
                     neg_path = None
@@ -2003,18 +2007,22 @@ def show_analysis_page():
                         pos_path = os.path.join(temp_dir, ms_positive_file.name)
                         with open(pos_path, 'wb') as f:
                             f.write(ms_positive_file.getbuffer())
+                        temp_files.append(pos_path)
                     if ms_negative_file:
                         neg_path = os.path.join(temp_dir, ms_negative_file.name)
                         with open(neg_path, 'wb') as f:
                             f.write(ms_negative_file.getbuffer())
+                        temp_files.append(neg_path)
                     if diagnostic_file:
                         diag_path = os.path.join(temp_dir, diagnostic_file.name)
                         with open(diag_path, 'wb') as f:
                             f.write(diagnostic_file.getbuffer())
+                        temp_files.append(diag_path)
                     if custom_db_file:
                         custom_db_path = os.path.join(temp_dir, custom_db_file.name)
                         with open(custom_db_path, 'wb') as f:
                             f.write(custom_db_file.getbuffer())
+                        temp_files.append(custom_db_path)
 
                     db_path = find_database_path()
                     if not db_path:
@@ -2030,11 +2038,11 @@ def show_analysis_page():
                     progress_bar.progress(10)
 
                     config = {
-                        'min_intensity': min_intensity_abs,
-                        'fragment_tolerance': fragment_tolerance,
-                        'fragment_tolerance_ppm': fragment_tolerance_ppm,
-                        'tolerance_ppm': tolerance_ppm,
-                        'max_candidates': max_candidates,
+                        'min_intensity': st.session_state.min_intensity_abs,
+                        'fragment_tolerance': st.session_state.fragment_tolerance,
+                        'fragment_tolerance_ppm': st.session_state.fragment_tolerance_ppm,
+                        'tolerance_ppm': st.session_state.tolerance_ppm,
+                        'max_candidates': st.session_state.max_candidates,
                     }
 
                     identifier = UltimateGardeniaIdentifier(
@@ -2043,16 +2051,16 @@ def show_analysis_page():
                         ms_negative_path=neg_path,
                         herb_name=herb_name,
                         config=config,
-                        use_parallel=use_parallel,
-                        rt_tolerance=rt_tolerance,
-                        loss_tolerance=loss_tolerance,
+                        use_parallel=st.session_state.use_parallel,
+                        rt_tolerance=st.session_state.rt_tolerance,
+                        loss_tolerance=st.session_state.loss_tolerance,
                         external_diagnostic_file=diag_path,
-                        rt_fusion_tolerance=rt_tolerance,
-                        intensity_relative_threshold=intensity_rel_threshold,
-                        tolerance_type=tolerance_type,
-                        use_rt_score=use_rt_score,
+                        rt_fusion_tolerance=st.session_state.rt_tolerance,
+                        intensity_relative_threshold=st.session_state.intensity_rel_threshold,
+                        tolerance_type=st.session_state.tolerance_type,
+                        use_rt_score=st.session_state.use_rt_score,
                         custom_db_path=custom_db_path,
-                        cache_index=cache_index
+                        cache_index=st.session_state.cache_index
                     )
 
                     status_text.text("【7/8】正在处理质谱数据...")
@@ -2075,9 +2083,17 @@ def show_analysis_page():
                         st.session_state['page'] = '结果分析'
                         st.rerun()
 
-                except Exception as e:
-                    st.error(f"鉴定过程中出错：{str(e)}")
-                    st.exception(e)
+            except Exception as e:
+                st.error(f"鉴定过程中出错：{str(e)}")
+                st.exception(e)
+            finally:
+                # 清理临时文件
+                for fpath in temp_files:
+                    try:
+                        if os.path.exists(fpath):
+                            os.remove(fpath)
+                    except:
+                        pass
     else:
         st.markdown("""
         <div class="empty-state">
@@ -2109,7 +2125,6 @@ def show_diagnostic_ion_page():
 
     st.success(f"✅ 已加载诊断离子数据库，包含 {len(diagnostic_df)} 条记录")
 
-    # 统计信息
     cols = st.columns(4)
     with cols[0]:
         if '化合物类型' in diagnostic_df.columns:
@@ -2206,7 +2221,7 @@ def show_diagnostic_ion_page():
 def show_guide_page():
     """使用指南页面 - 优化版"""
     create_header()
-    st.markdown("## 📖 使用指南（修正版）")
+    st.markdown("## 📖 使用指南（修复版）")
 
     st.markdown("""
     <div style="background: white; border-radius: 16px; padding: 2rem; box-shadow: 0 4px 20px rgba(0,0,0,0.08);">
@@ -2256,12 +2271,16 @@ def show_guide_page():
             </ul>
         </div>
 
-        <h3 style="color: #1e293b; margin-top: 2rem;">🆕 新增功能说明</h3>
+        <h3 style="color: #1e293b; margin-top: 2rem;">🆕 v5.12 修复内容</h3>
         <ul style="color: #64748b; line-height: 1.8;">
-            <li><strong>诊断离子去重</strong>：外部诊断离子文件中的重复 m/z 自动合并，权重累加</li>
-            <li><strong>加和离子显示优化</strong>：无加和离子时显示空白，更整洁</li>
-            <li><strong>碎片离子解析增强</strong>：支持顿号、分号、逗号、空格分隔符</li>
-            <li><strong>综合得分保底</strong>：确保评分为非负数</li>
+            <li><strong>CSV列名标准化</strong>：修复CSV文件加载后列名不匹配的问题</li>
+            <li><strong>碎片离子混合分隔符</strong>：支持顿号、分号、逗号、空格混合使用</li>
+            <li><strong>参数预设联动</strong>：点击预设模式后参数自动更新</li>
+            <li><strong>临时文件自动清理</strong>：鉴定结束后删除临时上传文件</li>
+            <li><strong>数据库缓存优化</strong>：基于文件修改时间，避免每次全量哈希</li>
+            <li><strong>碎片匹配效率提升</strong>：采用二分查找算法</li>
+            <li><strong>RT计算边界保护</strong>：防止负值保留时间</li>
+            <li><strong>文献来源多分隔符</strong>：支持中文分号、逗号等</li>
         </ul>
     </div>
     """, unsafe_allow_html=True)
@@ -2290,7 +2309,6 @@ def show_database_page():
 
         st.success(f"✅ 成功加载数据库，包含 {len(df)} 条化合物记录")
 
-        # 统计信息卡片
         cols = st.columns(4)
         with cols[0]:
             st.metric("总记录数", len(df))
@@ -2335,13 +2353,12 @@ def show_results_page():
 
     report = st.session_state['analysis_results']
 
-    st.markdown("## 📊 鉴定结果分析（修正版）")
+    st.markdown("## 📊 鉴定结果分析（修复版）")
 
     if report.empty:
         st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
         return
 
-    # 统计概览
     cols = st.columns(4)
     with cols[0]:
         st.metric("鉴定化合物总数", len(report))
@@ -2405,7 +2422,6 @@ def main():
     """主函数"""
     load_optimized_css()
 
-    # 初始化登录状态
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
 
@@ -2413,12 +2429,10 @@ def main():
         login_page()
         return
 
-    # 已登录，显示主界面
     if 'page' not in st.session_state:
         st.session_state['page'] = '首页'
 
-    logout_button()
-    page = create_sidebar()
+    page = create_sidebar()  # 侧边栏已包含登出按钮
     st.session_state['page'] = page
 
     if page == "首页":
