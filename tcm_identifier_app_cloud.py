@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.15（完整修复版）
-============================================================
-核心功能：
+中药化合物智能鉴定平台 - 云端部署增强版 v5.15（完整版）
+==========================================================
+新增功能：
 - 主要碎片离子输出支持文献上标标注（格式：m/z⁺¹²³）
 - 与一级比对成功的所有文献碎片比对结果完整展示
 - 碎片-文献详细映射表，查看每个碎片的文献支持情况
 - 匹配文献数统计，参与综合得分计算
-- 修复多篇文献碎片仅显示一篇的问题
+- 保留 v5.14 所有优化（碎片-文献映射、结果解读等）
 """
 
 import streamlit as st
@@ -65,7 +65,7 @@ def normalize_formula(formula):
 
 
 # ============================================================================
-# 鉴定程序核心代码 v5.15（完整修复多文献碎片映射）
+# 鉴定程序核心代码 v5.14（支持碎片-文献映射）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
@@ -119,7 +119,6 @@ class UltimateGardeniaIdentifier:
         print("="*80)
         print("中药化合物鉴定程序 v5.15（主要碎片文献标注版）")
         print("="*80)
-
         print("\n【1/8】正在加载数据库...")
         self.full_database = self._load_data(database_path)
         if custom_db_path and os.path.exists(custom_db_path):
@@ -271,7 +270,6 @@ class UltimateGardeniaIdentifier:
         解析碎片离子字符串，支持文献索引后缀。
         格式示例: "151.003:0,1; 137.024:1,2"
         返回: list of (mz, set(lit_indices))
-        修复：增加索引边界检查，忽略超出范围的索引
         """
         if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
             return []
@@ -290,15 +288,11 @@ class UltimateGardeniaIdentifier:
                     for token in lit_str.split(','):
                         token = token.strip()
                         if token.isdigit():
-                            idx = int(token)
-                            if idx < len(sources):
-                                lit_indices.add(idx)
-                            else:
-                                print(f"  警告: 碎片 {mz} 的文献索引 {idx} 超出范围（文献总数 {len(sources)}），已忽略")
+                            lit_indices.add(int(token))
                     if lit_indices:
                         result.append((mz, lit_indices))
                     else:
-                        # 无有效索引则默认所有文献
+                        # 解析失败则默认属于所有文献
                         result.append((mz, set(range(len(sources)))))
                 except ValueError:
                     continue
@@ -529,20 +523,17 @@ class UltimateGardeniaIdentifier:
         right = bisect_right(mz_array, mz_max)
         return range(left, right)
 
-    def _match_fragments_with_literature_mapping(self, observed, reference_frags, tolerance_value,
-                                                   tolerance_type='Da', precursor_mz=None):
+    def _match_fragments_fast(self, observed, reference_frags, tolerance_value, tolerance_type='Da', precursor_mz=None):
         """
-        匹配碎片并返回每个碎片对应的文献索引映射。
         reference_frags: list of (mz, lit_indices)
         observed: array of observed mz values
-        返回: list of (matched_mz, lit_indices_set) - 每个观测碎片只出现一次，文献索引合并
-        修复：使用字典合并所有匹配碎片的文献索引，确保不遗漏
+        返回: (matched_mz_list, matched_lit_indices)
         """
         if len(reference_frags) == 0 or len(observed) == 0:
-            return []
+            return [], set()
         observed_sorted = np.sort(observed)
-        # 使用字典存储每个观测 m/z 对应的文献索引集合
-        mz_to_lit = {}
+        matched_mz = []
+        matched_lit = set()
         for ref_mz, lit_set in reference_frags:
             if pd.isna(ref_mz) or ref_mz <= 0:
                 continue
@@ -554,11 +545,9 @@ class UltimateGardeniaIdentifier:
                     obs_val = observed_sorted[i]
                     if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
                         continue
-                    # 合并文献索引
-                    if obs_val not in mz_to_lit:
-                        mz_to_lit[obs_val] = set()
-                    mz_to_lit[obs_val].update(lit_set)
-                    break  # 每个参考碎片只匹配一次，但不同参考碎片可能匹配到相同 obs_val
+                    matched_mz.append(obs_val)
+                    matched_lit.update(lit_set)
+                    break
             else:  # ppm
                 tol = ref_mz * tolerance_value / 1e6
                 left = np.searchsorted(observed_sorted, ref_mz - tol)
@@ -567,12 +556,10 @@ class UltimateGardeniaIdentifier:
                     obs_val = observed_sorted[i]
                     if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
                         continue
-                    if obs_val not in mz_to_lit:
-                        mz_to_lit[obs_val] = set()
-                    mz_to_lit[obs_val].update(lit_set)
+                    matched_mz.append(obs_val)
+                    matched_lit.update(lit_set)
                     break
-        # 转换为列表
-        return [(mz, lit_set) for mz, lit_set in mz_to_lit.items()]
+        return list(set(matched_mz)), matched_lit
 
     def _find_diagnostic_ions_fast(self, matched_fragments, category, precursor_mz=None):
         if len(matched_fragments) == 0:
@@ -855,7 +842,7 @@ class UltimateGardeniaIdentifier:
                 'ppm': ppm,
                 'adduct': info['adduct_pos'] if mode == '正离子' else info['adduct_neg'],
                 'matched_fragments': matched_fragments,
-                'matched_fragments_with_lit': matched_fragments_with_lit,
+                'matched_fragments_with_lit': matched_fragments_with_lit,  # 新增：带文献索引的碎片
                 'matched_lit_indices': matched_lit_indices,
                 'matched_lit_count': matched_lit_count,
                 'diagnostic_ions': diagnostic_ions,
@@ -879,10 +866,47 @@ class UltimateGardeniaIdentifier:
         else:
             return scored_candidates[:return_top]
 
+    def _match_fragments_with_literature_mapping(self, observed, reference_frags, tolerance_value,
+                                                   tolerance_type='Da', precursor_mz=None):
+        """
+        匹配碎片并返回每个碎片对应的文献索引映射。
+        reference_frags: list of (mz, lit_indices)
+        observed: array of observed mz values
+        返回: list of (matched_mz, lit_indices_set) - 只返回成功匹配的碎片
+        """
+        if len(reference_frags) == 0 or len(observed) == 0:
+            return []
+        observed_sorted = np.sort(observed)
+        result = []
+        for ref_mz, lit_set in reference_frags:
+            if pd.isna(ref_mz) or ref_mz <= 0:
+                continue
+            if tolerance_type == 'Da':
+                tol = tolerance_value
+                left = np.searchsorted(observed_sorted, ref_mz - tol)
+                right = np.searchsorted(observed_sorted, ref_mz + tol)
+                for i in range(left, right):
+                    obs_val = observed_sorted[i]
+                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
+                        continue
+                    result.append((obs_val, lit_set))
+                    break
+            else:  # ppm
+                tol = ref_mz * tolerance_value / 1e6
+                left = np.searchsorted(observed_sorted, ref_mz - tol)
+                right = np.searchsorted(observed_sorted, ref_mz + tol)
+                for i in range(left, right):
+                    obs_val = observed_sorted[i]
+                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
+                        continue
+                    result.append((obs_val, lit_set))
+                    break
+        return result
+
     def _format_fragment_with_literature_superscript(self, fragments_with_lit, source_list):
         """
         格式化碎片离子为带文献上标的字符串。
-        返回格式: "mz⁺¹²³" 其中上标为文献索引+1（从1开始计数，更易读）
+        返回格式: "mz¹²³" 其中上标为文献索引+1（从1开始计数，更易读）
         如果没有文献索引，返回 "mz"
         """
         if not fragments_with_lit:
@@ -894,7 +918,7 @@ class UltimateGardeniaIdentifier:
             if lit_indices:
                 # 文献索引从1开始，更符合阅读习惯
                 superscript = ''.join(str(idx + 1) for idx in sorted(lit_indices))
-                formatted_parts.append(f'{mz_str}⁺{superscript}')
+                formatted_parts.append(f'{mz_str}⁺{superscript}')  # 使用上标标记
             else:
                 formatted_parts.append(mz_str)
         return '; '.join(formatted_parts)
@@ -990,7 +1014,7 @@ class UltimateGardeniaIdentifier:
                 diag_weights,
                 best_candidate['neutral_loss_matches'],
                 best_candidate['rt_deviation'],
-                best_candidate['matched_lit_count']
+                best_candidate['matched_lit_count']   # 新增文献匹配数
             )
 
             cas = best_candidate.get('cas', '')
@@ -1044,7 +1068,7 @@ class UltimateGardeniaIdentifier:
                 '综合得分': base_score,
                 '_merge_key': merge_key,
                 '_fragments_set': set(matched_frags),
-                '_fragment_lit_details': fragment_lit_details
+                '_fragment_lit_details': fragment_lit_details  # 用于详细展示
             }
 
             if merge_key not in herbs_collection:
@@ -1688,8 +1712,22 @@ def show_guide_page():
 
     ### 碎片-文献映射格式（数据库配置）
     在数据库的"碎片离子（正/负）"列中，可以为每个碎片指定文献索引：
+    ```
     151.003:0,1; 137.024:1,2
-    def show_database_page():
+    ```
+    表示碎片151.003出现在第0、1篇文献，碎片137.024出现在第1、2篇文献。
+    文献索引对应"文献来源"列中分号分隔的顺序（从0开始）。
+    若不指定索引（如`151.003`），则默认属于所有文献。
+
+    ### 常见问题
+    - **鉴定结果为空**：检查ppm容差是否过小，或药材筛选是否正确。
+    - **缓存加载失败**：删除 `index_cache.pkl` 文件后重试。
+    - **文献匹配数为0**：检查数据库是否配置了带索引的碎片字段。
+    - **碎片无上标**：该碎片在数据库中未关联文献索引。
+    """)
+
+
+def show_database_page():
     create_header()
     st.markdown("## 🗃️ 数据库预览")
     db_path = find_database_path()
@@ -1725,49 +1763,72 @@ def show_results_page():
     has_lit_frag_col = '主要碎片离子(文献标注)' in report.columns
 
     with st.expander("📖 结果解读示例（基于当前最高分化合物）"):
-        if not report.empty:
-            top = report.iloc[0]
-            st.markdown(f"""
-            **化合物**: {top['化合物中文名']} (m/z {top['m/z实际值']:.4f})
-            - ppm误差 = {top['ppm']:.2f} → {"高精度匹配" if top['ppm']<10 else "可接受"}
-            - 匹配碎片数 = {top['匹配碎片数']} → {"二级质谱验证充分" if top['匹配碎片数']>=3 else "碎片信息较少"}
-            - **匹配文献数 = {top['匹配文献数']}** → {"文献支持充分" if top['匹配文献数']>=2 else "文献支持较少"}
-            - 诊断离子个数 = {top['诊断性离子个数']} → {"符合类别特征" if top['诊断性离子个数']>0 else "无类别特异性"}
-            - 综合得分 = {top['综合得分']:.1f} → {top['评级名称']}
-            - 报告建议: {top['报告建议']}
-            """)
+        top = report.iloc[0]
+        st.markdown(f"""
+        **化合物**: {top['化合物中文名']} (m/z {top['m/z实际值']:.4f})
+        - ppm误差 = {top['ppm']:.2f} → {"高精度匹配" if top['ppm']<10 else "可接受"}
+        - 匹配碎片数 = {top['匹配碎片数']} → {"二级质谱验证充分" if top['匹配碎片数']>=3 else "碎片信息较少"}
+        - **匹配文献数 = {top['匹配文献数']}** → {"文献支持充分" if top['匹配文献数']>=2 else "文献支持较少"}
+        - 诊断离子个数 = {top['诊断性离子个数']} → {"符合类别特征" if top['诊断性离子个数']>0 else "无类别特异性"}
+        - 综合得分 = {top['综合得分']:.1f} → {top['评级名称']}
+        - 报告建议: {top['报告建议']}
+        """)
 
-            # 显示主要碎片离子的文献标注详情
-            if has_lit_frag_col and top['主要碎片离子(文献标注)']:
-                st.markdown("**📚 主要碎片离子（文献标注）**")
-                st.markdown(f"*{top['主要碎片离子(文献标注)']}*")
-                st.caption("注：上标数字表示报道该碎片的文献编号（如¹²³表示被第1、2、3篇文献同时报道）")
+        # 显示主要碎片离子的文献标注详情
+        if has_lit_frag_col and top['主要碎片离子(文献标注)']:
+            st.markdown("**📚 主要碎片离子（文献标注）**")
+            st.markdown(f"*{top['主要碎片离子(文献标注)']}*")
+            st.caption("注：上标数字表示报道该碎片的文献编号（如¹²³表示被第1、2、3篇文献同时报道）")
 
     # 添加碎片文献详情展开区域
     if has_lit_frag_col:
         with st.expander("🔬 碎片-文献详细映射表"):
             frag_data = []
-            sup_map = {'⁰':'0','¹':'1','²':'2','³':'3','⁴':'4','⁵':'5','⁶':'6','⁷':'7','⁸':'8','⁹':'9'}
             for idx, row in report.iterrows():
                 compound_name = row['化合物中文名']
                 lit_frag_str = row.get('主要碎片离子(文献标注)', '')
                 sources = row.get('文献来源', '')
 
+                # 解析碎片离子和文献信息
                 if lit_frag_str:
+                    # 格式: "mz¹²³; mz⁺⁴⁵" - 需要解析上标
                     frag_parts = lit_frag_str.split('; ')
                     for part in frag_parts:
                         part = part.strip()
                         if not part:
                             continue
-                        if '⁺' in part:
-                            mz_part, lit_part = part.split('⁺', 1)
-                            lit_nums = ''.join(sup_map.get(ch, ch) for ch in lit_part)
-                            frag_data.append({
-                                '化合物': compound_name,
-                                '碎片m/z': mz_part.strip(),
-                                '文献编号': lit_nums,
-                                '文献来源': sources
-                            })
+
+                        # 检查是否有上标文献标记
+                        if '⁺' in part or any(c in part for c in '⁰¹²³⁴⁵⁶⁷⁸⁹'):
+                            # 提取mz和文献编号
+                            if '⁺' in part:
+                                mz_part, lit_part = part.split('⁺', 1)
+                                lit_nums = lit_part.replace('⁰', '0').replace('¹', '1').replace('²', '2').replace('³', '3').replace('⁴', '4').replace('⁵', '5').replace('⁶', '6').replace('⁷', '7').replace('⁸', '8').replace('⁹', '9')
+                                frag_data.append({
+                                    '化合物': compound_name,
+                                    '碎片m/z': mz_part.strip(),
+                                    '文献编号': lit_nums,
+                                    '文献来源': sources
+                                })
+                            elif any(c in part for c in '⁰¹²³⁴⁵⁶⁷⁸⁹'):
+                                # 分离数字部分
+                                mz = ''
+                                lit_nums = ''
+                                for c in part:
+                                    if c in '⁰¹²³⁴⁵⁶⁷⁸⁹':
+                                        lit_nums += {'⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9'}[c]
+                                    elif c == '.' or c.isdigit():
+                                        mz += c
+                                    elif c in '; ':
+                                        continue
+                                if mz and lit_nums:
+                                    frag_data.append({
+                                        '化合物': compound_name,
+                                        '碎片m/z': mz,
+                                        '文献编号': lit_nums,
+                                        '文献来源': sources
+                                    })
+
             if frag_data:
                 frag_df = pd.DataFrame(frag_data)
                 st.dataframe(frag_df, use_container_width=True)
@@ -1784,7 +1845,7 @@ def show_results_page():
     available_cols = [c for c in display_cols if c in report.columns]
     st.dataframe(report[available_cols], use_container_width=True)
 
-    # 提供完整报告下载
+    # 提供完整报告下载（包含所有列）
     csv = report.to_csv(index=False).encode('utf-8')
     st.download_button("导出CSV", csv, "identification_report.csv")
 
