@@ -1,16 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.13（优化版）
+中药化合物智能鉴定平台 - 云端部署增强版 v5.14（完整版）
 ==========================================================
-新增优化：
-- 示例数据模板下载
-- 参数调优提示面板
-- 诊断离子模板下载
-- 增强错误提示与解决建议
-- 结果解读示例
-- 性能优化提示
-- 缓存损坏自动重建指引
-- 多离子融合规则说明
+新增功能：
+- 碎片离子支持文献索引（格式：mz:idx1,idx2），实现碎片-文献映射
+- 匹配文献数统计，参与综合得分计算
+- 保留 v5.13 所有优化（示例模板、参数提示、结果解读等）
 """
 
 import streamlit as st
@@ -19,7 +14,6 @@ import numpy as np
 import os
 import time
 import pickle
-import hashlib
 import re
 from datetime import datetime
 from io import BytesIO
@@ -69,12 +63,13 @@ def normalize_formula(formula):
 
 
 # ============================================================================
-# 鉴定程序核心代码（全能优化版）
+# 鉴定程序核心代码 v5.14（支持碎片-文献映射）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.13（优化版）
+    中药化合物鉴定终极版程序 v5.14
+    新增：碎片离子支持文献索引，匹配文献数参与评分
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -87,7 +82,7 @@ class UltimateGardeniaIdentifier:
                  use_rt_score=True,
                  custom_db_path=None,
                  cache_index=True):
-        """初始化鉴定程序（增强版）"""
+        """初始化鉴定程序"""
         self.config = {
             'gradient_time': 30.0,
             'cid_min': 0.5,
@@ -120,7 +115,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v5.13（优化版）")
+        print("中药化合物鉴定程序 v5.14（碎片-文献映射版）")
         print("="*80)
         print("\n【1/8】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -167,6 +162,7 @@ class UltimateGardeniaIdentifier:
         self._print_initialization_info()
         print("【7/8】初始化完成，准备鉴定")
 
+    # ----------------------------- 辅助方法 ----------------------------------
     def _normalize_columns(self, df):
         """标准化列名"""
         column_mapping = {
@@ -209,7 +205,6 @@ class UltimateGardeniaIdentifier:
         return filtered_db
 
     def _get_db_cache_key(self, db_path):
-        """基于文件修改时间和大小生成缓存键"""
         if not db_path or not os.path.exists(db_path):
             return None
         try:
@@ -244,7 +239,6 @@ class UltimateGardeniaIdentifier:
                     return
             except Exception as e:
                 print(f"  缓存加载失败，重新构建: {e}")
-                # 提示用户可删除缓存文件
                 st.warning(f"缓存文件损坏，正在重建索引。若频繁出现此提示，可手动删除 '{cache_file}' 文件。")
 
         self._build_optimized_index()
@@ -269,6 +263,45 @@ class UltimateGardeniaIdentifier:
             except Exception as e:
                 print(f"  缓存保存失败: {e}")
 
+    def _parse_fragments_with_literature(self, fragment_string, sources):
+        """
+        解析碎片离子字符串，支持文献索引后缀。
+        格式示例: "151.003:0,1; 137.024:1,2"
+        返回: list of (mz, set(lit_indices))
+        """
+        if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
+            return []
+        s = str(fragment_string)
+        parts = re.split(r'[、;，,\s]+', s)
+        result = []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if ':' in part:
+                mz_str, lit_str = part.split(':', 1)
+                try:
+                    mz = float(mz_str)
+                    lit_indices = set()
+                    for token in lit_str.split(','):
+                        token = token.strip()
+                        if token.isdigit():
+                            lit_indices.add(int(token))
+                    if lit_indices:
+                        result.append((mz, lit_indices))
+                    else:
+                        # 解析失败则默认属于所有文献
+                        result.append((mz, set(range(len(sources)))))
+                except ValueError:
+                    continue
+            else:
+                try:
+                    mz = float(part)
+                    result.append((mz, set(range(len(sources)))))
+                except ValueError:
+                    continue
+        return result
+
     def _build_optimized_index(self):
         self.sorted_idx_pos = []
         self.sorted_idx_neg = []
@@ -291,7 +324,12 @@ class UltimateGardeniaIdentifier:
                 formula = normalize_formula(formula)
             herb = str(row.get('药材名称') or row.get('药材名') or '')
             compound_type = str(row.get('化合物类型', ''))
-            source = str(row.get('文献来源') or row.get('文献') or '')
+            source_str = str(row.get('文献来源') or row.get('文献') or '')
+            # 解析文献列表
+            if pd.notna(source_str) and source_str:
+                sources = [s.strip() for s in re.split(r'[;,；，]+', source_str) if s.strip()]
+            else:
+                sources = []
             cas = str(row.get('CAS', ''))
 
             self.compound_info[idx] = {
@@ -300,7 +338,8 @@ class UltimateGardeniaIdentifier:
                 'formula': formula,
                 'herb': herb,
                 'compound_type': compound_type,
-                'source': source,
+                'source': source_str,
+                'sources': sources,
                 'cas': cas if cas and cas != 'nan' else '',
                 'adduct_pos': str(row.get('加合物（正）', '')),
                 'adduct_neg': str(row.get('加合物（负）', ''))
@@ -317,21 +356,27 @@ class UltimateGardeniaIdentifier:
                 if losses:
                     self.neutral_losses[idx] = losses
 
+            # 正离子碎片（带文献）
             if pd.notna(mz_pos) and str(mz_pos).strip() != '':
                 try:
                     mz_val = float(mz_pos)
                     if mz_val > 0:
-                        fragments = self._parse_fragments_fast(row.get('碎片离子（正）', ''))
-                        self.sorted_idx_pos.append((mz_val, idx, fragments))
+                        fragments_with_lit = self._parse_fragments_with_literature(
+                            row.get('碎片离子（正）', ''), sources
+                        )
+                        self.sorted_idx_pos.append((mz_val, idx, fragments_with_lit))
                 except (ValueError, TypeError):
                     pass
 
+            # 负离子碎片（带文献）
             if pd.notna(mz_neg) and str(mz_neg).strip() != '':
                 try:
                     mz_val = float(mz_neg)
                     if mz_val > 0:
-                        fragments = self._parse_fragments_fast(row.get('碎片离子（负）', ''))
-                        self.sorted_idx_neg.append((mz_val, idx, fragments))
+                        fragments_with_lit = self._parse_fragments_with_literature(
+                            row.get('碎片离子（负）', ''), sources
+                        )
+                        self.sorted_idx_neg.append((mz_val, idx, fragments_with_lit))
                 except (ValueError, TypeError):
                     pass
 
@@ -344,24 +389,19 @@ class UltimateGardeniaIdentifier:
         self.db_frag_pos = [x[2] for x in self.sorted_idx_pos]
         self.db_frag_neg = [x[2] for x in self.sorted_idx_neg]
 
-    def _parse_fragments_fast(self, fragment_string):
-        """解析碎片离子字符串，支持混合分隔符"""
-        if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
-            return np.array([])
-        s = str(fragment_string)
-        parts = re.split(r'[、;，,\s]+', s)
-        fragments = []
-        for part in parts:
+    def _parse_losses(self, loss_string):
+        if pd.isna(loss_string):
+            return []
+        losses = []
+        for part in str(loss_string).split(','):
             part = part.strip()
-            if part:
-                try:
-                    fragments.append(float(part))
-                except ValueError:
-                    continue
-        return np.array(fragments)
+            try:
+                losses.append(float(part))
+            except ValueError:
+                continue
+        return losses
 
     def _build_diagnostic_ion_library(self, external_file=None):
-        """构建诊断性离子库"""
         if external_file and os.path.exists(external_file):
             try:
                 df = pd.read_excel(external_file)
@@ -441,18 +481,6 @@ class UltimateGardeniaIdentifier:
     def _load_auxiliary_data(self):
         pass
 
-    def _parse_losses(self, loss_string):
-        if pd.isna(loss_string):
-            return []
-        losses = []
-        for part in str(loss_string).split(','):
-            part = part.strip()
-            try:
-                losses.append(float(part))
-            except ValueError:
-                continue
-        return losses
-
     def _find_neutral_losses(self, fragments, precursor_mz):
         if len(fragments) == 0:
             return []
@@ -493,35 +521,43 @@ class UltimateGardeniaIdentifier:
         right = bisect_right(mz_array, mz_max)
         return range(left, right)
 
-    def _match_fragments_fast(self, observed, reference, tolerance_value, tolerance_type='Da', precursor_mz=None):
-        if len(reference) == 0 or len(observed) == 0:
-            return []
+    def _match_fragments_fast(self, observed, reference_frags, tolerance_value, tolerance_type='Da', precursor_mz=None):
+        """
+        reference_frags: list of (mz, lit_indices)
+        observed: array of observed mz values
+        返回: (matched_mz_list, matched_lit_indices)
+        """
+        if len(reference_frags) == 0 or len(observed) == 0:
+            return [], set()
         observed_sorted = np.sort(observed)
-        matched = []
-        for ref_val in reference:
-            if pd.isna(ref_val) or ref_val <= 0:
+        matched_mz = []
+        matched_lit = set()
+        for ref_mz, lit_set in reference_frags:
+            if pd.isna(ref_mz) or ref_mz <= 0:
                 continue
             if tolerance_type == 'Da':
                 tol = tolerance_value
-                left = np.searchsorted(observed_sorted, ref_val - tol)
-                right = np.searchsorted(observed_sorted, ref_val + tol)
+                left = np.searchsorted(observed_sorted, ref_mz - tol)
+                right = np.searchsorted(observed_sorted, ref_mz + tol)
                 for i in range(left, right):
                     obs_val = observed_sorted[i]
                     if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
                         continue
-                    matched.append(obs_val)
+                    matched_mz.append(obs_val)
+                    matched_lit.update(lit_set)
                     break
-            else:
-                tol = ref_val * tolerance_value / 1e6
-                left = np.searchsorted(observed_sorted, ref_val - tol)
-                right = np.searchsorted(observed_sorted, ref_val + tol)
+            else:  # ppm
+                tol = ref_mz * tolerance_value / 1e6
+                left = np.searchsorted(observed_sorted, ref_mz - tol)
+                right = np.searchsorted(observed_sorted, ref_mz + tol)
                 for i in range(left, right):
                     obs_val = observed_sorted[i]
                     if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
                         continue
-                    matched.append(obs_val)
+                    matched_mz.append(obs_val)
+                    matched_lit.update(lit_set)
                     break
-        return list(set(matched))
+        return list(set(matched_mz)), matched_lit
 
     def _find_diagnostic_ions_fast(self, matched_fragments, category, precursor_mz=None):
         if len(matched_fragments) == 0:
@@ -573,7 +609,8 @@ class UltimateGardeniaIdentifier:
         return 6, '排除级', '未识别', '不符合评级标准'
 
     def _calculate_base_score(self, rating, ppm, matched_frag_count, diag_count,
-                              diag_weights=None, neutral_loss_match_count=0, rt_deviation=None):
+                              diag_weights=None, neutral_loss_match_count=0, 
+                              rt_deviation=None, lit_match_count=0):
         if rating == 1:
             base = 85
         elif rating == 2:
@@ -612,7 +649,9 @@ class UltimateGardeniaIdentifier:
             elif rt_deviation < 0.5:
                 rt_adj = 2
 
-        total = base + ppm_adj + frag_adj + diag_score + loss_adj + rt_adj
+        lit_adj = min(lit_match_count * 3, 12)   # 每匹配一篇文献 +3 分，上限 12
+
+        total = base + ppm_adj + frag_adj + diag_score + loss_adj + rt_adj + lit_adj
         total = max(0, total)
 
         if rating == 1 and total < 80:
@@ -748,7 +787,7 @@ class UltimateGardeniaIdentifier:
             else:
                 tolerance_value = self.config['fragment_tolerance_ppm']
 
-            matched_fragments = self._match_fragments_fast(
+            matched_fragments, matched_lit_indices = self._match_fragments_fast(
                 precursor['fragments'],
                 ref_frags,
                 tolerance_value,
@@ -779,6 +818,9 @@ class UltimateGardeniaIdentifier:
             if self.use_rt_score and db_idx in self.rt_values and precursor['retention_time'] is not None:
                 rt_deviation = abs(precursor['retention_time'] - self.rt_values[db_idx])
 
+            total_sources = len(info.get('sources', []))
+            matched_lit_count = len(matched_lit_indices) if total_sources > 0 else 0
+
             candidate = {
                 'name_cn': info['name_cn'],
                 'name_en': info['name_en'],
@@ -791,10 +833,13 @@ class UltimateGardeniaIdentifier:
                 'ppm': ppm,
                 'adduct': info['adduct_pos'] if mode == '正离子' else info['adduct_neg'],
                 'matched_fragments': matched_fragments,
+                'matched_lit_indices': matched_lit_indices,
+                'matched_lit_count': matched_lit_count,
                 'diagnostic_ions': diagnostic_ions,
                 'diag_weights': diag_weights,
                 'mode': mode,
                 'source': info['source'],
+                'sources': info.get('sources', []),
                 'category': category,
                 'db_index': db_idx,
                 'neutral_loss_matches': neutral_loss_matches,
@@ -882,7 +927,8 @@ class UltimateGardeniaIdentifier:
                 len(diag_ions),
                 diag_weights,
                 best_candidate['neutral_loss_matches'],
-                best_candidate['rt_deviation']
+                best_candidate['rt_deviation'],
+                best_candidate['matched_lit_count']   # 新增文献匹配数
             )
 
             cas = best_candidate.get('cas', '')
@@ -910,6 +956,7 @@ class UltimateGardeniaIdentifier:
                 '是否有碎片数据': '是' if precursor['fragments'].size > 0 else '否',
                 '主要碎片离子': '; '.join([f'{f:.4f}' for f in matched_frags]) if matched_frags else '',
                 '匹配碎片数': len(matched_frags),
+                '匹配文献数': best_candidate['matched_lit_count'],   # 新增字段
                 '诊断性离子个数': len(diag_ions),
                 '诊断性离子': '; '.join([f'{f:.4f}' for f in diag_ions]) if diag_ions else '',
                 '文献来源数': source_count,
@@ -1098,7 +1145,7 @@ class UltimateGardeniaIdentifier:
 
     def _print_initialization_info(self):
         print("\n" + "="*80)
-        print("程序初始化完成（修正版）")
+        print("程序初始化完成（碎片-文献映射版）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -1208,11 +1255,11 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# Streamlit 网页应用部分 - 优化版界面
+# Streamlit 网页应用部分
 # ============================================================================
 
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.13",
+    page_title="中药化合物智能鉴定平台 v5.14",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1220,16 +1267,15 @@ st.set_page_config(
 
 
 def load_optimized_css():
-    """加载优化后的CSS样式"""
     st.markdown("""
     <style>
-        /* 保持原有CSS样式不变，为了节省篇幅此处省略，实际使用时需保留全部样式 */
-        /* 此处为占位，实际代码中应包含之前的所有CSS */
         .stApp { background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f1f5f9 100%); }
-        .main-header { background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%); padding: 2rem; border-radius: 20px; }
+        .main-header { background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%); padding: 2rem; border-radius: 20px; margin-bottom: 2rem; }
+        .main-header h1, .main-header p { color: white; }
         .stat-card { background: rgba(255,255,255,0.95); border-radius: 16px; padding: 1.5rem; text-align: center; }
         .feature-card { background: white; border-radius: 16px; padding: 1.5rem; margin-bottom: 1rem; }
-        /* 更多样式... */
+        [data-testid="stSidebar"] { background: #ffffff; }
+        .stButton > button { background: linear-gradient(135deg, #059669, #0891b2); color: white; border-radius: 12px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1279,7 +1325,7 @@ def create_header():
     st.markdown(f"""
     <div class="main-header">
         <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v5.13 优化版 | 欢迎回来，{username}</p>
+        <p>v5.14 碎片-文献映射版 | 欢迎回来，{username}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1297,8 +1343,8 @@ def show_home_page():
     st.markdown("""
     - **智能化合物鉴定**：基于高分辨质谱数据精准匹配
     - **六级评级标准**：科学评估鉴定结果可靠性
-    - **综合评分系统**：多维度加权计算
-    - **药材来源合并**：同一化合物的所有药材自动合并
+    - **碎片-文献映射**：支持碎片关联文献，统计匹配文献数并加分
+    - **综合评分系统**：多维度加权计算（含文献匹配加分）
     """)
     if st.button("🚀 立即开始鉴定", type="primary"):
         st.session_state['page'] = '开始鉴定'
@@ -1314,7 +1360,6 @@ def show_analysis_page():
     with col2:
         ms_negative_file = st.file_uploader("负离子模式数据 (.xlsx)", type=['xlsx'], key='ms_neg')
     
-    # 示例模板下载
     with st.expander("📥 下载示例数据模板"):
         st.markdown("点击下方按钮下载CSV模板，按照模板格式准备数据。")
         sample_data = pd.DataFrame({
@@ -1329,9 +1374,20 @@ def show_analysis_page():
         st.download_button("下载 CSV 模板", data=csv_data, file_name="ms_data_template.csv", mime="text/csv")
     
     st.markdown("---")
+    st.markdown("## 📚 自定义数据库（可选）")
+    custom_db_file = st.file_uploader("上传自定义数据库 (.xlsx，需与主数据库列一致)", type=['xlsx'], key='custom_db')
+    if custom_db_file:
+        st.success(f"✅ 已上传: {custom_db_file.name}")
+    
+    st.markdown("---")
+    st.markdown("## 🧪 外部诊断离子（可选）")
+    diagnostic_file = st.file_uploader("上传自定义诊断离子文件 (.xlsx，可包含权重列)", type=['xlsx'], key='diagnostic')
+    if diagnostic_file:
+        st.success(f"✅ 已上传: {diagnostic_file.name}")
+    
+    st.markdown("---")
     st.markdown("## ⚙️ 鉴定参数配置")
     
-    # 参数调优提示
     with st.expander("📖 参数调优指南（点击展开）"):
         st.markdown("""
         - **ppm误差容限**：仪器精度高（<5 ppm）建议设为10，普通设为50。
@@ -1342,7 +1398,7 @@ def show_analysis_page():
         - **启用RT得分**：仅在数据库有可靠保留时间时启用。
         """)
     
-    # 参数控件（使用session_state）
+    # 参数控件
     if 'tolerance_ppm' not in st.session_state:
         st.session_state.tolerance_ppm = 50
     if 'fragment_tolerance' not in st.session_state:
@@ -1403,6 +1459,8 @@ def show_analysis_page():
                 temp_dir = tempfile.gettempdir()
                 pos_path = None
                 neg_path = None
+                diag_path = None
+                custom_db_path = None
                 if ms_positive_file:
                     pos_path = os.path.join(temp_dir, ms_positive_file.name)
                     with open(pos_path, 'wb') as f:
@@ -1413,6 +1471,16 @@ def show_analysis_page():
                     with open(neg_path, 'wb') as f:
                         f.write(ms_negative_file.getbuffer())
                     temp_files.append(neg_path)
+                if diagnostic_file:
+                    diag_path = os.path.join(temp_dir, diagnostic_file.name)
+                    with open(diag_path, 'wb') as f:
+                        f.write(diagnostic_file.getbuffer())
+                    temp_files.append(diag_path)
+                if custom_db_file:
+                    custom_db_path = os.path.join(temp_dir, custom_db_file.name)
+                    with open(custom_db_path, 'wb') as f:
+                        f.write(custom_db_file.getbuffer())
+                    temp_files.append(custom_db_path)
                 
                 db_path = find_database_path()
                 if not db_path:
@@ -1437,11 +1505,12 @@ def show_analysis_page():
                         use_parallel=st.session_state.use_parallel,
                         rt_tolerance=st.session_state.rt_tolerance,
                         loss_tolerance=st.session_state.loss_tolerance,
-                        external_diagnostic_file=None,
+                        external_diagnostic_file=diag_path,
                         rt_fusion_tolerance=st.session_state.rt_tolerance,
                         intensity_relative_threshold=st.session_state.intensity_rel_threshold,
                         tolerance_type=st.session_state.tolerance_type,
                         use_rt_score=st.session_state.use_rt_score,
+                        custom_db_path=custom_db_path,
                         cache_index=st.session_state.cache_index
                     )
                     report = identifier.generate_report('样品')
@@ -1470,7 +1539,6 @@ def show_diagnostic_ion_page():
         return
     st.success(f"已加载 {len(diagnostic_df)} 条诊断离子记录")
     
-    # 模板下载
     with st.expander("📥 下载诊断离子模板"):
         template = pd.DataFrame({
             '化合物类型': ['黄酮类', '生物碱类'],
@@ -1489,7 +1557,6 @@ def show_diagnostic_ion_page():
     ion_mode = st.selectbox("离子模式", ["全部", "正离子", "负离子"])
     
     if mz_input:
-        # 解析m/z
         mz_list = []
         for token in re.split(r'[,\s\n]+', mz_input):
             token = token.strip()
@@ -1517,95 +1584,17 @@ def show_guide_page():
     2. 上传文件，设置参数（新手可使用快速模式）。
     3. 点击开始鉴定，等待结果。
     4. 查看结果报告，根据评级和得分判断可靠性。
-    
-    ### 评分规则
+
+    ### 评分规则（v5.14 新增文献匹配加分）
     - 基础分：确证级85，高置信级65，推定级45，提示级25，参考级0
-    - 加分项：匹配碎片每个+2，诊断离子按权重+5/单位，中性丢失每个+2，RT匹配+2~5
+    - 加分项：
+      - 匹配碎片：每个+2（上限20）
+      - 诊断离子：按权重+5/单位（上限15）
+      - 中性丢失：每个+2（上限10）
+      - RT匹配：偏差<0.2 +5，<0.5 +2
+      - **文献匹配：每篇+3（上限12）**
     - 扣分项：ppm>10开始扣分
     - 保底：1级不低于80，2级不低于60
-    
-    ### 常见问题
-    - **鉴定结果为空**：检查ppm容差是否过小，或药材筛选是否正确。
-    - **缓存加载失败**：删除 `index_cache.pkl` 文件后重试。
-    - **临时文件残留**：程序自动清理，无需担心。
-    """)
 
-
-def show_database_page():
-    create_header()
-    st.markdown("## 🗃️ 数据库预览")
-    db_path = find_database_path()
-    if not db_path:
-        st.warning("未找到数据库文件")
-        return
-    df = load_database_cached()
-    st.dataframe(df.head(10))
-    st.info(f"共 {len(df)} 条记录")
-
-
-def show_results_page():
-    create_header()
-    if 'analysis_results' not in st.session_state:
-        st.warning("暂无鉴定结果，请先进行鉴定")
-        if st.button("前往鉴定"):
-            st.session_state['page'] = '开始鉴定'
-            st.rerun()
-        return
-    report = st.session_state['analysis_results']
-    if report.empty:
-        st.warning("鉴定结果为空")
-        return
-    
-    st.markdown("## 📊 鉴定结果")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1: st.metric("鉴定总数", len(report))
-    with col2: st.metric("确证级", (report['评级名称']=='确证级').sum())
-    with col3: st.metric("90分以上", (report['综合得分']>=90).sum())
-    with col4: st.metric("平均得分", f"{report['综合得分'].mean():.1f}")
-    
-    # 结果解读示例
-    with st.expander("📖 结果解读示例（基于当前最高分化合物）"):
-        top = report.iloc[0]
-        st.markdown(f"""
-        **化合物**: {top['化合物中文名']} (m/z {top['m/z实际值']:.4f})
-        - ppm误差 = {top['ppm']:.2f} → {"高精度匹配" if top['ppm']<10 else "可接受"}
-        - 匹配碎片数 = {top['匹配碎片数']} → {"二级质谱验证充分" if top['匹配碎片数']>=3 else "碎片信息较少"}
-        - 诊断离子个数 = {top['诊断性离子个数']} → {"符合类别特征" if top['诊断性离子个数']>0 else "无类别特异性"}
-        - 综合得分 = {top['综合得分']:.1f} → {top['评级名称']}
-        - 报告建议: {top['报告建议']}
-        """)
-    
-    st.dataframe(report, use_container_width=True)
-    
-    # 导出
-    csv = report.to_csv(index=False).encode('utf-8')
-    st.download_button("导出CSV", csv, "identification_report.csv")
-
-
-def main():
-    load_optimized_css()
-    if 'logged_in' not in st.session_state:
-        st.session_state.logged_in = False
-    if not st.session_state.logged_in:
-        login_page()
-        return
-    if 'page' not in st.session_state:
-        st.session_state['page'] = '首页'
-    page = create_sidebar()
-    st.session_state['page'] = page
-    if page == "首页":
-        show_home_page()
-    elif page == "开始鉴定":
-        show_analysis_page()
-    elif page == "诊断离子筛查":
-        show_diagnostic_ion_page()
-    elif page == "使用指南":
-        show_guide_page()
-    elif page == "数据库预览":
-        show_database_page()
-    elif page == "结果分析":
-        show_results_page()
-
-
-if __name__ == "__main__":
-    main()
+    ### 碎片-文献映射格式
+    在数据库的“碎片离子（正/负）”列中，可以为每个碎片指定文献索引：
