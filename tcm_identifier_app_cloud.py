@@ -877,7 +877,8 @@ class UltimateGardeniaIdentifier:
         if len(reference_frags) == 0 or len(observed) == 0:
             return []
         observed_sorted = np.sort(observed)
-        result = []
+        # 使用字典存储每个观测m/z对应的文献索引集合
+        mz_to_lit = {}
         for ref_mz, lit_set in reference_frags:
             if pd.isna(ref_mz) or ref_mz <= 0:
                 continue
@@ -887,37 +888,54 @@ class UltimateGardeniaIdentifier:
                 right = np.searchsorted(observed_sorted, ref_mz + tol)
                 for i in range(left, right):
                     obs_val = observed_sorted[i]
+                    # 排除母离子
                     if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
                         continue
-                    result.append((obs_val, lit_set))
-                    break
+                    # 合并文献索引
+                    if obs_val not in mz_to_lit:
+                        mz_to_lit[obs_val] = set()
+                    mz_to_lit[obs_val].update(lit_set)
             else:  # ppm
                 tol = ref_mz * tolerance_value / 1e6
                 left = np.searchsorted(observed_sorted, ref_mz - tol)
                 right = np.searchsorted(observed_sorted, ref_mz + tol)
                 for i in range(left, right):
                     obs_val = observed_sorted[i]
+                    # 排除母离子
                     if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
                         continue
-                    result.append((obs_val, lit_set))
-                    break
-        return result
+                    # 合并文献索引
+                    if obs_val not in mz_to_lit:
+                        mz_to_lit[obs_val] = set()
+                    mz_to_lit[obs_val].update(lit_set)
+        # 转换为列表
+        return [(mz, lit_set) for mz, lit_set in mz_to_lit.items()]
 
     def _format_fragment_with_literature_superscript(self, fragments_with_lit, source_list):
         """
         格式化碎片离子为带文献上标的字符串。
-        返回格式: "mz¹²³" 其中上标为文献索引+1（从1开始计数，更易读）
+        返回格式: "mz⁺¹²³" 其中上标为文献索引+1（从1开始计数，更易读）
         如果没有文献索引，返回 "mz"
         """
         if not fragments_with_lit:
             return ''
 
+        # 定义上标Unicode映射
+        superscript_map = {
+            '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+            '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'
+        }
+
         formatted_parts = []
-        for mz_val, lit_indices in fragments_with_lit:
+        # 按m/z值排序
+        sorted_frags = sorted(fragments_with_lit, key=lambda x: x[0])
+
+        for mz_val, lit_indices in sorted_frags:
             mz_str = f'{mz_val:.4f}'
             if lit_indices:
                 # 文献索引从1开始，更符合阅读习惯
-                superscript = ''.join(str(idx + 1) for idx in sorted(lit_indices))
+                lit_nums = sorted([idx + 1 for idx in lit_indices])  # 先转换为1-based并排序
+                superscript = ''.join(superscript_map[str(num)] for num in lit_nums if 0 <= num <= 9)
                 formatted_parts.append(f'{mz_str}⁺{superscript}')  # 使用上标标记
             else:
                 formatted_parts.append(mz_str)
@@ -1782,16 +1800,23 @@ def show_results_page():
 
     # 添加碎片文献详情展开区域
     if has_lit_frag_col:
-        with st.expander("🔬 碎片-文献详细映射表"):
+        with st.expander("🔬 碎片-文献详细映射表（展示所有匹配碎片与文献的比对关系）"):
             frag_data = []
             for idx, row in report.iterrows():
                 compound_name = row['化合物中文名']
                 lit_frag_str = row.get('主要碎片离子(文献标注)', '')
                 sources = row.get('文献来源', '')
+                source_count = row.get('文献来源数', 0)
+
+                # 定义上标Unicode映射
+                superscript_reverse_map = {
+                    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+                    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9'
+                }
 
                 # 解析碎片离子和文献信息
                 if lit_frag_str:
-                    # 格式: "mz¹²³; mz⁺⁴⁵" - 需要解析上标
+                    # 格式: "mz⁺¹²³; mz⁺⁴⁵" - 需要解析上标
                     frag_parts = lit_frag_str.split('; ')
                     for part in frag_parts:
                         part = part.strip()
@@ -1799,39 +1824,48 @@ def show_results_page():
                             continue
 
                         # 检查是否有上标文献标记
-                        if '⁺' in part or any(c in part for c in '⁰¹²³⁴⁵⁶⁷⁸⁹'):
-                            # 提取mz和文献编号
-                            if '⁺' in part:
+                        if '⁺' in part:
+                            try:
                                 mz_part, lit_part = part.split('⁺', 1)
-                                lit_nums = lit_part.replace('⁰', '0').replace('¹', '1').replace('²', '2').replace('³', '3').replace('⁴', '4').replace('⁵', '5').replace('⁶', '6').replace('⁷', '7').replace('⁸', '8').replace('⁹', '9')
-                                frag_data.append({
-                                    '化合物': compound_name,
-                                    '碎片m/z': mz_part.strip(),
-                                    '文献编号': lit_nums,
-                                    '文献来源': sources
-                                })
-                            elif any(c in part for c in '⁰¹²³⁴⁵⁶⁷⁸⁹'):
-                                # 分离数字部分
-                                mz = ''
+                                # 将上标字符转换回普通数字
                                 lit_nums = ''
-                                for c in part:
-                                    if c in '⁰¹²³⁴⁵⁶⁷⁸⁹':
-                                        lit_nums += {'⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9'}[c]
-                                    elif c == '.' or c.isdigit():
-                                        mz += c
-                                    elif c in '; ':
-                                        continue
-                                if mz and lit_nums:
+                                for char in lit_part:
+                                    if char in superscript_reverse_map:
+                                        lit_nums += superscript_reverse_map[char]
+                                    elif char.isdigit():
+                                        lit_nums += char
+
+                                if lit_nums:
+                                    # 解析每个文献编号
+                                    lit_list = list(lit_nums)
+                                    # 获取对应的文献名称
+                                    lit_names = []
+                                    source_list = [s.strip() for s in re.split(r'[;,；，]+', str(sources)) if s.strip()]
+                                    for lit_num in lit_list:
+                                        if lit_num.isdigit():
+                                            idx_num = int(lit_num) - 1  # 转换为0-based索引
+                                            if 0 <= idx_num < len(source_list):
+                                                lit_names.append(f"[{lit_num}]{source_list[idx_num]}")
+                                            else:
+                                                lit_names.append(f"[{lit_num}]文献{idx_num+1}")
+                                        else:
+                                            lit_names.append(f"[{lit_num}]")
+                                    lit_names_str = '; '.join(lit_names)
+
                                     frag_data.append({
                                         '化合物': compound_name,
-                                        '碎片m/z': mz,
+                                        '碎片m/z': mz_part.strip(),
                                         '文献编号': lit_nums,
-                                        '文献来源': sources
+                                        '涉及文献': lit_names_str,
+                                        '文献总数': source_count
                                     })
+                            except (ValueError, IndexError):
+                                continue
 
             if frag_data:
                 frag_df = pd.DataFrame(frag_data)
                 st.dataframe(frag_df, use_container_width=True)
+                st.caption("📖 说明：每个碎片后面的编号表示被哪些文献报道（如 [1]表示第1篇文献），涉及文献列显示完整的文献名称")
             else:
                 st.info("暂无碎片-文献详细映射数据")
 
