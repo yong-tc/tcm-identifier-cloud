@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署高性能版 v5.15（完整优化）
+中药化合物智能鉴定平台 - 云端部署高性能版 v5.15（修复列缺失错误）
 ============================================================
-新增功能（v5.15）：
-- 高性能跨行合并：同一化合物的碎片和文献自动合并，匹配覆盖度提升
-- 可配置合并开关：用户可选择是否启用合并
-- 向量化聚合操作：大幅提高数据库处理速度，避免卡死
-- 保留 v5.14 所有功能（碎片-文献映射、评分系统、六级评级等）
+修复：合并时动态检测列是否存在，避免 KeyError
 """
 
 import streamlit as st
@@ -64,13 +60,13 @@ def normalize_formula(formula):
 
 
 # ============================================================================
-# 鉴定程序核心代码 v5.15（高性能合并版）
+# 鉴定程序核心代码 v5.15（修复列缺失错误）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
     中药化合物鉴定终极版程序 v5.15
-    新增：高性能跨行合并同一化合物碎片和文献
+    新增：高性能跨行合并同一化合物碎片和文献，动态检测列存在性
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -118,7 +114,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v5.15（高性能合并版）")
+        print("中药化合物鉴定程序 v5.15（修复版）")
         print("="*80)
         print("\n【1/8】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -173,11 +169,11 @@ class UltimateGardeniaIdentifier:
         self._print_initialization_info()
         print("【7/8】初始化完成，准备鉴定")
 
-    # ----------------------------- 高性能合并方法 ----------------------------------
+    # ----------------------------- 高性能合并方法（修复列缺失） ----------------------------------
     def _merge_compound_records(self, df):
         """
         高性能合并同一化合物的多行记录（碎片并集、文献并集）
-        使用向量化 groupby + 聚合，大幅提升速度
+        动态检测列是否存在，避免 KeyError
         """
         if df.empty:
             return df
@@ -187,24 +183,25 @@ class UltimateGardeniaIdentifier:
         df['_merge_key'] = None
 
         # CAS 键
-        cas_series = df['CAS'].fillna('')
-        mask_cas = cas_series.apply(lambda x: bool(str(x).strip()) and str(x) != 'nan')
-        df.loc[mask_cas, '_merge_key'] = 'CAS_' + cas_series[mask_cas].astype(str)
+        if 'CAS' in df.columns:
+            cas_series = df['CAS'].fillna('')
+            mask_cas = cas_series.apply(lambda x: bool(str(x).strip()) and str(x) != 'nan')
+            df.loc[mask_cas, '_merge_key'] = 'CAS_' + cas_series[mask_cas].astype(str)
 
         # 无 CAS 的用名称+分子式
         no_cas_mask = df['_merge_key'].isna()
         if no_cas_mask.any():
-            name_cn = df.loc[no_cas_mask, '名称（中文）'].fillna('').astype(str)
-            name_en = df.loc[no_cas_mask, '名称（英文）'].fillna('').astype(str)
+            name_cn = df.loc[no_cas_mask, '名称（中文）'].fillna('').astype(str) if '名称（中文）' in df.columns else pd.Series(['']*len(no_cas_mask))
+            name_en = df.loc[no_cas_mask, '名称（英文）'].fillna('').astype(str) if '名称（英文）' in df.columns else pd.Series(['']*len(no_cas_mask))
             formula = df.loc[no_cas_mask, '分子式'].apply(
                 lambda x: normalize_formula(x) if pd.notna(x) and str(x).strip() else 'unknown'
-            )
+            ) if '分子式' in df.columns else pd.Series(['unknown']*len(no_cas_mask))
             df.loc[no_cas_mask, '_merge_key'] = 'NAME_' + name_cn + '_' + name_en + '_' + formula
 
-        # 分组聚合
+        # 分组
         grouped = df.groupby('_merge_key', as_index=False)
 
-        # ----- 聚合函数定义 -----
+        # ----- 定义辅助函数 -----
         def agg_herbs(series):
             herbs = set()
             for v in series:
@@ -218,13 +215,11 @@ class UltimateGardeniaIdentifier:
                 if pd.notna(v) and str(v).strip():
                     parts = re.split(r'[;,；，]+', str(v))
                     sources.extend([p.strip() for p in parts if p.strip()])
-            # 去重并保持顺序
             unique = []
             [unique.append(x) for x in sources if x not in unique]
             return '; '.join(unique)
 
         def merge_fragments(frag_series, source_series):
-            """合并碎片离子，支持文献索引重新映射"""
             # 收集所有碎片字符串及其对应的文献来源
             all_frag_strs = []
             all_sources = []
@@ -265,7 +260,6 @@ class UltimateGardeniaIdentifier:
                 items.append(f"{mz:.3f}:{idx_str}")
             return '; '.join(items)
 
-        # 中性丢失合并（去重）
         def merge_losses(series):
             losses = set()
             for v in series:
@@ -278,42 +272,91 @@ class UltimateGardeniaIdentifier:
                             pass
             return ','.join(str(l) for l in sorted(losses)) if losses else ''
 
-        # 构建聚合字典
-        agg_dict = {
-            '药材名称': agg_herbs,
-            '文献来源': agg_sources,
-            '中性丢失': merge_losses,
-            '保留时间(min)': 'first',
-            '准分子离子（正）': 'first',
-            '准分子离子（负）': 'first',
-            '名称（中文）': 'first',
-            '名称（英文）': 'first',
-            '分子式': 'first',
-            '化合物类型': 'first',
-            '加合物（正）': 'first',
-            '加合物（负）': 'first',
-            'CAS': 'first',
-        }
-        # 注意：碎片离子需要传入对应的文献来源列，因此单独处理
-        # 先执行其他列的聚合
+        # 构建聚合字典（仅包含存在的列）
+        agg_dict = {}
+        if '药材名称' in df.columns:
+            agg_dict['药材名称'] = agg_herbs
+        if '文献来源' in df.columns:
+            agg_dict['文献来源'] = agg_sources
+        if '中性丢失' in df.columns:
+            agg_dict['中性丢失'] = merge_losses
+        if '保留时间(min)' in df.columns:
+            agg_dict['保留时间(min)'] = 'first'
+        if '准分子离子（正）' in df.columns:
+            agg_dict['准分子离子（正）'] = 'first'
+        if '准分子离子（负）' in df.columns:
+            agg_dict['准分子离子（负）'] = 'first'
+        if '名称（中文）' in df.columns:
+            agg_dict['名称（中文）'] = 'first'
+        if '名称（英文）' in df.columns:
+            agg_dict['名称（英文）'] = 'first'
+        if '分子式' in df.columns:
+            agg_dict['分子式'] = 'first'
+        if '化合物类型' in df.columns:
+            agg_dict['化合物类型'] = 'first'
+        if '加合物（正）' in df.columns:
+            agg_dict['加合物（正）'] = 'first'
+        if '加合物（负）' in df.columns:
+            agg_dict['加合物（负）'] = 'first'
+        if 'CAS' in df.columns:
+            agg_dict['CAS'] = 'first'
+
+        # 执行聚合
         result = grouped.agg(agg_dict).reset_index(drop=True)
 
         # 单独处理碎片离子（需要文献来源信息）
         pos_fragments = []
         neg_fragments = []
-        for key, group in grouped:
-            source_series = group['文献来源']
-            # 正离子碎片
-            pos_series = group.get('碎片离子（正）', pd.Series([None]*len(group)))
-            pos_merged = merge_fragments(pos_series, source_series)
-            pos_fragments.append(pos_merged)
-            # 负离子碎片
-            neg_series = group.get('碎片离子（负）', pd.Series([None]*len(group)))
-            neg_merged = merge_fragments(neg_series, source_series)
-            neg_fragments.append(neg_merged)
+        has_pos = '碎片离子（正）' in df.columns
+        has_neg = '碎片离子（负）' in df.columns
+        has_source = '文献来源' in df.columns
 
-        result['碎片离子（正）'] = pos_fragments
-        result['碎片离子（负）'] = neg_fragments
+        if (has_pos or has_neg) and has_source:
+            for key, group in grouped:
+                source_series = group['文献来源']
+                if has_pos:
+                    pos_series = group.get('碎片离子（正）', pd.Series([None]*len(group)))
+                    pos_merged = merge_fragments(pos_series, source_series)
+                else:
+                    pos_merged = ''
+                if has_neg:
+                    neg_series = group.get('碎片离子（负）', pd.Series([None]*len(group)))
+                    neg_merged = merge_fragments(neg_series, source_series)
+                else:
+                    neg_merged = ''
+                pos_fragments.append(pos_merged)
+                neg_fragments.append(neg_merged)
+        else:
+            # 如果没有文献来源，则简单合并碎片字符串（去重）
+            if has_pos:
+                for key, group in grouped:
+                    frags = group['碎片离子（正）'].dropna().astype(str).tolist()
+                    all_frags = []
+                    for f in frags:
+                        for part in re.split(r'[、;，,\s]+', f):
+                            part = part.strip()
+                            if part and part not in all_frags:
+                                all_frags.append(part)
+                    pos_fragments.append('; '.join(all_frags))
+            else:
+                pos_fragments = [''] * len(grouped)
+            if has_neg:
+                for key, group in grouped:
+                    frags = group['碎片离子（负）'].dropna().astype(str).tolist()
+                    all_frags = []
+                    for f in frags:
+                        for part in re.split(r'[、;，,\s]+', f):
+                            part = part.strip()
+                            if part and part not in all_frags:
+                                all_frags.append(part)
+                    neg_fragments.append('; '.join(all_frags))
+            else:
+                neg_fragments = [''] * len(grouped)
+
+        if has_pos:
+            result['碎片离子（正）'] = pos_fragments
+        if has_neg:
+            result['碎片离子（负）'] = neg_fragments
 
         # 删除辅助键列
         if '_merge_key' in result.columns:
@@ -808,7 +851,7 @@ class UltimateGardeniaIdentifier:
             elif rt_deviation < 0.5:
                 rt_adj = 2
 
-        lit_adj = min(lit_match_count * 3, 12)   # 每匹配一篇文献 +3 分，上限 12
+        lit_adj = min(lit_match_count * 3, 12)
 
         total = base + ppm_adj + frag_adj + diag_score + loss_adj + rt_adj + lit_adj
         total = max(0, total)
@@ -1304,7 +1347,7 @@ class UltimateGardeniaIdentifier:
 
     def _print_initialization_info(self):
         print("\n" + "="*80)
-        print("程序初始化完成（高性能合并版）")
+        print("程序初始化完成（修复版）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -1485,7 +1528,7 @@ def create_header():
     st.markdown(f"""
     <div class="main-header">
         <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v5.15 高性能合并版 | 欢迎回来，{username}</p>
+        <p>v5.15 修复版 | 欢迎回来，{username}</p>
     </div>
     """, unsafe_allow_html=True)
 
