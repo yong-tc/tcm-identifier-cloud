@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署高性能版 v5.15（修复列缺失错误）
+中药化合物智能鉴定平台 - 云端部署高性能版 v5.15（适配丁香数据库）
 ============================================================
-修复：合并时动态检测列是否存在，避免 KeyError
+修复：增强列名映射，支持中文括号、缺失列容错，增加调试输出
 """
 
 import streamlit as st
@@ -60,13 +60,13 @@ def normalize_formula(formula):
 
 
 # ============================================================================
-# 鉴定程序核心代码 v5.15（修复列缺失错误）
+# 鉴定程序核心代码 v5.15（适配丁香数据库）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
     中药化合物鉴定终极版程序 v5.15
-    新增：高性能跨行合并同一化合物碎片和文献，动态检测列存在性
+    增强列名映射和错误处理
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -114,7 +114,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v5.15（修复版）")
+        print("中药化合物鉴定程序 v5.15（适配版）")
         print("="*80)
         print("\n【1/8】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -213,7 +213,8 @@ class UltimateGardeniaIdentifier:
             sources = []
             for v in series:
                 if pd.notna(v) and str(v).strip():
-                    parts = re.split(r'[;,；，]+', str(v))
+                    # 支持分号、逗号、中文顿号分隔
+                    parts = re.split(r'[;,；，、\s]+', str(v))
                     sources.extend([p.strip() for p in parts if p.strip()])
             unique = []
             [unique.append(x) for x in sources if x not in unique]
@@ -230,7 +231,7 @@ class UltimateGardeniaIdentifier:
             # 构建全局文献列表（去重）
             global_sources = []
             for src in all_sources:
-                parts = re.split(r'[;,；，]+', src)
+                parts = re.split(r'[;,；，、\s]+', src)
                 for p in parts:
                     p = p.strip()
                     if p and p not in global_sources:
@@ -238,7 +239,7 @@ class UltimateGardeniaIdentifier:
             # 合并碎片
             frag_dict = {}
             for frag_str, src_str in zip(all_frag_strs, all_sources):
-                row_sources = [s.strip() for s in re.split(r'[;,；，]+', src_str) if s.strip()] if src_str else []
+                row_sources = [s.strip() for s in re.split(r'[;,；，、\s]+', src_str) if s.strip()] if src_str else []
                 parsed = self._parse_fragments_with_literature(frag_str, row_sources)
                 for mz, lit_set in parsed:
                     if mz not in frag_dict:
@@ -366,16 +367,36 @@ class UltimateGardeniaIdentifier:
 
     # ----------------------------- 辅助方法 ----------------------------------
     def _normalize_columns(self, df):
-        """标准化列名"""
+        """标准化列名，支持多种变体"""
         column_mapping = {
             '药材名': '药材名称',
             '文献': '文献来源',
             '保留时间(min)': '保留时间',
-            '中丢失': '中性丢失'
+            '中丢失': '中性丢失',
+            '准分子离子（正）': '准分子离子（正）',  # 确保括号统一
+            '准分子离子（负）': '准分子离子（负）',
+            '碎片离子（正）': '碎片离子（正）',
+            '碎片离子（负）': '碎片离子（负）',
+            '加合物（正）': '加合物（正）',
+            '加合物（负）': '加合物（负）',
+            '名称（中文）': '名称（中文）',
+            '名称（英文）': '名称（英文）',
+            '分子式': '分子式',
+            '化合物类型': '化合物类型',
+            'CAS': 'CAS'
         }
         for old_name, new_name in column_mapping.items():
             if old_name in df.columns and new_name not in df.columns:
                 df.rename(columns={old_name: new_name}, inplace=True)
+        # 处理可能的全角括号
+        if '准分子离子（正）' not in df.columns and '准分子离子(正)' in df.columns:
+            df.rename(columns={'准分子离子(正)': '准分子离子（正）'}, inplace=True)
+        if '准分子离子（负）' not in df.columns and '准分子离子(负)' in df.columns:
+            df.rename(columns={'准分子离子(负)': '准分子离子（负）'}, inplace=True)
+        if '碎片离子（正）' not in df.columns and '碎片离子(正)' in df.columns:
+            df.rename(columns={'碎片离子(正)': '碎片离子（正）'}, inplace=True)
+        if '碎片离子（负）' not in df.columns and '碎片离子(负)' in df.columns:
+            df.rename(columns={'碎片离子(负)': '碎片离子（负）'}, inplace=True)
         return df
 
     def _load_data(self, filepath):
@@ -469,11 +490,13 @@ class UltimateGardeniaIdentifier:
         """
         解析碎片离子字符串，支持文献索引后缀。
         格式示例: "151.003:0,1; 137.024:1,2"
+        支持中文顿号分隔
         返回: list of (mz, set(lit_indices))
         """
         if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
             return []
         s = str(fragment_string)
+        # 支持中文顿号、分号、逗号、空格
         parts = re.split(r'[、;，,\s]+', s)
         result = []
         for part in parts:
@@ -527,9 +550,9 @@ class UltimateGardeniaIdentifier:
             herb = str(row.get('药材名称') or row.get('药材名') or '')
             compound_type = str(row.get('化合物类型', ''))
             source_str = str(row.get('文献来源') or row.get('文献') or '')
-            # 解析文献列表
+            # 解析文献列表，支持多种分隔符
             if pd.notna(source_str) and source_str:
-                sources = [s.strip() for s in re.split(r'[;,；，]+', source_str) if s.strip()]
+                sources = [s.strip() for s in re.split(r'[;,；，、\s]+', source_str) if s.strip()]
             else:
                 sources = []
             cas = str(row.get('CAS', ''))
@@ -865,27 +888,43 @@ class UltimateGardeniaIdentifier:
         return round(total, 2)
 
     def extract_precursor_ions(self, ms_data, ionization_mode):
+        """
+        从质谱数据中提取母离子和碎片离子。
+        支持多种列名变体，并打印调试信息。
+        """
         if ms_data.empty:
             return []
 
+        # 查找母离子列（支持中英文）
         precursor_col = None
-        possible_names = ['Precursor M/z', 'Precursor_mz', 'Precursor', 'precursor m/z', 'precursor_mz']
+        possible_names = [
+            'Precursor M/z', 'Precursor_mz', 'Precursor', 'precursor m/z', 'precursor_mz',
+            '母离子m/z', '母离子', '准分子离子', '母离子质荷比'
+        ]
         for col in ms_data.columns:
             if col in possible_names:
                 precursor_col = col
                 break
         if precursor_col is None:
+            # 模糊匹配
             for col in ms_data.columns:
-                if 'precursor' in col.lower() and 'm/z' in col.lower():
+                if 'precursor' in col.lower() and ('m/z' in col.lower() or '质荷比' in col):
+                    precursor_col = col
+                    break
+                if '母离子' in col:
                     precursor_col = col
                     break
         if precursor_col is None:
-            st.error("未找到母离子列（Precursor M/z），请检查文件格式或使用自定义列名功能。")
+            st.error("未找到母离子列。请确保数据包含 'Precursor M/z' 或 '母离子m/z' 等列。")
+            st.write("检测到的列名：", list(ms_data.columns))
             return []
 
+        # 查找碎片离子列
         mz_columns = []
         for col in ms_data.columns:
             if ('Peak_' in col and '_m/z' in col) or ('m/z' in col.lower() and col != precursor_col):
+                mz_columns.append(col)
+            elif '碎片' in col and 'm/z' in col:
                 mz_columns.append(col)
         if not mz_columns:
             st.warning("未找到碎片离子列，将只进行一级匹配。")
@@ -900,13 +939,22 @@ class UltimateGardeniaIdentifier:
                 fragments = []
                 fragments_dict = {}
                 base_peak = 0
+                # 先找基峰
                 for col in mz_columns:
                     intensity = 0
-                    intensity_col = col.replace('_m/z', '_Intensity') if '_m/z' in col else None
+                    intensity_col = None
+                    if '_m/z' in col:
+                        intensity_col = col.replace('_m/z', '_Intensity')
+                    elif 'm/z' in col:
+                        intensity_col = col.replace('m/z', 'Intensity')
                     if intensity_col and intensity_col in row.index:
                         intensity = float(row[intensity_col]) if pd.notna(row[intensity_col]) else 0
                     else:
-                        intensity = 1
+                        # 尝试其他常见强度列名
+                        for icol in row.index:
+                            if 'intensity' in icol.lower() and col.replace('m/z', '') in icol:
+                                intensity = float(row[icol]) if pd.notna(row[icol]) else 0
+                                break
                     if intensity > base_peak:
                         base_peak = intensity
 
@@ -914,12 +962,18 @@ class UltimateGardeniaIdentifier:
                     fragment_mz = row[col]
                     if pd.notna(fragment_mz) and float(fragment_mz) > 0:
                         intensity = 0
-                        intensity_col = col.replace('_m/z', '_Intensity') if '_m/z' in col else None
+                        intensity_col = None
+                        if '_m/z' in col:
+                            intensity_col = col.replace('_m/z', '_Intensity')
+                        elif 'm/z' in col:
+                            intensity_col = col.replace('m/z', 'Intensity')
                         if intensity_col and intensity_col in row.index:
                             intensity = float(row[intensity_col]) if pd.notna(row[intensity_col]) else 0
                         else:
-                            intensity = 1
-
+                            for icol in row.index:
+                                if 'intensity' in icol.lower() and col.replace('m/z', '') in icol:
+                                    intensity = float(row[icol]) if pd.notna(row[icol]) else 0
+                                    break
                         if intensity >= min_intensity_abs:
                             if base_peak > 0:
                                 rel_intensity = intensity / base_peak
@@ -935,7 +989,12 @@ class UltimateGardeniaIdentifier:
                 rt = row.get('出峰时间t/min', np.nan)
                 if pd.isna(rt):
                     rt = row.get('出峰时间', np.nan)
+                if pd.isna(rt):
+                    rt = row.get('Retention Time', np.nan)
+                if pd.isna(rt):
+                    rt = row.get('RT', np.nan)
 
+                # 如果没有保留时间，使用CID估算（如果需要）
                 if pd.isna(rt) and 'CID' in row.index:
                     cid = row['CID']
                     gt = self.config['gradient_time']
@@ -960,6 +1019,8 @@ class UltimateGardeniaIdentifier:
                     'base_peak': base_peak
                 })
 
+        if len(precursors) == 0:
+            st.warning(f"未提取到任何母离子（{ionization_mode}模式）。请检查数据格式和阈值设置。")
         return precursors
 
     def identify_compound(self, precursor, return_top=1, score_threshold=0):
@@ -1102,7 +1163,7 @@ class UltimateGardeniaIdentifier:
 
             source_str = best_candidate.get('source', '')
             if pd.notna(source_str) and source_str:
-                source_list = [s.strip() for s in re.split(r'[;,；，]+', str(source_str)) if s.strip()]
+                source_list = [s.strip() for s in re.split(r'[;,；，、\s]+', str(source_str)) if s.strip()]
                 source_count = len(source_list)
                 source_display = '; '.join(source_list)
             else:
@@ -1347,7 +1408,7 @@ class UltimateGardeniaIdentifier:
 
     def _print_initialization_info(self):
         print("\n" + "="*80)
-        print("程序初始化完成（修复版）")
+        print("程序初始化完成（适配版）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -1458,7 +1519,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# Streamlit 网页应用部分
+# Streamlit 网页应用部分（与之前相同，略作调整）
 # ============================================================================
 
 st.set_page_config(
@@ -1528,7 +1589,7 @@ def create_header():
     st.markdown(f"""
     <div class="main-header">
         <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v5.15 修复版 | 欢迎回来，{username}</p>
+        <p>v5.15 适配版 | 欢迎回来，{username}</p>
     </div>
     """, unsafe_allow_html=True)
 
