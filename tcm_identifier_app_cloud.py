@@ -1828,20 +1828,20 @@ def show_guide_page():
 
 
 def show_database_page():
-create_header()
-st.markdown("## 🗃️ 数据库预览")
-db_path = find_database_path()
-if not db_path:
+    create_header()
+    st.markdown("## 🗃️ 数据库预览")
+    db_path = find_database_path()
+    if not db_path:
     st.warning("未找到数据库文件")
     return
-df = load_database_cached()
-st.dataframe(df.head(10))
-st.info(f"共 {len(df)} 条记录")
+   df = load_database_cached()
+   st.dataframe(df.head(10))
+   st.info(f"共 {len(df)} 条记录")
 
 
 def show_results_page():
-create_header()
-if 'analysis_results' not in st.session_state:
+    create_header()
+    if 'analysis_results' not in st.session_state:
     st.warning("暂无鉴定结果，请先进行鉴定")
     if st.button("前往鉴定"):
         st.session_state['page'] = '开始鉴定'
