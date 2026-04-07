@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署高性能版 v5.15（适配丁香数据库）
+中药化合物智能鉴定平台 - 云端部署高性能版 v5.15（增强诊断）
 ============================================================
-修复：增强列名映射，支持中文括号、缺失列容错，增加调试输出
+增强：自动降级合并异常，详细错误打印，兼容更多列名变体
 """
 
 import streamlit as st
@@ -16,6 +16,7 @@ from datetime import datetime
 from io import BytesIO
 import tempfile
 from bisect import bisect_left, bisect_right
+import traceback
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -60,13 +61,13 @@ def normalize_formula(formula):
 
 
 # ============================================================================
-# 鉴定程序核心代码 v5.15（适配丁香数据库）
+# 鉴定程序核心代码 v5.15（增强诊断）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
     中药化合物鉴定终极版程序 v5.15
-    增强列名映射和错误处理
+    增强错误诊断和降级处理
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -114,7 +115,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v5.15（适配版）")
+        print("中药化合物鉴定程序 v5.15（增强诊断版）")
         print("="*80)
         print("\n【1/8】正在加载数据库...")
         self.full_database = self._load_data(database_path)
@@ -132,13 +133,19 @@ class UltimateGardeniaIdentifier:
             print("【2/8】使用全部数据库进行化合物鉴定")
         print(f"  原始数据库记录数: {len(self.database)}")
 
-        # 高性能合并同一化合物的多行记录
+        # 高性能合并同一化合物的多行记录（带降级）
         if self.merge_compounds:
-            print("【2.5/8】正在合并同一化合物的多行记录（碎片并集、文献并集）...")
-            self.database = self._merge_compound_records(self.database)
-            print(f"  合并后化合物数: {len(self.database)}")
+            print("【2.5/8】正在合并同一化合物的多行记录...")
+            try:
+                self.database = self._merge_compound_records(self.database)
+                print(f"  合并后化合物数: {len(self.database)}")
+            except Exception as e:
+                print(f"  合并失败: {e}")
+                print(traceback.format_exc())
+                st.warning(f"合并化合物时出错，已跳过合并继续鉴定。错误：{str(e)}")
+                self.merge_compounds = False  # 降级，不再尝试合并
         else:
-            print("【2.5/8】跳过合并步骤（用户已禁用）")
+            print("【2.5/8】跳过合并步骤（用户已禁用或合并失败）")
 
         print("【3/8】正在加载质谱数据...")
         self.ms_positive = self._load_data(ms_positive_path) if ms_positive_path else pd.DataFrame()
@@ -169,7 +176,7 @@ class UltimateGardeniaIdentifier:
         self._print_initialization_info()
         print("【7/8】初始化完成，准备鉴定")
 
-    # ----------------------------- 高性能合并方法（修复列缺失） ----------------------------------
+    # ----------------------------- 高性能合并方法（增强鲁棒性） ----------------------------------
     def _merge_compound_records(self, df):
         """
         高性能合并同一化合物的多行记录（碎片并集、文献并集）
@@ -213,7 +220,6 @@ class UltimateGardeniaIdentifier:
             sources = []
             for v in series:
                 if pd.notna(v) and str(v).strip():
-                    # 支持分号、逗号、中文顿号分隔
                     parts = re.split(r'[;,；，、\s]+', str(v))
                     sources.extend([p.strip() for p in parts if p.strip()])
             unique = []
@@ -367,36 +373,49 @@ class UltimateGardeniaIdentifier:
 
     # ----------------------------- 辅助方法 ----------------------------------
     def _normalize_columns(self, df):
-        """标准化列名，支持多种变体"""
+        """标准化列名，支持多种变体（全角/半角括号、空格等）"""
+        # 定义需要标准化的映射
         column_mapping = {
             '药材名': '药材名称',
             '文献': '文献来源',
             '保留时间(min)': '保留时间',
             '中丢失': '中性丢失',
-            '准分子离子（正）': '准分子离子（正）',  # 确保括号统一
-            '准分子离子（负）': '准分子离子（负）',
-            '碎片离子（正）': '碎片离子（正）',
-            '碎片离子（负）': '碎片离子（负）',
-            '加合物（正）': '加合物（正）',
-            '加合物（负）': '加合物（负）',
-            '名称（中文）': '名称（中文）',
-            '名称（英文）': '名称（英文）',
-            '分子式': '分子式',
-            '化合物类型': '化合物类型',
-            'CAS': 'CAS'
         }
+        # 先处理精确匹配
         for old_name, new_name in column_mapping.items():
             if old_name in df.columns and new_name not in df.columns:
                 df.rename(columns={old_name: new_name}, inplace=True)
-        # 处理可能的全角括号
-        if '准分子离子（正）' not in df.columns and '准分子离子(正)' in df.columns:
-            df.rename(columns={'准分子离子(正)': '准分子离子（正）'}, inplace=True)
-        if '准分子离子（负）' not in df.columns and '准分子离子(负)' in df.columns:
-            df.rename(columns={'准分子离子(负)': '准分子离子（负）'}, inplace=True)
-        if '碎片离子（正）' not in df.columns and '碎片离子(正)' in df.columns:
-            df.rename(columns={'碎片离子(正)': '碎片离子（正）'}, inplace=True)
-        if '碎片离子（负）' not in df.columns and '碎片离子(负)' in df.columns:
-            df.rename(columns={'碎片离子(负)': '碎片离子（负）'}, inplace=True)
+
+        # 处理可能的半角括号变体
+        bracket_variants = {
+            '准分子离子(正)': '准分子离子（正）',
+            '准分子离子(负)': '准分子离子（负）',
+            '碎片离子(正)': '碎片离子（正）',
+            '碎片离子(负)': '碎片离子（负）',
+            '加合物(正)': '加合物（正）',
+            '加合物(负)': '加合物（负）',
+            '名称(中文)': '名称（中文）',
+            '名称(英文)': '名称（英文）',
+        }
+        for old_var, new_name in bracket_variants.items():
+            if old_var in df.columns and new_name not in df.columns:
+                df.rename(columns={old_var: new_name}, inplace=True)
+
+        # 如果仍然没有标准列名，尝试模糊匹配（不区分全半角）
+        target_cols = ['准分子离子（正）', '准分子离子（负）', '碎片离子（正）', '碎片离子（负）',
+                       '加合物（正）', '加合物（负）', '名称（中文）', '名称（英文）', '分子式', '化合物类型', 'CAS']
+        for target in target_cols:
+            if target not in df.columns:
+                # 尝试找包含关键字的列（去除括号差异）
+                pattern = re.sub(r'[（(]', '[（(]', target)
+                pattern = re.sub(r'[）)]', '[）)]', pattern)
+                for col in df.columns:
+                    if re.search(pattern, col):
+                        df.rename(columns={col: target}, inplace=True)
+                        break
+
+        # 打印列名对比（调试用）
+        print("  标准化后的列名：", list(df.columns))
         return df
 
     def _load_data(self, filepath):
@@ -1408,7 +1427,7 @@ class UltimateGardeniaIdentifier:
 
     def _print_initialization_info(self):
         print("\n" + "="*80)
-        print("程序初始化完成（适配版）")
+        print("程序初始化完成（增强诊断版）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -1589,7 +1608,7 @@ def create_header():
     st.markdown(f"""
     <div class="main-header">
         <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v5.15 适配版 | 欢迎回来，{username}</p>
+        <p>v5.15 增强诊断版 | 欢迎回来，{username}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1793,7 +1812,7 @@ def show_analysis_page():
                         st.rerun()
             except Exception as e:
                 st.error(f"鉴定出错: {str(e)}")
-                st.exception(e)
+                st.code(traceback.format_exc())
             finally:
                 for f in temp_files:
                     try: os.remove(f)
