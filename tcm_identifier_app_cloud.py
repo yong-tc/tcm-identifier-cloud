@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.16（漏洞修复版）
+中药化合物智能鉴定平台 - 云端部署增强版 v5.16（完整修复版）
 ======================================================================
-在 v5.15 基础上修复：
-1. 候选排序使用综合得分
-2. 碎片匹配引入覆盖率惩罚
+基于 v5.15 修复以下漏洞：
+1. 候选排序使用综合得分（而非仅碎片数）
+2. 碎片匹配引入覆盖率惩罚（匹配数/总实验碎片数）
 3. 碎片匹配选择最佳匹配（最小误差）
 4. 诊断离子分类优先使用化合物类型字段
-5. 无索引碎片不再自动关联全部文献
-6. 实现真正的并行处理
+5. 无索引碎片不再自动关联全部文献（避免虚高）
+6. 实现真正的并行处理（ThreadPoolExecutor）
 """
 
 import streamlit as st
@@ -72,7 +72,7 @@ def normalize_formula(formula):
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.16（修复版）
+    中药化合物鉴定终极版程序 v5.16（完整修复版）
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -118,7 +118,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v5.16（漏洞修复版）")
+        print("中药化合物鉴定程序 v5.16（完整修复版）")
         print("="*80)
 
         print("\n【1/8】正在加载数据库...")
@@ -214,8 +214,7 @@ class UltimateGardeniaIdentifier:
     def _merge_compound_records(self, df):
         """
         合并同一化合物的多行记录（按CAS或名称+分子式分组）。
-        将碎片离子和文献来源合并，重新索引文献，生成新行（每个准分子离子m/z一行）。
-        修复：无索引碎片不再自动关联所有文献。
+        修复：无索引碎片不再自动关联全部文献。
         """
         if df.empty:
             return df
@@ -282,7 +281,7 @@ class UltimateGardeniaIdentifier:
             merged_neutral_loss = ','.join(str(l) for l in sorted(neutral_losses_set)) if neutral_losses_set else ''
 
             # ----- 处理正离子数据 -----
-            pos_mz_frag_map = {}  # mz -> list of (fragment_str, original_sources_list)
+            pos_mz_frag_map = {}
             for _, row in group.iterrows():
                 mz_pos = row.get('准分子离子（正）')
                 if pd.notna(mz_pos) and str(mz_pos).strip():
@@ -326,15 +325,13 @@ class UltimateGardeniaIdentifier:
                                             new_indices.add(source_to_idx[src_name])
                                 if new_indices:
                                     frag_dict[frag_mz] = frag_dict.get(frag_mz, set()) | new_indices
-                                # 修复：无有效索引时，不添加任何文献（不再默认关联全部）
                             except ValueError:
                                 continue
                         else:
-                            # 修复：无索引的碎片不再自动关联所有文献，直接跳过（视为无文献支持）
+                            # 修复：无索引的碎片不再自动关联所有文献
                             try:
                                 frag_mz = float(part)
                                 # 不添加任何文献索引
-                                # frag_dict[frag_mz] = frag_dict.get(frag_mz, set())  # 空集
                             except ValueError:
                                 continue
 
@@ -417,7 +414,6 @@ class UltimateGardeniaIdentifier:
                             # 无索引，不关联文献
                             try:
                                 frag_mz = float(part)
-                                # 不添加任何文献索引
                             except ValueError:
                                 continue
 
@@ -545,14 +541,12 @@ class UltimateGardeniaIdentifier:
                     if lit_indices:
                         result.append((mz, lit_indices))
                     else:
-                        # 无效索引，视为无文献
                         result.append((mz, set()))
                 except ValueError:
                     continue
             else:
                 try:
                     mz = float(part)
-                    # 修复：无索引时返回空集合，不关联所有文献
                     result.append((mz, set()))
                 except ValueError:
                     continue
@@ -748,14 +742,12 @@ class UltimateGardeniaIdentifier:
     def _classify_compound(self, name, compound_type):
         """
         修复：优先使用数据库中的化合物类型字段与诊断离子库的类别精确匹配。
-        仅当匹配失败时才回退到关键词硬编码。
         """
         compound_type_str = str(compound_type).strip()
         # 首先尝试直接匹配诊断离子库的类别
         for category in self.diagnostic_ions.keys():
             if category == compound_type_str:
                 return category
-            # 也支持包含关系（例如“黄酮类”包含“黄酮”）
             if compound_type_str and category in compound_type_str:
                 return category
         # 回退到关键词匹配
@@ -790,19 +782,17 @@ class UltimateGardeniaIdentifier:
     def _match_fragments_fast(self, observed, reference_frags, tolerance_value, tolerance_type='Da', precursor_mz=None):
         """
         修复：为每个参考碎片选择容差范围内误差最小的实验碎片作为最佳匹配。
-        返回：matched_mz_list (去重), matched_lit_set (所有匹配到的文献索引集合), matched_details (每个参考碎片的最佳匹配详情)
         """
         if len(reference_frags) == 0 or len(observed) == 0:
             return [], set(), []
         observed_sorted = np.sort(observed)
         matched_mz_set = set()
         matched_lit_set = set()
-        matched_details = []  # 每个参考碎片对应一个 (obs_mz, lit_set)
+        matched_details = []
 
         for ref_mz, lit_set in reference_frags:
             if pd.isna(ref_mz) or ref_mz <= 0:
                 continue
-            # 确定容差窗口
             if tolerance_type == 'Da':
                 tol = tolerance_value
             else:
@@ -813,7 +803,6 @@ class UltimateGardeniaIdentifier:
             best_error = float('inf')
             for i in range(left, right):
                 obs_val = observed_sorted[i]
-                # 排除母离子本身
                 if precursor_mz is not None and abs(obs_val - precursor_mz) <= (tol if tolerance_type=='Da' else precursor_mz*tolerance_value/1e6):
                     continue
                 error = abs(obs_val - ref_mz)
@@ -879,7 +868,7 @@ class UltimateGardeniaIdentifier:
                               diag_weights=None, neutral_loss_match_count=0, 
                               rt_deviation=None, lit_match_count=0, coverage=1.0):
         """
-        增加 coverage 参数（匹配碎片数/总实验碎片数）作为最终得分的乘数因子。
+        增加 coverage 参数作为得分乘数因子。
         """
         if rating == 1:
             base = 85
@@ -924,15 +913,13 @@ class UltimateGardeniaIdentifier:
         total = base + ppm_adj + frag_adj + diag_score + loss_adj + rt_adj + lit_adj
         total = max(0, total)
 
-        # 应用覆盖率惩罚 (coverage = matched_frag_count / total_experiment_fragments)
-        # 覆盖率低于 0.5 时显著降低得分
+        # 覆盖率惩罚
         if coverage < 0.3:
             total = total * 0.5
         elif coverage < 0.6:
             total = total * 0.75
         elif coverage < 0.8:
             total = total * 0.9
-        # 覆盖率 >= 0.8 不惩罚
 
         if rating == 1 and total < 80:
             total = 80
@@ -1103,10 +1090,8 @@ class UltimateGardeniaIdentifier:
             total_sources = len(info.get('sources', []))
             matched_lit_count = len(matched_lit_indices) if total_sources > 0 else 0
 
-            # 计算覆盖率 (匹配碎片数 / 总实验碎片数)
             coverage = len(matched_fragments) / total_exp_fragments if total_exp_fragments > 0 else 1.0
 
-            # 确定评级
             lvl_id, lvl_name, confidence, suggestion = self._determine_confidence_level(
                 ppm,
                 len(matched_fragments),
@@ -1114,17 +1099,10 @@ class UltimateGardeniaIdentifier:
                 len(precursor['fragments']) > 0
             )
 
-            # 计算综合得分（传入覆盖率）
             base_score = self._calculate_base_score(
-                lvl_id,
-                ppm,
-                len(matched_fragments),
-                len(diagnostic_ions),
-                diag_weights,
-                neutral_loss_matches,
-                rt_deviation,
-                matched_lit_count,
-                coverage
+                lvl_id, ppm, len(matched_fragments), len(diagnostic_ions),
+                diag_weights, neutral_loss_matches, rt_deviation,
+                matched_lit_count, coverage
             )
 
             candidate = {
@@ -1156,12 +1134,14 @@ class UltimateGardeniaIdentifier:
                 'lvl_id': lvl_id,
                 'lvl_name': lvl_name,
                 'confidence': confidence,
-                'suggestion': suggestion
+                'suggestion': suggestion,
+                # 保存原始母离子信息供报告使用
+                'precursor_rt': precursor['retention_time'],
+                'precursor_fragments_list': precursor['fragments'].tolist(),
+                'precursor_total_fragments': total_exp_fragments
             }
-
             scored_candidates.append(candidate)
 
-        # 修复：按综合得分（base_score）降序排序
         scored_candidates.sort(key=lambda x: x['base_score'], reverse=True)
 
         if return_top == 1:
@@ -1175,7 +1155,6 @@ class UltimateGardeniaIdentifier:
 
         pos_precursors = self.extract_precursor_ions(self.ms_positive, '正离子') if not self.ms_positive.empty else []
         neg_precursors = self.extract_precursor_ions(self.ms_negative, '负离子') if not self.ms_negative.empty else []
-
         all_precursors = pos_precursors + neg_precursors
         total = len(all_precursors)
 
@@ -1183,7 +1162,7 @@ class UltimateGardeniaIdentifier:
             print("警告: 没有提取到任何母离子，请检查质谱数据文件格式。")
             return pd.DataFrame()
 
-        # 并行处理
+        # 并行获取最佳候选
         if self.use_parallel and total > 10:
             print(f"使用并行处理，工作线程数: {self.num_workers}")
             results = [None] * total
@@ -1204,7 +1183,6 @@ class UltimateGardeniaIdentifier:
                     print(f"    处理进度: {i+1}/{total}")
                 best_candidates.append(self.identify_compound(precursor, return_top=1))
 
-        # 收集有效候选并更新统计
         valid_candidates = []
         for candidate in best_candidates:
             if candidate is None:
@@ -1217,37 +1195,224 @@ class UltimateGardeniaIdentifier:
         if not valid_candidates:
             return pd.DataFrame()
 
-        # 构建报告记录（与原来逻辑相同，但使用候选中的预计算字段）
+        # 构建报告记录
         best_records = {}
         herbs_collection = {}
 
-        for candidate in valid_candidates:
-            # 获取对应的 precursor（需要保留原始 precursor 信息，但 candidate 中没有存储，需从原列表取？）
-            # 为了保持原有逻辑，我们在循环中需要知道对应的 precursor 信息。
-            # 简单方法：在构建 candidate 时同时存储 precursor 的副本。但为了最小改动，我们重新提取一次？不高效。
-            # 更好的方式：在 identify_compound 返回的 candidate 中增加 'precursor' 字段。
-            # 修改 identify_compound，在 candidate 中增加 'precursor_info'。
-            # 由于上面我们已经修改了 identify_compound 返回字典，我们可以提前加入。
-            # 但为了保持代码清晰，我们在此处不再重复提取，而是直接从 candidate 中获取所需信息。
-            # candidate 中已有 observed_mz, retention_time 等？没有 retention_time，需要添加。
-            # 重新修改 identify_compound 加入 precursor_rt 和 precursor_fragments 等。
-            # 为了节省时间，我们采用另一种方式：在 generate_report 中重新循环时，同时保存 precursor 和 candidate。
-            # 这里简化：直接使用原有循环逻辑，但为了展示修复，我们保持原有生成报告的代码结构，只是从 candidate 中读取。
-            # 由于代码量已经很大，此处假设 candidate 中已包含必要字段（需修改 identify_compound 添加 retention_time 和 fragments）。
-            # 为完整修复，我们将在 identify_compound 中添加 'retention_time' 和 'fragments_list'。
-            pass
+        for cand in valid_candidates:
+            name_cn = cand['name_cn']
+            name_en = cand['name_en']
+            formula = cand['formula'] if cand['formula'] and cand['formula'] != 'nan' else '待确定'
+            en_name = cand['name_en'] if cand['name_en'] and cand['name_en'] != 'nan' else ''
+            source_str = cand.get('source', '')
+            if pd.notna(source_str) and source_str:
+                source_list = [s.strip() for s in re.split(r'[;,；，]+', str(source_str)) if s.strip()]
+                source_count = len(source_list)
+                source_display = '; '.join(source_list)
+            else:
+                source_count = 0
+                source_display = ''
 
-        # 注意：由于时间限制，上面的 generate_report 需要与原有逻辑完全兼容，但为了展示修复，我们提供一个简化版。
-        # 实际交付时应将 candidate 中增加 precursor 相关信息，并保持后续报告生成逻辑不变。
-        # 此处我们直接复用原有 generate_report 逻辑（未修改部分），但需要确保 candidate 结构包含所有字段。
-        # 为简洁，我们保持原有 generate_report 代码（除并行部分外）不变，但需要修改 identify_compound 返回的 candidate 包含必要信息。
-        # 这里我们只展示核心修复点，完整代码请见附件。
+            matched_frags = cand['matched_fragments']
+            diag_ions = cand['diagnostic_ions']
+            diag_weights = cand['diag_weights']
 
-        # 由于篇幅，此处省略完整的 generate_report 实现，但保证上述修复均已生效。
-        # 实际运行时，请确保 identify_compound 返回的 candidate 包含 'retention_time' 和 'fragments_list' 等字段。
+            matched_details = cand.get('matched_details', [])
+            frag_lit_map_str = ''
+            if matched_details:
+                unique_map = {}
+                for obs_mz, lit_set in matched_details:
+                    if obs_mz in unique_map:
+                        unique_map[obs_mz].update(lit_set)
+                    else:
+                        unique_map[obs_mz] = set(lit_set)
+                frag_lit_parts = []
+                for obs_mz in sorted(unique_map.keys()):
+                    lit_indices = sorted(unique_map[obs_mz])
+                    if lit_indices:
+                        frag_lit_parts.append(f"{obs_mz:.4f}[{','.join(map(str, lit_indices))}]")
+                    else:
+                        frag_lit_parts.append(f"{obs_mz:.4f}")
+                frag_lit_map_str = '; '.join(frag_lit_parts)
 
-        # 返回空 DataFrame 占位
-        return pd.DataFrame()
+            adduct = cand['adduct']
+            if pd.isna(adduct) or adduct == 'nan' or adduct == '':
+                adduct = ''
+            else:
+                for sep in [',', ';']:
+                    if sep in adduct:
+                        adduct = adduct.split(sep)[0].strip()
+                        break
+
+            cas = cand.get('cas', '')
+            if cas and cas != 'nan' and cas != '':
+                merge_key = cas
+            elif en_name and en_name != '':
+                merge_key = f"{en_name}_{formula}"
+            else:
+                merge_key = f"{name_cn}_{formula}"
+
+            record = {
+                '序号': 0,
+                '出峰时间t/min': cand['precursor_rt'],
+                '化合物中文名': name_cn,
+                '化合物英文名': en_name,
+                '分子式': formula,
+                'CAS号': cand['cas'],
+                '药材名称': cand['herb'],
+                '化合物类型': cand['compound_type'],
+                '离子化方式': cand['mode'],
+                '加和离子': adduct,
+                'm/z实际值': round(cand['observed_mz'], 4),
+                'm/z理论值': round(cand['theoretical_mz'], 4),
+                'ppm': round(cand['ppm'], 4),
+                '是否有碎片数据': '是' if cand['precursor_total_fragments'] > 0 else '否',
+                '主要碎片离子': '; '.join([f'{f:.4f}' for f in matched_frags]) if matched_frags else '',
+                '碎片-文献映射': frag_lit_map_str,
+                '匹配碎片数': len(matched_frags),
+                '匹配文献数': cand['matched_lit_count'],
+                '诊断性离子个数': len(diag_ions),
+                '诊断性离子': '; '.join([f'{f:.4f}' for f in diag_ions]) if diag_ions else '',
+                '文献来源数': source_count,
+                '文献来源': source_display,
+                '评级': cand['lvl_id'],
+                '评级名称': cand['lvl_name'],
+                '置信度': cand['confidence'],
+                '报告建议': cand['suggestion'],
+                '基础得分': cand['base_score'],
+                '综合得分': cand['base_score'],
+                '_merge_key': merge_key,
+                '_fragments_set': set(matched_frags)
+            }
+
+            if merge_key not in herbs_collection:
+                herbs_collection[merge_key] = set()
+            herbs_collection[merge_key].add(cand['herb'])
+
+            current_score = cand['base_score']
+            if merge_key not in best_records or current_score > best_records[merge_key][1]:
+                best_records[merge_key] = (record, current_score)
+
+        records_list = []
+        for merge_key, (record, score) in best_records.items():
+            herbs = herbs_collection[merge_key]
+            record['药材名称'] = '; '.join(sorted(herbs))
+            records_list.append(record)
+
+        if not records_list:
+            return pd.DataFrame()
+
+        records_list.sort(key=lambda x: x['出峰时间t/min'] if x['出峰时间t/min'] is not None else 0)
+
+        rt_tol = self.rt_fusion_tolerance
+        fused_records = []
+        i = 0
+        n = len(records_list)
+        while i < n:
+            group = [records_list[i]]
+            j = i + 1
+            while j < n:
+                rt1 = group[0]['出峰时间t/min']
+                rt2 = records_list[j]['出峰时间t/min']
+                if rt1 is None or rt2 is None:
+                    break
+                if abs(rt1 - rt2) <= rt_tol:
+                    group.append(records_list[j])
+                    j += 1
+                else:
+                    break
+
+            compound_groups = {}
+            for rec in group:
+                key = rec['_merge_key']
+                if key not in compound_groups:
+                    compound_groups[key] = []
+                compound_groups[key].append(rec)
+
+            for comp_key, comp_recs in compound_groups.items():
+                if len(comp_recs) == 1:
+                    rec = comp_recs[0].copy()
+                    del rec['_merge_key']
+                    del rec['_fragments_set']
+                    if '基础得分' in rec:
+                        del rec['基础得分']
+                    fused_records.append(rec)
+                else:
+                    best_rec = max(comp_recs, key=lambda x: x['基础得分']).copy()
+                    adducts = set()
+                    modes = set()
+                    all_frag_lit_maps = []
+                    for rec in comp_recs:
+                        if rec.get('加和离子'):
+                            adducts.add(rec['加和离子'])
+                        if rec.get('离子化方式'):
+                            modes.add(rec['离子化方式'])
+                        if rec.get('碎片-文献映射'):
+                            all_frag_lit_maps.append(rec['碎片-文献映射'])
+                    best_rec['加和离子'] = '; '.join(sorted(adducts))
+                    best_rec['离子化方式'] = '/'.join(sorted(modes))
+                    if all_frag_lit_maps:
+                        best_rec['碎片-文献映射'] = ' || '.join(all_frag_lit_maps)
+
+                    all_frag_sets = [rec['_fragments_set'] for rec in comp_recs]
+                    similarities = []
+                    for a in range(len(all_frag_sets)):
+                        for b in range(a+1, len(all_frag_sets)):
+                            set_a = all_frag_sets[a]
+                            set_b = all_frag_sets[b]
+                            if len(set_a) == 0 and len(set_b) == 0:
+                                sim = 1.0
+                            elif len(set_a) == 0 or len(set_b) == 0:
+                                sim = 0.0
+                            else:
+                                intersection = len(set_a & set_b)
+                                union = len(set_a | set_b)
+                                sim = intersection / union if union > 0 else 0
+                            similarities.append(sim)
+                    avg_similarity = np.mean(similarities) if similarities else 1.0
+
+                    extra_count = len(adducts) - 1
+                    if extra_count > 0:
+                        base_bonus = extra_count * 5
+                        if avg_similarity < 0.5:
+                            fusion_bonus = base_bonus * 0.5
+                        else:
+                            fusion_bonus = base_bonus
+                        fusion_bonus = min(fusion_bonus, 15)
+                    else:
+                        fusion_bonus = 0
+
+                    final_score = min(best_rec['基础得分'] + fusion_bonus, 100)
+
+                    if best_rec['评级'] == 1 and final_score < 80:
+                        final_score = 80
+                    if best_rec['评级'] == 2 and final_score < 60:
+                        final_score = 60
+
+                    best_rec['综合得分'] = final_score
+
+                    if len(comp_recs) >= 2 and all(rec['评级'] <= 2 for rec in comp_recs):
+                        best_rec['评级'] = 1
+                        best_rec['评级名称'] = '确证级'
+                        best_rec['置信度'] = '最高'
+                        best_rec['报告建议'] = '可直接报告'
+
+                    del best_rec['_merge_key']
+                    del best_rec['_fragments_set']
+                    if '基础得分' in best_rec:
+                        del best_rec['基础得分']
+                    fused_records.append(best_rec)
+
+            i = j
+
+        report_df = pd.DataFrame(fused_records)
+
+        if not report_df.empty:
+            report_df = report_df.sort_values(by=['评级', '综合得分', 'ppm'], ascending=[True, False, True])
+            report_df = report_df.reset_index(drop=True)
+            report_df['序号'] = range(1, len(report_df) + 1)
+
+        return report_df
 
     def save_report(self, report_df, output_path):
         report_df.to_excel(output_path, index=False)
@@ -1315,7 +1480,7 @@ class UltimateGardeniaIdentifier:
 
 
 # ============================================================================
-# 数据库加载函数（带缓存）- 保持不变
+# 数据库加载函数（带缓存）
 # ============================================================================
 
 @st.cache_data
@@ -1409,11 +1574,11 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# Streamlit 网页应用部分（与原来基本相同，仅版本号更新）
+# Streamlit 网页应用部分
 # ============================================================================
 
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.16（漏洞修复版）",
+    page_title="中药化合物智能鉴定平台 v5.16（完整修复版）",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1479,7 +1644,7 @@ def create_header():
     st.markdown(f"""
     <div class="main-header">
         <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v5.16 漏洞修复版 | 欢迎回来，{username}</p>
+        <p>v5.16 完整修复版 | 欢迎回来，{username}</p>
     </div>
     """, unsafe_allow_html=True)
 
