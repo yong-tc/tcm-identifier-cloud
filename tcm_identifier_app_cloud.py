@@ -6,6 +6,7 @@
 - v6.2 全候选版：保留所有ppm范围内的候选化合物，不截取前max_candidates
 - 二级比对（碎片匹配）后，输出所有匹配上的化合物
 - 一个母离子可能对应多个候选化合物
+- 已修复 use_container_width 弃用警告，改用 width 参数
 """
 
 import streamlit as st
@@ -333,7 +334,7 @@ class UltimateGardeniaIdentifier:
                  english_db_path=None,
                  standard_db_path=None,
                  cache_index=True,
-                 min_fragment_match=1):  # 新增：最少碎片匹配数
+                 min_fragment_match=1):
         """初始化鉴定程序（三库独立比对版 v6.2）"""
         self.config = {
             'gradient_time': 30.0,
@@ -342,7 +343,7 @@ class UltimateGardeniaIdentifier:
             'fragment_tolerance': 0.05,
             'fragment_tolerance_ppm': 20,
             'tolerance_ppm': 50,
-            'max_candidates': 100,  # 改为更大的值，实际不截取
+            'max_candidates': 100,
             'min_fragment_count': 1,
             'min_intensity': 100,
             'ppm_tier1': 10,
@@ -353,7 +354,6 @@ class UltimateGardeniaIdentifier:
         if config:
             self.config.update(config)
         
-        # 新增：最少碎片匹配数阈值
         self.min_fragment_match = min_fragment_match
 
         self.rt_tolerance = rt_tolerance
@@ -377,26 +377,22 @@ class UltimateGardeniaIdentifier:
         
         print("\n【1/9】正在加载数据库...")
         
-        # 加载主数据库
         self.main_database = self._load_data(database_path)
         if self.main_database.empty:
             print("  警告: 主数据库为空或未找到")
         else:
             print(f"  主数据库加载成功: {len(self.main_database)} 条记录")
         
-        # 加载英文数据库
         self.english_database = self._load_english_data(english_db_path)
         if not self.english_database.empty:
             print(f"  英文数据库加载成功: {len(self.english_database)} 条记录")
         
-        # 加载对照品数据库
         self.standard_database = self._load_standard_data(standard_db_path)
         if not self.standard_database.empty:
             print(f"  对照品数据库加载成功: {len(self.standard_database)} 条记录")
         else:
             print("  对照品数据库未找到或为空")
 
-        # 加载自定义数据库
         if custom_db_path and os.path.exists(custom_db_path):
             custom_db = self._load_data(custom_db_path)
             if not custom_db.empty:
@@ -406,7 +402,6 @@ class UltimateGardeniaIdentifier:
                 else:
                     self.main_database = pd.concat([self.main_database, custom_db], ignore_index=True)
 
-        # 筛选药材（如果指定）
         if herb_name:
             print(f"【2/9】正在筛选 {herb_name} 相关数据...")
             self.main_database = self._filter_by_herb(self.main_database, herb_name)
@@ -441,7 +436,7 @@ class UltimateGardeniaIdentifier:
 
         self.stats = {
             'total_precursors': 0,
-            'total_candidates': 0,  # 新增：总候选数统计
+            'total_candidates': 0,
             'identified_compounds': 0,
             'scored_candidates': 0
         }
@@ -546,7 +541,7 @@ class UltimateGardeniaIdentifier:
         return pd.DataFrame()
 
     def _build_diagnostic_ion_library(self, external_file=None):
-        """构建诊断性离子库（支持外部Excel文件，自动去重合并权重）"""
+        """构建诊断性离子库"""
         if external_file and os.path.exists(external_file):
             try:
                 df = pd.read_excel(external_file)
@@ -578,7 +573,7 @@ class UltimateGardeniaIdentifier:
                 print(f"  加载外部诊断离子文件失败：{e}，将使用内置库")
                 self._build_default_diagnostic_ions()
         else:
-            print("  未找到外部诊断离子文件，使用内置诊断离子库（无权重，默认权重1）")
+            print("  未找到外部诊断离子文件，使用内置诊断离子库")
             self._build_default_diagnostic_ions()
 
     def _build_default_diagnostic_ions(self):
@@ -674,17 +669,11 @@ class UltimateGardeniaIdentifier:
         return filtered_db
 
     def _build_separate_indices(self):
-        """为每个数据库分别构建索引（v6.2优化版：预构建碎片来源映射）"""
-        # 主数据库索引
+        """为每个数据库分别构建索引"""
         self.main_index = self._build_single_index(self.main_database, '主数据库')
-        
-        # 英文数据库索引
         self.english_index = self._build_single_index(self.english_database, '英文数据库')
-        
-        # 对照品数据库索引
         self.standard_index = self._build_single_index(self.standard_database, '对照品数据库')
         
-        # 预构建所有数据库的碎片来源映射
         print("  正在预构建碎片来源快速查找表...")
         self._prebuild_fragment_source_lookup()
         print("  ✓ 碎片来源快速查找表构建完成")
@@ -793,9 +782,7 @@ class UltimateGardeniaIdentifier:
         return index_data
 
     def _prebuild_fragment_source_lookup(self):
-        """
-        预构建碎片来源快速查找表
-        """
+        """预构建碎片来源快速查找表"""
         self.fragment_source_lookup = {
             'main': {},
             'english': {},
@@ -820,22 +807,6 @@ class UltimateGardeniaIdentifier:
             
             print(f"    {db_key}数据库碎片来源: {len(lookup)} 个唯一碎片")
 
-    def _get_fragment_sources_fast(self, db_key, frag_mz, tolerance=0.01):
-        """快速获取碎片离子的文献来源"""
-        if db_key not in self.fragment_source_lookup:
-            return set()
-        
-        lookup = self.fragment_source_lookup[db_key]
-        exact_key = round(frag_mz, 4)
-        if exact_key in lookup:
-            return lookup[exact_key]
-        
-        for key in list(lookup.keys()):
-            if abs(key - frag_mz) <= tolerance:
-                return lookup[key]
-        
-        return set()
-
     def _build_global_fragment_sources(self):
         """构建全局碎片离子来源映射"""
         self.global_fragment_sources = {}
@@ -848,10 +819,7 @@ class UltimateGardeniaIdentifier:
                 self.global_fragment_sources[compound_key] = sources
 
     def _search_database(self, precursor_mz, tolerance_ppm, ionization_mode, index_data):
-        """
-        在指定数据库索引中搜索候选化合物
-        v6.2修改：返回所有在ppm范围内的候选，不截取
-        """
+        """在指定数据库索引中搜索候选化合物（返回所有在ppm范围内的候选）"""
         candidates = []
         
         if ionization_mode == 'positive' or ionization_mode == 'both':
@@ -866,7 +834,6 @@ class UltimateGardeniaIdentifier:
         
         match_range = self._binary_search_range(mz_values, precursor_mz, tolerance_ppm)
         
-        # 返回所有在范围内的候选（不截取）
         for i in match_range:
             db_mz = mz_values[i]
             ppm_error = abs(precursor_mz - db_mz) / db_mz * 1e6 if db_mz > 0 else float('inf')
@@ -1138,17 +1105,13 @@ class UltimateGardeniaIdentifier:
     def identify_compound(self, precursor_mz, fragments, rt, ionization_mode):
         """
         鉴定单个化合物（v6.2全候选版）
-        核心改动：
-        1. 获取所有ppm范围内的候选化合物（不截取）
-        2. 对每个候选进行二级碎片匹配
-        3. 返回所有匹配上的化合物（可能多个）
+        获取所有ppm范围内的候选化合物，二级匹配后输出所有匹配上的
         """
         tolerance_ppm = self.config['tolerance_ppm']
         fragment_tolerance = self.config['fragment_tolerance']
         
         all_candidates = []
         
-        # 在三个数据库中分别搜索
         databases = [
             (self.main_index, 'main', '主数据库'),
             (self.english_index, 'english', '英文数据库'),
@@ -1159,13 +1122,10 @@ class UltimateGardeniaIdentifier:
             if index_data['mz_values_pos'].size == 0 and index_data['mz_values_neg'].size == 0:
                 continue
             
-            # 使用预构建的查找表
             self.temp_fragment_source_map = self.fragment_source_lookup.get(db_key, {})
             
-            # 获取所有ppm范围内的候选（不截取）
             candidates = self._search_database(precursor_mz, tolerance_ppm, ionization_mode, index_data)
             
-            # 为每个候选添加数据库键信息
             for c in candidates:
                 c['db_key'] = db_key
                 c['db_name_display'] = db_name
@@ -1175,12 +1135,9 @@ class UltimateGardeniaIdentifier:
         if not all_candidates:
             return []
         
-        # ========== v6.2核心改动：对所有候选进行二级匹配 ==========
-        # 不再按ppm排序截取，而是对所有候选进行碎片匹配
         results = []
         
         for candidate in all_candidates:
-            # 二级匹配：碎片匹配
             matched_frags, matched_frag_sources = self._match_fragments_with_source(
                 fragments,
                 candidate['fragments'],
@@ -1189,7 +1146,6 @@ class UltimateGardeniaIdentifier:
                 precursor_mz
             )
             
-            # 如果碎片匹配数为0，跳过该候选（除非没有碎片数据）
             if len(matched_frags) == 0 and len(candidate['fragments']) > 0:
                 continue
             
@@ -1208,7 +1164,6 @@ class UltimateGardeniaIdentifier:
                 len(candidate['fragments']) > 0
             )
             
-            # 获取保留时间偏差
             rt_deviation = None
             if rt is not None and candidate['db_idx'] in candidate['rt_values']:
                 db_rt = candidate['rt_values'][candidate['db_idx']]
@@ -1224,7 +1179,6 @@ class UltimateGardeniaIdentifier:
                 rt_deviation
             )
             
-            # 构建碎片离子列表
             fragment_list = []
             for frag_mz, src_set in matched_frag_sources.items():
                 sources_str = '; '.join(sorted(src_set))
@@ -1264,13 +1218,12 @@ class UltimateGardeniaIdentifier:
             
             results.append(result)
         
-        # 按综合得分排序（高分在前）
         results.sort(key=lambda x: x['综合得分'], reverse=True)
         
         return results
 
     def generate_report(self, sample_name='样品'):
-        """生成鉴定报告（v6.2全候选版）"""
+        """生成鉴定报告"""
         records = []
         
         print("\n【8/9】正在处理正离子数据...")
@@ -1295,7 +1248,6 @@ class UltimateGardeniaIdentifier:
                 result['出峰时间t/min'] = precursor['rt']
                 records.append(result)
             
-            # 打印每个母离子的匹配情况
             if len(results) > 0:
                 print(f"    母离子 {precursor['precursor_mz']} 匹配到 {len(results)} 个候选化合物")
         
@@ -1624,7 +1576,7 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# Streamlit 网页应用部分（保持不变）
+# Streamlit 网页应用部分
 # ============================================================================
 
 st.set_page_config(
@@ -1697,7 +1649,8 @@ def login_page():
     with st.form("login_form"):
         username = st.text_input("用户名", placeholder="请输入用户名")
         password = st.text_input("密码", type="password", placeholder="请输入密码")
-        submitted = st.form_submit_button("登录", use_container_width=True)
+        # 修复: use_container_width=True → width="stretch"
+        submitted = st.form_submit_button("登录", width="stretch")
 
         if submitted:
             if username == VALID_USERNAME and password == VALID_PASSWORD:
@@ -1712,7 +1665,8 @@ def login_page():
 
 def logout_button():
     """显示登出按钮"""
-    if st.sidebar.button("登出", use_container_width=True):
+    # 修复: use_container_width=True → width="stretch"
+    if st.sidebar.button("登出", width="stretch"):
         st.session_state.logged_in = False
         st.session_state.pop('username', None)
         st.rerun()
@@ -1814,7 +1768,8 @@ def show_home_page():
             </div>
             """, unsafe_allow_html=True)
 
-    if st.button("立即开始鉴定", type="primary", use_container_width=True):
+    # 修复: use_container_width=True → width="stretch"
+    if st.button("立即开始鉴定", type="primary", width="stretch"):
         st.session_state['page'] = '开始鉴定'
         st.rerun()
 
@@ -1906,7 +1861,8 @@ def show_analysis_page():
     st.info("💡 **全候选模式说明**：系统会查找所有ppm范围内的候选化合物，然后进行二级碎片匹配，输出所有匹配上的化合物（一个母离子可能对应多个候选）。")
 
     if ms_positive_file or ms_negative_file:
-        if st.button("开始化合物鉴定", type="primary", use_container_width=True):
+        # 修复: use_container_width=True → width="stretch"
+        if st.button("开始化合物鉴定", type="primary", width="stretch"):
             with st.spinner("正在初始化鉴定程序..."):
                 try:
                     temp_dir = tempfile.gettempdir()
@@ -1955,7 +1911,7 @@ def show_analysis_page():
                         'fragment_tolerance': fragment_tolerance,
                         'fragment_tolerance_ppm': fragment_tolerance_ppm,
                         'tolerance_ppm': tolerance_ppm,
-                        'max_candidates': 100,  # 设为较大值，实际不截取
+                        'max_candidates': 100,
                     }
 
                     identifier = UltimateGardeniaIdentifier(
@@ -2168,7 +2124,8 @@ def show_results_page():
             <p>请先进行化合物鉴定</p>
         </div>
         """, unsafe_allow_html=True)
-        if st.button("前往鉴定页面"):
+        # 修复: 添加 width="stretch"
+        if st.button("前往鉴定页面", width="stretch"):
             st.session_state['page'] = '开始鉴定'
             st.rerun()
         return
