@@ -544,6 +544,118 @@ class UltimateGardeniaIdentifier:
                 return pd.DataFrame()
         return pd.DataFrame()
 
+    def _build_diagnostic_ion_library(self, external_file=None):
+        """构建诊断性离子库（支持外部Excel文件，自动去重合并权重）"""
+        if external_file and os.path.exists(external_file):
+            try:
+                df = pd.read_excel(external_file)
+                required_cols = ['化合物类型', '诊断碎片离子m/z']
+                if not all(col in df.columns for col in required_cols):
+                    raise ValueError(f"外部诊断离子文件缺少必要列：{required_cols}")
+
+                self.diagnostic_ions = {}
+                for category, group in df.groupby('化合物类型'):
+                    ions_dict = {}
+                    for _, row in group.iterrows():
+                        mz = row['诊断碎片离子m/z']
+                        if pd.notna(mz):
+                            mz = float(mz)
+                            weight = row.get('权重', 1)
+                            try:
+                                weight = float(weight)
+                            except:
+                                weight = 1
+                            ions_dict[mz] = ions_dict.get(mz, 0) + weight
+                    description = group['描述'].iloc[0] if '描述' in group.columns else f'来自外部文件，{len(ions_dict)}个离子'
+                    self.diagnostic_ions[category] = {
+                        'ions': list(ions_dict.keys()),
+                        'weights': list(ions_dict.values()),
+                        'description': description
+                    }
+                print(f"  成功加载外部诊断离子库：{len(self.diagnostic_ions)} 类，{len(df)} 条记录（去重后）")
+            except Exception as e:
+                print(f"  加载外部诊断离子文件失败：{e}，将使用内置库")
+                self._build_default_diagnostic_ions()
+        else:
+            print("  未找到外部诊断离子文件，使用内置诊断离子库（无权重，默认权重1）")
+            self._build_default_diagnostic_ions()
+
+    def _build_default_diagnostic_ions(self):
+        """构建默认诊断离子库"""
+        self.diagnostic_ions = {
+            '环烯醚萜类': {
+                'ions': [138.055, 124.039, 110.023, 96.008, 82.029, 67.029, 127.039],
+                'weights': [1]*7,
+                'description': '环烯醚萜类特征脱水碎片'
+            },
+            '有机酸类': {
+                'ions': [191.056, 179.034, 173.045, 135.045, 93.034, 85.029],
+                'weights': [1]*6,
+                'description': '咖啡酰奎尼酸系列特征离子'
+            },
+            '黄酮类': {
+                'ions': [151.003, 137.024, 121.029, 107.049, 81.034, 65.039],
+                'weights': [1]*6,
+                'description': '黄酮苷元特征碎片'
+            },
+            '萜类': {
+                'ions': [127.076, 113.060, 99.044, 85.029, 71.013],
+                'weights': [1]*5,
+                'description': '萜类特征碎片'
+            },
+            '栀子特异': {
+                'ions': [127.039, 113.024, 101.024, 69.034, 97.028],
+                'weights': [1]*5,
+                'description': '栀子特有成分特征离子'
+            },
+            '生物碱类': {
+                'ions': [105.070, 91.054, 79.054, 65.039],
+                'weights': [1]*4,
+                'description': '生物碱特征碎片'
+            },
+            '酚酸类': {
+                'ions': [137.024, 123.044, 109.028, 95.049],
+                'weights': [1]*4,
+                'description': '酚酸类特征碎片'
+            }
+        }
+
+    def _load_auxiliary_data(self):
+        """加载辅助数据"""
+        pass
+
+    def _parse_losses(self, loss_string):
+        """解析中性丢失字符串"""
+        if pd.isna(loss_string):
+            return []
+        losses = []
+        for part in str(loss_string).split(','):
+            part = part.strip()
+            try:
+                losses.append(float(part))
+            except ValueError:
+                continue
+        return losses
+
+    def _classify_compound(self, name, compound_type):
+        """化合物类型分类"""
+        name = name.lower()
+        compound_type = str(compound_type).lower()
+
+        if any(keyword in compound_type for keyword in ['环烯醚', 'iridoid']):
+            return '环烯醚萜类'
+        if any(keyword in compound_type for keyword in ['有机酸', '酚酸', '有机酸类']):
+            return '有机酸类'
+        if any(keyword in compound_type for keyword in ['黄酮', 'flavon']):
+            return '黄酮类'
+        if any(keyword in compound_type for keyword in ['萜', 'terpen']):
+            return '萜类'
+        if any(keyword in compound_type for keyword in ['生物碱', 'alkaloid']):
+            return '生物碱类'
+        if any(keyword in name for keyword in ['京尼平', '栀子', 'genipos', 'gardenia']):
+            return '栀子特异'
+        return '其他'
+
     def _filter_by_herb(self, database, herb_name):
         """根据药材名称筛选数据库"""
         if herb_name is None or database.empty:
