@@ -192,12 +192,12 @@ def load_english_database_cached(db_filename="数据库（英文）.xlsx"):
 
 
 @st.cache_data
-def load_standard_database_cached(db_filename="对照品数据库.xls"):
+def load_standard_database_cached(db_filename="对照品数据库.xlsx"):
     """加载对照品数据库（独立处理）"""
     db_paths = [
-        "对照品数据库.xls",
-        "data/对照品数据库.xls",
-        "user_input_files/对照品数据库.xls"
+        "对照品数据库.xlsx",
+        "data/对照品数据库.xlsx",
+        "user_input_files/对照品数据库.xlsx"
     ]
     if db_filename and os.path.exists(db_filename):
         db_paths.insert(0, db_filename)
@@ -229,7 +229,7 @@ def load_standard_database_cached(db_filename="对照品数据库.xls"):
             except Exception as e:
                 print(f"  加载对照品数据库失败: {path}, 错误: {e}")
                 continue
-    print("  未找到对照品数据库文件（对照品数据库.xls）")
+    print("  未找到对照品数据库文件（对照品数据库.xlsx）")
     return pd.DataFrame()
 
 
@@ -265,9 +265,9 @@ def find_english_database_path():
 def find_standard_database_path():
     """查找对照品数据库路径"""
     db_paths = [
-        "对照品数据库.xls",
-        "data/对照品数据库.xls",
-        "user_input_files/对照品数据库.xls"
+        "对照品数据库.xlsx",
+        "data/对照品数据库.xlsx",
+        "user_input_files/对照品数据库.xlsx"
     ]
     for path in db_paths:
         if os.path.exists(path):
@@ -1944,7 +1944,7 @@ def show_analysis_page():
     col1, col2 = st.columns(2)
     with col1:
         use_english_db = st.checkbox("启用英文数据库（数据库（英文）.xlsx）", value=True)
-        use_standard_db = st.checkbox("启用对照品数据库（对照品数据库.xls）", value=True)
+        use_standard_db = st.checkbox("启用对照品数据库（对照品数据库.xlsx）", value=True)
     with col2:
         custom_db_file = st.file_uploader(
             "上传自定义数据库 (.xlsx，可选)",
@@ -2071,7 +2071,7 @@ def show_analysis_page():
                         if standard_db_path:
                             st.info(f"✅ 已找到对照品数据库: {standard_db_path}")
                         else:
-                            st.warning("未找到对照品数据库文件（对照品数据库.xls）")
+                            st.warning("未找到对照品数据库文件（对照品数据库.xlsx）")
 
                     db_path = find_database_path()
                     if not db_path:
@@ -2300,7 +2300,7 @@ def show_guide_page():
         <h3 style="color: #1e293b; margin-top: 1.5rem;">✨ v5.12 新增功能</h3>
         <ul style="color: #64748b; line-height: 1.6;">
             <li><strong>双库并行鉴定</strong>：同时支持主数据库（TCM-SM-MS DB）和英文数据库（数据库（英文）.xlsx）</li>
-            <li><strong>对照品数据库比对</strong>：支持加载对照品数据库.xls，独立参与鉴定</li>
+            <li><strong>对照品数据库比对</strong>：支持加载对照品数据库.xlsx，独立参与鉴定</li>
             <li><strong>碎片离子多分隔符支持</strong>：支持顿号、分号、逗号、空格等多种分隔符</li>
             <li><strong>文献-碎片映射</strong>：自动记录每个化合物碎片离子的文献来源</li>
             <li><strong>碎片离子来源展示</strong>：在主要碎片离子列中标注文献来源</li>
@@ -2310,7 +2310,7 @@ def show_guide_page():
         <ul style="color: #64748b; line-height: 1.6;">
             <li><strong>主数据库</strong>：TCM-SM-MS DB.xlsx（中药小分子化学成分高分辨质谱数据库）</li>
             <li><strong>英文数据库</strong>：数据库（英文）.xlsx（独立并行使用，需包含名称（中文）、准分子离子（正）等列）</li>
-            <li><strong>对照品数据库</strong>：对照品数据库.xls（独立比对，需包含中文名、准分子离子（正）等列）</li>
+            <li><strong>对照品数据库</strong>：对照品数据库.xlsx（独立比对，需包含中文名、准分子离子（正）等列）</li>
             <li><strong>诊断离子库</strong>：诊断离子.xlsx（可选，支持自定义）</li>
         </ul>
     </div>
@@ -2358,7 +2358,7 @@ def show_database_page():
 
     # 显示对照品数据库
     st.markdown("---")
-    st.markdown("### 🧪 对照品数据库（对照品数据库.xls）")
+    st.markdown("### 🧪 对照品数据库（对照品数据库.xlsx）")
     std_path = find_standard_database_path()
     if std_path:
         try:
@@ -2374,7 +2374,7 @@ def show_database_page():
         except Exception as e:
             st.error(f"加载对照品数据库时出错：{str(e)}")
     else:
-        st.info("未找到对照品数据库文件（对照品数据库.xls）")
+        st.info("未找到对照品数据库文件（对照品数据库.xlsx）")
 
 
 def show_results_page():
