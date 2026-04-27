@@ -7,6 +7,7 @@
 - 二级比对（碎片匹配）后，输出所有匹配上的化合物
 - 一个母离子可能对应多个候选化合物
 - 已修复 use_container_width 弃用警告，改用 width 参数
+- 优化版：支持三种不同结构数据库（主数据库、英文数据库、对照品数据库）
 """
 
 import streamlit as st
@@ -20,6 +21,7 @@ from datetime import datetime
 from io import BytesIO
 import tempfile
 from bisect import bisect_left, bisect_right
+import re
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -49,38 +51,49 @@ def normalize_formula(formula):
 
 
 # ============================================================================
-# 碎片离子解析函数（支持多种分隔符）
+# 增强版碎片离子解析函数（支持多种分隔符，包括对照品数据库格式）
 # ============================================================================
+
 def parse_fragments(fragment_string):
     """
-    解析碎片离子字符串，支持顿号、分号、逗号、空格、换行符分隔符
+    解析碎片离子字符串，支持顿号、分号、逗号、空格、换行符、<br>分隔符
     返回：碎片离子列表（float）
     """
     if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
         return []
-    s = str(fragment_string)
-    for sep in ['、', '；', ',', ' ', '\t', '\n', '\r\n']:
+    
+    s = str(fragment_string).strip()
+    
+    # 对照品数据库格式：使用 <br> 作为分隔符
+    if '<br>' in s:
+        # 支持多种分隔符混合
+        parts = re.split(r'<br>|,|;|、|\s+', s)
+        fragments = []
+        for part in parts:
+            part = part.strip()
+            if part and part != '':
+                try:
+                    # 过滤掉明显不是m/z的值
+                    if part.lower() not in ['nan', 'null', 'none', '']:
+                        fragments.append(float(part))
+                except ValueError:
+                    continue
+        return fragments
+    
+    # 使用常见分隔符
+    for sep in ['、', '；', ',', ';', ' ', '\t', '\n', '\r\n']:
         if sep in s:
             s = s.replace(sep, ';')
     
     fragments = []
     for part in s.split(';'):
         part = part.strip()
-        if part:
-            if '<br>' in part:
-                sub_parts = part.split('<br>')
-                for sub in sub_parts:
-                    sub = sub.strip()
-                    if sub:
-                        try:
-                            fragments.append(float(sub))
-                        except ValueError:
-                            continue
-            else:
-                try:
+        if part and part != '':
+            try:
+                if part.lower() not in ['nan', 'null', 'none', '']:
                     fragments.append(float(part))
-                except ValueError:
-                    continue
+            except ValueError:
+                continue
     return fragments
 
 
@@ -104,7 +117,63 @@ def parse_fragments_with_source(fragment_string, source_name, db_source=''):
 
 
 # ============================================================================
-# 数据库加载函数（带缓存）- 支持多个数据库
+# 药材名称提取（支持对照品数据库的"来源"列）
+# ============================================================================
+
+def extract_herb_name(source_string):
+    """
+    从对照品数据库的"来源"列提取药材名称
+    
+    格式示例：
+    - "对照品（安捷伦QTOF)" → 无药材信息
+    - "栀子" → 直接药材名
+    - "对照品（安捷伦QTOF);栀子" → 提取"栀子"
+    """
+    if pd.isna(source_string) or not source_string:
+        return ''
+    
+    s = str(source_string)
+    
+    # 如果包含分号，取最后一部分
+    if ';' in s:
+        parts = s.split(';')
+        for part in reversed(parts):
+            part = part.strip()
+            # 排除"对照品"、"安捷伦"等关键词
+            if part and '对照品' not in part and '安捷伦' not in part and 'QTOF' not in part:
+                return part
+        return ''
+    
+    # 如果包含括号，尝试提取括号外的内容
+    if '(' in s:
+        before_paren = s.split('(')[0].strip()
+        if before_paren and '对照品' not in before_paren:
+            return before_paren
+    
+    # 直接返回，排除干扰词
+    if s and '对照品' not in s and '安捷伦' not in s:
+        return s
+    
+    return ''
+
+
+def extract_literature_source(source_string):
+    """
+    从对照品数据库的"来源"列提取文献/数据来源信息
+    """
+    if pd.isna(source_string) or not source_string:
+        return '对照品数据库'
+    
+    s = str(source_string)
+    
+    if '对照品（安捷伦QTOF)' in s:
+        return '安捷伦QTOF对照品数据'
+    
+    return s.split(';')[0] if ';' in s else s
+
+
+# ============================================================================
+# 数据库加载函数（带缓存）- 支持三个不同结构的数据库
 # ============================================================================
 
 @st.cache_data
@@ -134,6 +203,7 @@ def load_database_cached(db_filename=None):
                     if old_name in df.columns and new_name not in df.columns:
                         df.rename(columns={old_name: new_name}, inplace=True)
                 df['_data_source'] = '主数据库'
+                df['_db_type'] = 'main'
                 return df
             except Exception as e:
                 continue
@@ -142,7 +212,7 @@ def load_database_cached(db_filename=None):
 
 @st.cache_data
 def load_english_database_cached(db_filename="数据库（英文）.xlsx"):
-    """加载英文数据库"""
+    """加载英文数据库（逗号分隔碎片）"""
     db_paths = [
         "数据库（英文）.xlsx",
         "data/数据库（英文）.xlsx",
@@ -180,6 +250,7 @@ def load_english_database_cached(db_filename="数据库（英文）.xlsx"):
                         df['文献来源'] = ''
                     
                     df['_data_source'] = '英文数据库'
+                    df['_db_type'] = 'english'
                     print(f"  英文数据库加载成功: {len(df)} 条记录")
                     return df
             except Exception as e:
@@ -190,9 +261,19 @@ def load_english_database_cached(db_filename="数据库（英文）.xlsx"):
 
 
 @st.cache_data
-def load_standard_database_cached(db_filename="对照品数据库.xlsx"):
-    """加载对照品数据库"""
+def load_standard_database_cached(db_filename="对照品质谱数据表.xlsx"):
+    """
+    加载对照品数据库（特殊格式）
+    
+    特点：
+    - 一个化合物可能有多行（不同加合物模式）
+    - 碎片离子用<br>分隔
+    - 来源列包含药材信息
+    """
     db_paths = [
+        "对照品质谱数据表.xlsx",
+        "data/对照品质谱数据表.xlsx",
+        "user_input_files/对照品质谱数据表.xlsx",
         "对照品数据库.xlsx",
         "data/对照品数据库.xlsx",
         "user_input_files/对照品数据库.xlsx"
@@ -204,30 +285,118 @@ def load_standard_database_cached(db_filename="对照品数据库.xlsx"):
         if os.path.exists(path):
             try:
                 df = pd.read_excel(path, sheet_name=0)
+                
+                # 列名标准化
                 column_mapping = {
                     '中文名': '名称（中文）',
                     'Name': '名称（英文）',
                     'Formula': '分子式',
+                    'Mass': '质量',
+                    'CAS': 'CAS号',
+                    'ChemSpider': 'ChemSpider',
+                    'IUPAC': 'IUPAC',
                     '加合物': '加合物（正）',
                     '准分子离子（正）': '准分子离子（正）',
                     '碎片离子（正）': '碎片离子（正）',
                     'Rel Abund': '相对丰度',
                     '准分子离子（负）': '准分子离子（负）',
-                    '碎片离子（负）': '碎片离子（负）'
+                    '碎片离子（负）': '碎片离子（负）',
+                    '来源': '原始来源'
                 }
+                
                 for old_name, new_name in column_mapping.items():
                     if old_name in df.columns and new_name not in df.columns:
                         df.rename(columns={old_name: new_name}, inplace=True)
                 
+                # 处理药材名称
+                if '原始来源' in df.columns:
+                    df['药材名称'] = df['原始来源'].apply(extract_herb_name)
+                    df['文献来源'] = df['原始来源'].apply(extract_literature_source)
+                else:
+                    df['药材名称'] = ''
+                    df['文献来源'] = '对照品数据库'
+                
+                # 处理多行合并：同一个化合物的不同加合物模式
+                df = _consolidate_standard_records(df)
+                
+                # 确保必要列存在
+                for col in ['化合物类型', '加合物（负）', '准分子离子（负）', '碎片离子（负）']:
+                    if col not in df.columns:
+                        df[col] = ''
+                
                 df['_data_source'] = '对照品数据库'
+                df['_db_type'] = 'standard'
                 df['_is_standard'] = True
+                
                 print(f"  对照品数据库加载成功: {len(df)} 条记录")
                 return df
             except Exception as e:
                 print(f"  加载对照品数据库失败: {path}, 错误: {e}")
                 continue
-    print("  未找到对照品数据库文件（对照品数据库.xlsx）")
+    print("  未找到对照品数据库文件（对照品质谱数据表.xlsx）")
     return pd.DataFrame()
+
+
+def _consolidate_standard_records(df):
+    """
+    合并对照品数据库中同一化合物的不同加合物记录
+    
+    输入：同化合物多行（不同加合物模式）
+    输出：合并后的单行（包含正负离子信息）
+    """
+    # 使用编号作为分组键
+    if '编号' not in df.columns:
+        return df
+    
+    consolidated = []
+    
+    for compound_id, group in df.groupby('编号'):
+        if len(group) == 1:
+            consolidated.append(group.iloc[0].to_dict())
+            continue
+        
+        # 合并多行
+        merged = {}
+        
+        # 基础信息（取第一行的值）
+        for col in ['编号', '名称（中文）', '名称（英文）', '分子式', 'CAS号', 
+                    'ChemSpider', 'IUPAC', '药材名称', '文献来源', '原始来源']:
+            if col in group.columns:
+                non_null = group[col].dropna()
+                merged[col] = non_null.iloc[0] if len(non_null) > 0 else ''
+        
+        # 化合物类型（默认）
+        merged['化合物类型'] = ''
+        
+        # 正离子模式信息
+        pos_rows = group[group['加合物（正）'].notna() | group['准分子离子（正）'].notna()]
+        if len(pos_rows) > 0:
+            pos_row = pos_rows.iloc[0]
+            merged['加合物（正）'] = pos_row.get('加合物（正）', '')
+            merged['准分子离子（正）'] = pos_row.get('准分子离子（正）', '')
+            merged['碎片离子（正）'] = pos_row.get('碎片离子（正）', '')
+            merged['相对丰度'] = pos_row.get('相对丰度', '')
+        else:
+            merged['加合物（正）'] = ''
+            merged['准分子离子（正）'] = ''
+            merged['碎片离子（正）'] = ''
+            merged['相对丰度'] = ''
+        
+        # 负离子模式信息
+        neg_rows = group[group['加合物（负）'].notna() | group['准分子离子（负）'].notna()]
+        if len(neg_rows) > 0:
+            neg_row = neg_rows.iloc[0]
+            merged['加合物（负）'] = neg_row.get('加合物（负）', '')
+            merged['准分子离子（负）'] = neg_row.get('准分子离子（负）', '')
+            merged['碎片离子（负）'] = neg_row.get('碎片离子（负）', '')
+        else:
+            merged['加合物（负）'] = ''
+            merged['准分子离子（负）'] = ''
+            merged['碎片离子（负）'] = ''
+        
+        consolidated.append(merged)
+    
+    return pd.DataFrame(consolidated)
 
 
 def find_database_path():
@@ -262,6 +431,9 @@ def find_english_database_path():
 def find_standard_database_path():
     """查找对照品数据库路径"""
     db_paths = [
+        "对照品质谱数据表.xlsx",
+        "data/对照品质谱数据表.xlsx",
+        "user_input_files/对照品质谱数据表.xlsx",
         "对照品数据库.xlsx",
         "data/对照品数据库.xlsx",
         "user_input_files/对照品数据库.xlsx"
@@ -445,7 +617,7 @@ class UltimateGardeniaIdentifier:
         print("【7/9】初始化完成，准备鉴定")
 
     def _load_data(self, filepath):
-        """加载数据文件（Excel/CSV）"""
+        """加载数据文件（Excel/CSV）- 支持主数据库格式"""
         if filepath and os.path.exists(filepath):
             try:
                 if filepath.endswith('.xlsx'):
@@ -472,7 +644,7 @@ class UltimateGardeniaIdentifier:
         return pd.DataFrame()
 
     def _load_english_data(self, filepath):
-        """加载英文数据库"""
+        """加载英文数据库 - 增强版"""
         if filepath and os.path.exists(filepath):
             try:
                 df = pd.read_excel(filepath)
@@ -502,24 +674,52 @@ class UltimateGardeniaIdentifier:
         return pd.DataFrame()
 
     def _load_standard_data(self, filepath):
-        """加载对照品数据库"""
+        """
+        加载对照品数据库 - 增强版
+        支持对照品质谱数据表.xlsx格式
+        """
         if filepath and os.path.exists(filepath):
             try:
                 df = pd.read_excel(filepath, sheet_name=0)
+                
+                # 列名标准化
                 column_mapping = {
                     '中文名': '名称（中文）',
                     'Name': '名称（英文）',
                     'Formula': '分子式',
+                    'Mass': '质量',
+                    'CAS': 'CAS号',
+                    'ChemSpider': 'ChemSpider',
+                    'IUPAC': 'IUPAC',
                     '加合物': '加合物（正）',
                     '准分子离子（正）': '准分子离子（正）',
                     '碎片离子（正）': '碎片离子（正）',
                     'Rel Abund': '相对丰度',
                     '准分子离子（负）': '准分子离子（负）',
-                    '碎片离子（负）': '碎片离子（负）'
+                    '碎片离子（负）': '碎片离子（负）',
+                    '来源': '原始来源'
                 }
+                
                 for old_name, new_name in column_mapping.items():
                     if old_name in df.columns and new_name not in df.columns:
                         df.rename(columns={old_name: new_name}, inplace=True)
+                
+                # 处理药材名称
+                if '原始来源' in df.columns:
+                    df['药材名称'] = df['原始来源'].apply(extract_herb_name)
+                    df['文献来源'] = df['原始来源'].apply(extract_literature_source)
+                else:
+                    df['药材名称'] = ''
+                    df['文献来源'] = '对照品数据库'
+                
+                # 处理多行合并
+                if '编号' in df.columns:
+                    df = self._consolidate_standard_records(df)
+                
+                # 确保必要列存在
+                for col in ['化合物类型', '加合物（负）', '准分子离子（负）', '碎片离子（负）']:
+                    if col not in df.columns:
+                        df[col] = ''
                 
                 if '名称（中文）' not in df.columns:
                     df['名称（中文）'] = ''
@@ -527,10 +727,6 @@ class UltimateGardeniaIdentifier:
                     df['名称（英文）'] = ''
                 if '分子式' not in df.columns:
                     df['分子式'] = ''
-                if '化合物类型' not in df.columns:
-                    df['化合物类型'] = ''
-                if '药材名称' not in df.columns:
-                    df['药材名称'] = ''
                 
                 df['_data_source'] = '对照品数据库'
                 df['_is_standard'] = True
@@ -539,6 +735,59 @@ class UltimateGardeniaIdentifier:
                 print(f"警告: 无法加载对照品数据库 {filepath}: {e}")
                 return pd.DataFrame()
         return pd.DataFrame()
+
+    def _consolidate_standard_records(self, df):
+        """合并对照品数据库中同一化合物的不同加合物记录"""
+        if '编号' not in df.columns:
+            return df
+        
+        consolidated = []
+        
+        for compound_id, group in df.groupby('编号'):
+            if len(group) == 1:
+                consolidated.append(group.iloc[0].to_dict())
+                continue
+            
+            merged = {}
+            
+            # 基础信息
+            for col in ['编号', '名称（中文）', '名称（英文）', '分子式', 'CAS号', 
+                        'ChemSpider', 'IUPAC', '药材名称', '文献来源']:
+                if col in group.columns:
+                    non_null = group[col].dropna()
+                    merged[col] = non_null.iloc[0] if len(non_null) > 0 else ''
+            
+            merged['化合物类型'] = ''
+            
+            # 正离子模式
+            pos_rows = group[group['加合物（正）'].notna() | group['准分子离子（正）'].notna()]
+            if len(pos_rows) > 0:
+                pos_row = pos_rows.iloc[0]
+                merged['加合物（正）'] = pos_row.get('加合物（正）', '')
+                merged['准分子离子（正）'] = pos_row.get('准分子离子（正）', '')
+                merged['碎片离子（正）'] = pos_row.get('碎片离子（正）', '')
+                merged['相对丰度'] = pos_row.get('相对丰度', '')
+            else:
+                merged['加合物（正）'] = ''
+                merged['准分子离子（正）'] = ''
+                merged['碎片离子（正）'] = ''
+                merged['相对丰度'] = ''
+            
+            # 负离子模式
+            neg_rows = group[group['加合物（负）'].notna() | group['准分子离子（负）'].notna()]
+            if len(neg_rows) > 0:
+                neg_row = neg_rows.iloc[0]
+                merged['加合物（负）'] = neg_row.get('加合物（负）', '')
+                merged['准分子离子（负）'] = neg_row.get('准分子离子（负）', '')
+                merged['碎片离子（负）'] = neg_row.get('碎片离子（负）', '')
+            else:
+                merged['加合物（负）'] = ''
+                merged['准分子离子（负）'] = ''
+                merged['碎片离子（负）'] = ''
+            
+            consolidated.append(merged)
+        
+        return pd.DataFrame(consolidated)
 
     def _build_diagnostic_ion_library(self, external_file=None):
         """构建诊断性离子库"""
@@ -1649,7 +1898,6 @@ def login_page():
     with st.form("login_form"):
         username = st.text_input("用户名", placeholder="请输入用户名")
         password = st.text_input("密码", type="password", placeholder="请输入密码")
-        # 修复: use_container_width=True → width="stretch"
         submitted = st.form_submit_button("登录", width="stretch")
 
         if submitted:
@@ -1665,7 +1913,6 @@ def login_page():
 
 def logout_button():
     """显示登出按钮"""
-    # 修复: use_container_width=True → width="stretch"
     if st.sidebar.button("登出", width="stretch"):
         st.session_state.logged_in = False
         st.session_state.pop('username', None)
@@ -1768,7 +2015,6 @@ def show_home_page():
             </div>
             """, unsafe_allow_html=True)
 
-    # 修复: use_container_width=True → width="stretch"
     if st.button("立即开始鉴定", type="primary", width="stretch"):
         st.session_state['page'] = '开始鉴定'
         st.rerun()
@@ -1808,7 +2054,7 @@ def show_analysis_page():
     col1, col2 = st.columns(2)
     with col1:
         use_english_db = st.checkbox("启用英文数据库（数据库（英文）.xlsx）", value=True)
-        use_standard_db = st.checkbox("启用对照品数据库（对照品数据库.xlsx）", value=True)
+        use_standard_db = st.checkbox("启用对照品数据库（对照品质谱数据表.xlsx）", value=True)
     with col2:
         custom_db_file = st.file_uploader(
             "上传自定义数据库 (.xlsx，可选)",
@@ -1861,7 +2107,6 @@ def show_analysis_page():
     st.info("💡 **全候选模式说明**：系统会查找所有ppm范围内的候选化合物，然后进行二级碎片匹配，输出所有匹配上的化合物（一个母离子可能对应多个候选）。")
 
     if ms_positive_file or ms_negative_file:
-        # 修复: use_container_width=True → width="stretch"
         if st.button("开始化合物鉴定", type="primary", width="stretch"):
             with st.spinner("正在初始化鉴定程序..."):
                 try:
@@ -1891,7 +2136,7 @@ def show_analysis_page():
                         if standard_db_path:
                             st.info(f"已找到对照品数据库: {standard_db_path}")
                         else:
-                            st.warning("未找到对照品数据库文件（对照品数据库.xlsx）")
+                            st.warning("未找到对照品数据库文件（对照品质谱数据表.xlsx）")
 
                     db_path = find_database_path()
                     if not db_path:
@@ -2034,7 +2279,7 @@ def show_guide_page():
 
     1. **主数据库 (TCM-SM-MS DB.xlsx)**：中药小分子化学成分高分辨质谱数据库
     2. **英文数据库 (数据库（英文）.xlsx)**：英文化合物数据库
-    3. **对照品数据库 (对照品数据库.xlsx)**：标准品参考数据库
+    3. **对照品数据库 (对照品质谱数据表.xlsx)**：标准品参考数据库
 
     ### v6.2 全候选模式
 
@@ -2099,14 +2344,16 @@ def show_database_page():
         st.info("未找到英文数据库文件")
 
     st.markdown("---")
-    st.markdown("### 对照品数据库（对照品数据库.xlsx）")
+    st.markdown("### 对照品数据库（对照品质谱数据表.xlsx）")
     std_path = find_standard_database_path()
     if std_path:
         try:
             std_df = load_standard_database_cached()
             if not std_df.empty:
                 st.success(f"对照品数据库：{len(std_df)} 条记录")
-                st.dataframe(std_df.head(5), use_container_width=True)
+                display_cols = ['名称（中文）', '名称（英文）', '分子式', '准分子离子（正）', '准分子离子（负）']
+                available_cols = [c for c in display_cols if c in std_df.columns]
+                st.dataframe(std_df[available_cols].head(5), use_container_width=True)
         except Exception as e:
             st.error(f"加载对照品数据库时出错：{str(e)}")
     else:
@@ -2124,7 +2371,6 @@ def show_results_page():
             <p>请先进行化合物鉴定</p>
         </div>
         """, unsafe_allow_html=True)
-        # 修复: 添加 width="stretch"
         if st.button("前往鉴定页面", width="stretch"):
             st.session_state['page'] = '开始鉴定'
             st.rerun()
