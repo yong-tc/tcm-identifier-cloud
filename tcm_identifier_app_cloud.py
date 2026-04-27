@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v5.12（支持英文数据库 + 碎片多值映射）
+中药化合物智能鉴定平台 - 云端部署增强版 v5.13（文献-碎片详细映射）
 ==========================================================
 更新说明：
-- 新增对"数据库（英文）.xlsx"的支持，作为独立补充数据库
-- 碎片离子列支持分号、逗号、空格等多值映射（适用于所有数据库）
-- 鉴定顺序：主数据库和英文数据库并行鉴定，结果合并去重
+- 一级匹配：准分子离子匹配，使用ppm容差控制
+- 二级匹配：碎片离子匹配，使用绝对Da容差控制（可调整）
+- 文献输出：支持详细映射格式 139.05(文献1,文献2); 134.03(文献1,文献3)
+- 支持碎片对应多篇文献的映射关系
 - 其他功能保持不变
 """
 
@@ -16,10 +17,12 @@ import os
 import time
 import pickle
 import hashlib
+import re
 from datetime import datetime
 from io import BytesIO
 import tempfile
 from bisect import bisect_left, bisect_right
+from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -49,18 +52,18 @@ def normalize_formula(formula):
 
 
 # ============================================================================
-# 碎片离子解析函数（支持多值映射）
+# 碎片离子解析函数（支持多值映射，支持文献来源绑定）
 # ============================================================================
 
-def parse_fragments_multivalue(fragment_string):
+def parse_fragments_with_sources(fragment_string, source_string):
     """
-    解析碎片离子字符串，支持多种分隔符映射多个碎片值
-    支持的格式：
+    解析碎片离子字符串，并绑定文献来源
+    返回: [(mz, [source1, source2, ...]), ...] 每个碎片对应的文献列表
+    支持格式：
     - 139.05, 134.03, 151.01
     - 139.05; 134.03; 151.01
     - 139.05、134.03、151.01
     - 139.05 134.03 151.01
-    - 139.05,134.03,151.01
     """
     if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
         return []
@@ -69,16 +72,60 @@ def parse_fragments_multivalue(fragment_string):
     fragments = []
     
     # 尝试多种分隔符
-    # 优先使用顿号（、）
     if '、' in s:
         parts = s.split('、')
-    # 分号（;）
     elif ';' in s:
         parts = s.split(';')
-    # 逗号（,）
     elif ',' in s:
         parts = s.split(',')
-    # 空格
+    elif ' ' in s:
+        parts = s.split()
+    else:
+        parts = [s]
+    
+    # 解析文献来源列表
+    sources = []
+    if not pd.isna(source_string) and source_string:
+        source_str = str(source_string).strip()
+        # 支持分号、逗号分隔的多篇文献
+        if ';' in source_str:
+            sources = [s.strip() for s in source_str.split(';') if s.strip()]
+        elif ',' in source_str:
+            sources = [s.strip() for s in source_str.split(',') if s.strip()]
+        else:
+            sources = [source_str]
+    
+    for part in parts:
+        part = part.strip()
+        if part:
+            try:
+                # 提取数字部分
+                match = re.search(r'[-+]?\d+\.?\d*', part)
+                if match:
+                    frag_value = float(match.group())
+                    fragments.append((frag_value, sources.copy()))
+                else:
+                    fragments.append((float(part), sources.copy()))
+            except ValueError:
+                continue
+    
+    return fragments
+
+
+def parse_fragments_simple(fragment_string):
+    """简单解析碎片离子，仅返回mz列表"""
+    if pd.isna(fragment_string) or not fragment_string or str(fragment_string).strip() == '':
+        return []
+    
+    s = str(fragment_string).strip()
+    fragments = []
+    
+    if '、' in s:
+        parts = s.split('、')
+    elif ';' in s:
+        parts = s.split(';')
+    elif ',' in s:
+        parts = s.split(',')
     elif ' ' in s:
         parts = s.split()
     else:
@@ -88,20 +135,41 @@ def parse_fragments_multivalue(fragment_string):
         part = part.strip()
         if part:
             try:
-                # 支持格式如 "139.05" 或 "139.05 (100%)" 等，只取数字部分
-                # 提取数字部分（支持正负号和小数点）
-                import re
                 match = re.search(r'[-+]?\d+\.?\d*', part)
                 if match:
-                    frag_value = float(match.group())
-                    fragments.append(frag_value)
+                    fragments.append(float(match.group()))
                 else:
-                    # 如果无法提取数字，直接尝试转换
                     fragments.append(float(part))
             except ValueError:
                 continue
     
     return fragments
+
+
+def format_fragment_sources(fragment_sources_map):
+    """
+    格式化碎片-文献映射关系
+    输入: {139.05: ['文献1', '文献2'], 134.03: ['文献1', '文献3']}
+    输出: "139.05(文献1,文献2); 134.03(文献1,文献3)"
+    """
+    if not fragment_sources_map:
+        return ''
+    
+    items = []
+    for mz in sorted(fragment_sources_map.keys()):
+        sources = fragment_sources_map[mz]
+        if sources:
+            # 去重并保持顺序
+            unique_sources = []
+            for s in sources:
+                if s not in unique_sources:
+                    unique_sources.append(s)
+            sources_str = ','.join(unique_sources)
+            items.append(f"{mz:.4f}({sources_str})")
+        else:
+            items.append(f"{mz:.4f}")
+    
+    return '; '.join(items)
 
 
 # ============================================================================
@@ -126,7 +194,6 @@ def load_database_cached(db_filename="TCM-SM-MS DB.xlsx"):
             try:
                 df = pd.read_excel(path)
                 print(f"主数据库加载成功: {path}, 共 {len(df)} 条记录")
-                # 标准化主数据库列名
                 df = standardize_db_columns(df)
                 return df
             except Exception as e:
@@ -151,7 +218,6 @@ def load_english_database_cached(db_filename="数据库（英文）.xlsx"):
             try:
                 df = pd.read_excel(path)
                 print(f"英文数据库加载成功: {path}, 共 {len(df)} 条记录")
-                # 标准化英文数据库列名
                 df = standardize_db_columns(df)
                 return df
             except Exception as e:
@@ -162,7 +228,7 @@ def load_english_database_cached(db_filename="数据库（英文）.xlsx"):
 
 
 def standardize_db_columns(df):
-    """标准化数据库列名（适用于主库和英文库）"""
+    """标准化数据库列名"""
     column_mapping = {
         '药材名': '药材名称',
         '文献': '文献来源',
@@ -174,27 +240,26 @@ def standardize_db_columns(df):
         if old_name in df.columns and new_name not in df.columns:
             df.rename(columns={old_name: new_name}, inplace=True)
     
-    # 确保必要列存在
-    required_cols = ['名称（中文）', '名称（英文）', '准分子离子（正）', '准分子离子（负）']
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = ''
-    
-    # 确保碎片离子列存在
+    if '名称（中文）' not in df.columns:
+        df['名称（中文）'] = ''
+    if '名称（英文）' not in df.columns:
+        df['名称（英文）'] = ''
     if '碎片离子（正）' not in df.columns:
         df['碎片离子（正）'] = ''
     if '碎片离子（负）' not in df.columns:
         df['碎片离子（负）'] = ''
-    
-    # 确保化合物类型列存在
-    if '化合物类型' not in df.columns:
-        df['化合物类型'] = ''
-    
-    # 确保加合物列存在
+    if '准分子离子（正）' not in df.columns:
+        df['准分子离子（正）'] = ''
+    if '准分子离子（负）' not in df.columns:
+        df['准分子离子（负）'] = ''
     if '加合物（正）' not in df.columns:
         df['加合物（正）'] = ''
     if '加合物（负）' not in df.columns:
         df['加合物（负）'] = ''
+    if '化合物类型' not in df.columns:
+        df['化合物类型'] = ''
+    if '文献来源' not in df.columns:
+        df['文献来源'] = ''
     
     return df
 
@@ -307,17 +372,18 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# 鉴定程序核心代码（支持英文数据库 + 碎片多值映射）
+# 鉴定程序核心代码（支持文献-碎片详细映射）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v5.12（支持英文数据库 + 碎片多值映射）
+    中药化合物鉴定终极版程序 v5.13（文献-碎片详细映射）
 
     主要更新：
-    1. 支持加载英文数据库作为独立补充数据库
-    2. 碎片离子解析支持多值映射（分号、逗号、空格、顿号分隔）
-    3. 鉴定顺序：先匹配主数据库，再匹配英文数据库，结果合并去重
+    1. 一级匹配（准分子离子）：使用ppm容差控制
+    2. 二级匹配（碎片离子）：使用绝对Da容差控制（可调整）
+    3. 文献输出：支持详细映射格式 139.05(文献1,文献2)
+    4. 支持碎片对应多篇文献的映射关系
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -330,14 +396,16 @@ class UltimateGardeniaIdentifier:
                  use_rt_score=True,
                  custom_db_path=None,
                  cache_index=True,
-                 english_db_path=None):
-        """初始化鉴定程序（支持英文数据库）"""
+                 english_db_path=None,
+                 fragment_tolerance_no_ppm=0.1):  # 新增：二级匹配绝对Da容差
+        """初始化鉴定程序"""
         self.config = {
             'gradient_time': 30.0,
             'cid_min': 0.5,
             'cid_max': 1.0,
             'fragment_tolerance': 0.05,
             'fragment_tolerance_ppm': 20,
+            'fragment_tolerance_no_ppm': fragment_tolerance_no_ppm,  # 新增：二级匹配绝对Da容差
             'tolerance_ppm': 50,
             'max_candidates': 3,
             'min_fragment_count': 1,
@@ -364,7 +432,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v5.12（支持英文数据库 + 碎片多值映射）")
+        print("中药化合物鉴定程序 v5.13（文献-碎片详细映射）")
         print("="*80)
         
         # 初始化空数据库
@@ -379,7 +447,7 @@ class UltimateGardeniaIdentifier:
         else:
             print("  警告: 未找到主数据库文件")
         
-        # 步骤2：加载英文数据库（独立）
+        # 步骤2：加载英文数据库
         print("【2/9】正在加载英文数据库...")
         if english_db_path is None:
             english_db_path = find_english_database_path()
@@ -387,7 +455,6 @@ class UltimateGardeniaIdentifier:
             english_db = self._load_data(english_db_path)
             if not english_db.empty:
                 print(f"  英文数据库加载成功: {len(english_db)} 条记录")
-                # 合并到总数据库（保留来源标记）
                 english_db['_db_source'] = 'english'
                 self.full_database = pd.concat([self.full_database, english_db], ignore_index=True)
             else:
@@ -450,7 +517,6 @@ class UltimateGardeniaIdentifier:
                 elif filepath.endswith('.csv'):
                     return pd.read_csv(filepath)
 
-                # 标准化列名
                 column_mapping = {
                     '药材名': '药材名称',
                     '文献': '文献来源',
@@ -462,7 +528,6 @@ class UltimateGardeniaIdentifier:
                     if old_name in df.columns and new_name not in df.columns:
                         df.rename(columns={old_name: new_name}, inplace=True)
 
-                # 确保必要列存在
                 if '名称（中文）' not in df.columns:
                     df['名称（中文）'] = ''
                 if '名称（英文）' not in df.columns:
@@ -481,6 +546,8 @@ class UltimateGardeniaIdentifier:
                     df['加合物（负）'] = ''
                 if '化合物类型' not in df.columns:
                     df['化合物类型'] = ''
+                if '文献来源' not in df.columns:
+                    df['文献来源'] = ''
 
                 return df
             except Exception as e:
@@ -504,7 +571,7 @@ class UltimateGardeniaIdentifier:
 
     def _build_or_load_index(self):
         """构建或加载索引缓存"""
-        cache_file = "index_cache_v512.pkl"
+        cache_file = "index_cache_v513.pkl"
         db_hash = hashlib.md5(pd.util.hash_pandas_object(self.database).values).hexdigest()
 
         if self.cache_index and os.path.exists(cache_file):
@@ -517,8 +584,6 @@ class UltimateGardeniaIdentifier:
                     self.sorted_idx_neg = cached['sorted_idx_neg']
                     self.mz_values_pos = cached['mz_values_pos']
                     self.mz_values_neg = cached['mz_values_neg']
-                    self.db_frag_pos = cached['db_frag_pos']
-                    self.db_frag_neg = cached['db_frag_neg']
                     self.compound_info = cached['compound_info']
                     self.rt_values = cached.get('rt_values', {})
                     self.neutral_losses = cached.get('neutral_losses', {})
@@ -537,8 +602,6 @@ class UltimateGardeniaIdentifier:
                     'sorted_idx_neg': self.sorted_idx_neg,
                     'mz_values_pos': self.mz_values_pos,
                     'mz_values_neg': self.mz_values_neg,
-                    'db_frag_pos': self.db_frag_pos,
-                    'db_frag_neg': self.db_frag_neg,
                     'compound_info': self.compound_info,
                     'rt_values': self.rt_values,
                     'neutral_losses': self.neutral_losses
@@ -549,21 +612,12 @@ class UltimateGardeniaIdentifier:
             except Exception as e:
                 print(f"  缓存保存失败: {e}")
 
-    def _parse_fragments_multivalue(self, fragment_string):
-        """
-        解析碎片离子字符串，支持多种分隔符映射多个碎片值
-        供索引构建使用
-        """
-        return parse_fragments_multivalue(fragment_string)
-
     def _build_optimized_index(self):
-        """构建优化索引（支持碎片多值映射）"""
-        self.sorted_idx_pos = []
+        """构建优化索引（支持文献-碎片映射）"""
+        self.sorted_idx_pos = []  # (mz, db_idx, fragments_with_sources)
         self.sorted_idx_neg = []
         self.mz_values_pos = []
         self.mz_values_neg = []
-        self.db_frag_pos = []
-        self.db_frag_neg = []
         self.compound_info = {}
         self.rt_values = {}
         self.neutral_losses = {}
@@ -607,23 +661,30 @@ class UltimateGardeniaIdentifier:
                 if losses:
                     self.neutral_losses[idx] = losses
 
-            # 处理正离子 - 使用支持多值映射的解析函数
+            # 处理正离子 - 带文献来源的碎片
             if pd.notna(mz_pos) and str(mz_pos).strip() != '':
                 try:
                     mz_val = float(mz_pos)
                     if mz_val > 0:
-                        fragments = self._parse_fragments_multivalue(row.get('碎片离子（正）', ''))
-                        self.sorted_idx_pos.append((mz_val, idx, np.array(fragments) if fragments else np.array([])))
+                        # 解析碎片并绑定文献
+                        fragments_with_sources = parse_fragments_with_sources(
+                            row.get('碎片离子（正）', ''),
+                            source
+                        )
+                        self.sorted_idx_pos.append((mz_val, idx, fragments_with_sources))
                 except (ValueError, TypeError):
                     pass
 
-            # 处理负离子 - 使用支持多值映射的解析函数
+            # 处理负离子
             if pd.notna(mz_neg) and str(mz_neg).strip() != '':
                 try:
                     mz_val = float(mz_neg)
                     if mz_val > 0:
-                        fragments = self._parse_fragments_multivalue(row.get('碎片离子（负）', ''))
-                        self.sorted_idx_neg.append((mz_val, idx, np.array(fragments) if fragments else np.array([])))
+                        fragments_with_sources = parse_fragments_with_sources(
+                            row.get('碎片离子（负）', ''),
+                            source
+                        )
+                        self.sorted_idx_neg.append((mz_val, idx, fragments_with_sources))
                 except (ValueError, TypeError):
                     pass
 
@@ -633,11 +694,41 @@ class UltimateGardeniaIdentifier:
         self.mz_values_pos = np.array([x[0] for x in self.sorted_idx_pos])
         self.mz_values_neg = np.array([x[0] for x in self.sorted_idx_neg])
 
-        self.db_frag_pos = [x[2] for x in self.sorted_idx_pos]
-        self.db_frag_neg = [x[2] for x in self.sorted_idx_neg]
+    def _match_fragments_with_sources(self, observed_fragments, db_fragments_with_sources, 
+                                       tolerance_value, precursor_mz=None):
+        """
+        匹配碎片并返回碎片-文献映射
+        输入: observed_fragments - 实测碎片列表
+             db_fragments_with_sources - [(mz, [source1, source2,...]), ...]
+        输出: matched_fragments_list, fragment_sources_map
+        """
+        if len(db_fragments_with_sources) == 0:
+            return [], {}
+        
+        observed = np.asarray(observed_fragments)
+        matched_fragments = []
+        fragment_sources_map = defaultdict(list)  # {mz: [sources]}
+        
+        for ref_mz, sources in db_fragments_with_sources:
+            if pd.notna(ref_mz) and float(ref_mz) > 0:
+                for obs_mz in observed:
+                    # 跳过母离子本身
+                    if precursor_mz is not None and abs(obs_mz - precursor_mz) <= tolerance_value:
+                        continue
+                    
+                    if abs(obs_mz - ref_mz) <= tolerance_value:
+                        if obs_mz not in matched_fragments:
+                            matched_fragments.append(obs_mz)
+                        # 合并文献来源
+                        for s in sources:
+                            if s and s not in fragment_sources_map[obs_mz]:
+                                fragment_sources_map[obs_mz].append(s)
+                        break
+        
+        return matched_fragments, fragment_sources_map
 
     def _build_diagnostic_ion_library(self, external_file=None):
-        """构建诊断性离子库（支持外部Excel文件，自动去重合并权重）"""
+        """构建诊断性离子库"""
         if external_file and os.path.exists(external_file):
             try:
                 df = pd.read_excel(external_file)
@@ -664,12 +755,12 @@ class UltimateGardeniaIdentifier:
                         'weights': list(ions_dict.values()),
                         'description': description
                     }
-                print(f"  成功加载外部诊断离子库：{len(self.diagnostic_ions)} 类，{len(df)} 条记录（去重后）")
+                print(f"  成功加载外部诊断离子库：{len(self.diagnostic_ions)} 类，{len(df)} 条记录")
             except Exception as e:
                 print(f"  加载外部诊断离子文件失败：{e}，将使用内置库")
                 self._build_default_diagnostic_ions()
         else:
-            print("  未找到外部诊断离子文件，使用内置诊断离子库（无权重，默认权重1）")
+            print("  未找到外部诊断离子文件，使用内置诊断离子库")
             self._build_default_diagnostic_ions()
 
     def _build_default_diagnostic_ions(self):
@@ -760,7 +851,7 @@ class UltimateGardeniaIdentifier:
         return '其他'
 
     def _binary_search_range(self, mz_array, mz, tolerance_ppm):
-        """二分查找匹配范围"""
+        """二分查找匹配范围（一级匹配使用）"""
         if len(mz_array) == 0:
             return range(0, 0)
         mz = float(mz)
@@ -770,29 +861,6 @@ class UltimateGardeniaIdentifier:
         left = bisect_left(mz_array, mz_min)
         right = bisect_right(mz_array, mz_max)
         return range(left, right)
-
-    def _match_fragments_fast(self, observed, reference, tolerance_value, tolerance_type='Da', precursor_mz=None):
-        """快速匹配碎片离子"""
-        matched = []
-        if len(reference) == 0:
-            return matched
-        ref_arr = np.asarray(reference)
-        obs_arr = np.asarray(observed)
-        for ref_val in ref_arr:
-            if pd.notna(ref_val) and float(ref_val) > 0:
-                for obs_val in obs_arr:
-                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
-                        continue
-                    if tolerance_type == 'Da':
-                        if abs(obs_val - ref_val) <= tolerance_value:
-                            matched.append(obs_val)
-                            break
-                    else:
-                        ppm_error = abs(obs_val - ref_val) / ref_val * 1e6
-                        if ppm_error <= tolerance_value:
-                            matched.append(obs_val)
-                            break
-        return list(set(matched))
 
     def _find_diagnostic_ions_fast(self, matched_fragments, category, precursor_mz=None):
         """快速查找诊断离子"""
@@ -996,47 +1064,58 @@ class UltimateGardeniaIdentifier:
         return precursors
 
     def identify_compound(self, precursor, return_top=1, score_threshold=0):
-        """鉴定化合物"""
+        """
+        鉴定化合物
+        一级匹配：使用ppm容差控制
+        二级匹配：使用绝对Da容差控制（fragment_tolerance_no_ppm）
+        """
         mode = precursor['mode']
         if mode == '正离子':
             sorted_idx = self.sorted_idx_pos
             mz_array = self.mz_values_pos
-            db_frags = self.db_frag_pos
         else:
             sorted_idx = self.sorted_idx_neg
             mz_array = self.mz_values_neg
-            db_frags = self.db_frag_neg
 
-        candidate_range = self._binary_search_range(mz_array, precursor['precursor_mz'], self.config['tolerance_ppm'])
+        # ========== 一级匹配：使用ppm容差 ==========
+        candidate_range = self._binary_search_range(
+            mz_array, 
+            precursor['precursor_mz'], 
+            self.config['tolerance_ppm']
+        )
 
         scored_candidates = []
         for idx in candidate_range:
-            mz_val, db_idx, ref_frags = sorted_idx[idx]
+            mz_val, db_idx, db_fragments_with_sources = sorted_idx[idx]
             if db_idx not in self.compound_info:
                 continue
 
             info = self.compound_info[db_idx]
             category = self._classify_compound(info['name_cn'] + ' ' + info['name_en'], info['compound_type'])
 
-            if self.tolerance_type == 'Da':
-                tolerance_value = self.config['fragment_tolerance']
-            else:
-                tolerance_value = self.config['fragment_tolerance_ppm']
-
-            matched_fragments = self._match_fragments_fast(
+            # ========== 二级匹配：使用绝对Da容差 ==========
+            # 使用 fragment_tolerance_no_ppm 进行二级匹配
+            tolerance_value = self.config['fragment_tolerance_no_ppm']
+            
+            matched_fragments, fragment_sources_map = self._match_fragments_with_sources(
                 precursor['fragments'],
-                ref_frags,
+                db_fragments_with_sources,
                 tolerance_value,
-                self.tolerance_type,
                 precursor['precursor_mz']
             )
+            
+            # 格式化碎片-文献映射
+            matched_fragments_str = format_fragment_sources(fragment_sources_map)
+            matched_fragments_list = list(fragment_sources_map.keys())
 
+            # 查找诊断离子
             diagnostic_ions, diag_weights = self._find_diagnostic_ions_fast(
-                matched_fragments,
+                matched_fragments_list,
                 category,
                 precursor['precursor_mz']
             )
 
+            # 中性丢失匹配
             neutral_loss_matches = 0
             if db_idx in self.neutral_losses:
                 expected_losses = self.neutral_losses[db_idx]
@@ -1054,6 +1133,14 @@ class UltimateGardeniaIdentifier:
             if self.use_rt_score and db_idx in self.rt_values and precursor['retention_time'] is not None:
                 rt_deviation = abs(precursor['retention_time'] - self.rt_values[db_idx])
 
+            # 合并所有文献来源（用于兼容旧格式）
+            all_sources = set()
+            for sources in fragment_sources_map.values():
+                for s in sources:
+                    if s:
+                        all_sources.add(s)
+            source_display = '; '.join(sorted(all_sources)) if all_sources else info['source']
+
             candidate = {
                 'name_cn': info['name_cn'],
                 'name_en': info['name_en'],
@@ -1065,16 +1152,18 @@ class UltimateGardeniaIdentifier:
                 'theoretical_mz': theoretical_mz,
                 'ppm': ppm,
                 'adduct': info['adduct_pos'] if mode == '正离子' else info['adduct_neg'],
-                'matched_fragments': matched_fragments,
+                'matched_fragments': matched_fragments_list,
+                'matched_fragments_str': matched_fragments_str,  # 新增：带文献映射的碎片字符串
                 'diagnostic_ions': diagnostic_ions,
                 'diag_weights': diag_weights,
                 'mode': mode,
-                'source': info['source'],
+                'source': source_display,
                 'category': category,
                 'db_index': db_idx,
                 'neutral_loss_matches': neutral_loss_matches,
                 'rt_deviation': rt_deviation,
-                'db_source': info.get('db_source', 'main')
+                'db_source': info.get('db_source', 'main'),
+                'fragment_sources_map': fragment_sources_map  # 保存映射关系
             }
 
             candidate['temp_score'] = -ppm
@@ -1130,18 +1219,16 @@ class UltimateGardeniaIdentifier:
             formula = best_candidate['formula'] if best_candidate['formula'] and best_candidate['formula'] != 'nan' else '待确定'
             en_name = best_candidate['name_en'] if best_candidate['name_en'] and best_candidate['name_en'] != 'nan' else ''
 
-            source_str = best_candidate.get('source', '')
-            if pd.notna(source_str) and source_str:
-                source_list = [s.strip() for s in str(source_str).split(';') if s.strip()]
-                source_count = len(source_list)
-                source_display = '; '.join(source_list)
-            else:
-                source_count = 0
-                source_display = ''
+            source_display = best_candidate['source']
 
             matched_frags = best_candidate['matched_fragments']
             diag_ions = best_candidate['diagnostic_ions']
             diag_weights = best_candidate['diag_weights']
+            
+            # 使用带文献映射的碎片字符串
+            matched_fragments_display = best_candidate.get('matched_fragments_str', '')
+            if not matched_fragments_display:
+                matched_fragments_display = '; '.join([f'{f:.4f}' for f in matched_frags]) if matched_frags else ''
 
             adduct = best_candidate['adduct']
             if pd.isna(adduct) or adduct == 'nan' or adduct == '':
@@ -1185,11 +1272,10 @@ class UltimateGardeniaIdentifier:
                 'm/z理论值': round(best_candidate['theoretical_mz'], 4),
                 'ppm': round(best_candidate['ppm'], 4),
                 '是否有碎片数据': '是' if precursor['fragments'].size > 0 else '否',
-                '主要碎片离子': '; '.join([f'{f:.4f}' for f in matched_frags]) if matched_frags else '',
+                '主要碎片离子(文献映射)': matched_fragments_display,  # 使用带文献映射的格式
                 '匹配碎片数': len(matched_frags),
                 '诊断性离子个数': len(diag_ions),
                 '诊断性离子': '; '.join([f'{f:.4f}' for f in diag_ions]) if diag_ions else '',
-                '文献来源数': source_count,
                 '文献来源': source_display,
                 '评级': lvl_id,
                 '评级名称': lvl_name,
@@ -1198,8 +1284,7 @@ class UltimateGardeniaIdentifier:
                 '基础得分': base_score,
                 '综合得分': base_score,
                 '_merge_key': merge_key,
-                '_fragments_set': set(matched_frags),
-                '_db_source': best_candidate.get('db_source', 'main')
+                '_fragments_set': set(matched_frags)
             }
 
             if merge_key not in herbs_collection:
@@ -1251,8 +1336,6 @@ class UltimateGardeniaIdentifier:
                     rec = comp_recs[0].copy()
                     del rec['_merge_key']
                     del rec['_fragments_set']
-                    if '_db_source' in rec:
-                        del rec['_db_source']
                     if '基础得分' in rec:
                         del rec['基础得分']
                     fused_records.append(rec)
@@ -1261,17 +1344,17 @@ class UltimateGardeniaIdentifier:
                     adducts = set()
                     modes = set()
                     db_sources = set()
+                    all_frag_sets = []
                     for rec in comp_recs:
                         if rec['加和离子']:
                             adducts.add(rec['加和离子'])
                         if rec['离子化方式']:
                             modes.add(rec['离子化方式'])
-                        if '_db_source' in rec:
-                            db_sources.add(rec['_db_source'])
+                        all_frag_sets.append(rec['_fragments_set'])
+                    
                     best_rec['加和离子'] = '; '.join(sorted(adducts))
                     best_rec['离子化方式'] = '/'.join(sorted(modes))
 
-                    all_frag_sets = [rec['_fragments_set'] for rec in comp_recs]
                     similarities = []
                     for a in range(len(all_frag_sets)):
                         for b in range(a+1, len(all_frag_sets)):
@@ -1316,8 +1399,6 @@ class UltimateGardeniaIdentifier:
 
                     del best_rec['_merge_key']
                     del best_rec['_fragments_set']
-                    if '_db_source' in best_rec:
-                        del best_rec['_db_source']
                     if '基础得分' in best_rec:
                         del best_rec['基础得分']
                     fused_records.append(best_rec)
@@ -1383,7 +1464,7 @@ class UltimateGardeniaIdentifier:
 
     def _print_initialization_info(self):
         print("\n" + "="*80)
-        print("程序初始化完成（v5.12，支持英文数据库 + 碎片多值映射）")
+        print("程序初始化完成（v5.13，文献-碎片详细映射）")
         print("="*80)
         print(f"  - 数据库记录数: {len(self.database)} 条（含英文数据库）")
         print(f"  - 正离子索引: {len(self.mz_values_pos)} 条")
@@ -1391,21 +1472,22 @@ class UltimateGardeniaIdentifier:
         print(f"  - 诊断性离子库: {len(self.diagnostic_ions)} 类")
         print(f"  - 保留时间数据: {len(self.rt_values)} 条")
         print(f"  - 中性丢失数据: {len(self.neutral_losses)} 条")
-        print(f"  - 容差类型: {self.tolerance_type}")
+        print(f"  - 一级匹配ppm容差: {self.config['tolerance_ppm']} ppm")
+        print(f"  - 二级匹配绝对Da容差: {self.config['fragment_tolerance_no_ppm']} Da")
         print(f"  - 强度相对阈值: {self.intensity_relative_threshold*100:.1f}%")
         print(f"  - RT得分: {'启用' if self.use_rt_score else '禁用'}")
         print(f"  - 并行处理: {'启用' if self.use_parallel else '禁用'}")
-        print(f"  - 碎片多值映射: 启用（支持分号、逗号、空格、顿号分隔）")
+        print(f"  - 文献-碎片映射: 启用（格式: m/z(文献1,文献2)）")
         print("="*80)
 
 
 # ============================================================================
-# Streamlit 网页应用部分 - 优化版界面
+# Streamlit 网页应用部分
 # ============================================================================
 
 # 设置页面配置
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v5.12",
+    page_title="中药化合物智能鉴定平台 v5.13",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1413,392 +1495,45 @@ st.set_page_config(
 
 
 def load_optimized_css():
-    """加载优化后的CSS样式 - 现代卡片式设计"""
+    """加载优化后的CSS样式"""
     st.markdown("""
     <style>
-        /* ========== 基础样式重置 ========== */
         @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap');
-
-        * {
-            font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif !important;
-        }
-
-        /* ========== 全局背景和主题 ========== */
-        .stApp {
-            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f1f5f9 100%);
-            min-height: 100vh;
-        }
-
-        /* ========== 主标题区域 - 增强设计 ========== */
-        .main-header {
-            background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%);
-            padding: 2.5rem 2rem;
-            border-radius: 20px;
-            margin-bottom: 2rem;
-            color: white;
-            box-shadow: 0 20px 40px rgba(5, 150, 105, 0.3);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .main-header::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            right: -50%;
-            width: 100%;
-            height: 200%;
-            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
-            animation: pulse 3s ease-in-out infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); opacity: 0.5; }
-            50% { transform: scale(1.1); opacity: 0.8; }
-        }
-
-        .main-header h1 {
-            color: white !important;
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin: 0;
-            position: relative;
-            z-index: 1;
-        }
-
-        .main-header p {
-            color: rgba(255,255,255,0.9);
-            font-size: 1.1rem;
-            margin-top: 0.5rem;
-            position: relative;
-            z-index: 1;
-        }
-
-        /* ========== 统计卡片 - 玻璃态设计 ========== */
-        .stat-card {
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(10px);
-            border-radius: 16px;
-            padding: 1.5rem;
-            text-align: center;
-            margin: 0.5rem;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.5);
-            transition: all 0.3s ease;
-        }
-
-        .stat-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 8px 30px rgba(5, 150, 105, 0.2);
-        }
-
-        .stat-number {
-            font-size: 2.5rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, #059669, #0891b2);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .stat-label {
-            font-size: 0.95rem;
-            color: #64748b;
-            margin-top: 0.5rem;
-            font-weight: 500;
-        }
-
-        /* ========== 功能卡片 - 现代卡片设计 ========== */
-        .feature-card {
-            background: white;
-            border-radius: 16px;
-            padding: 2rem;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
-            margin-bottom: 1.5rem;
-            border-left: 5px solid;
-            border-image: linear-gradient(to bottom, #059669, #0891b2) 1;
-            transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .feature-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 3px;
-            background: linear-gradient(90deg, #059669, #0891b2, #7c3aed);
-            opacity: 0;
-            transition: opacity 0.3s ease;
-        }
-
-        .feature-card:hover::before {
-            opacity: 1;
-        }
-
-        .feature-card:hover {
-            transform: translateX(5px);
-            box-shadow: 0 8px 30px rgba(5, 150, 105, 0.15);
-        }
-
-        .feature-card h4 {
-            color: #1e293b;
-            font-size: 1.25rem;
-            font-weight: 600;
-            margin-bottom: 0.75rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .feature-card p {
-            color: #64748b;
-            font-size: 0.95rem;
-            line-height: 1.6;
-            margin: 0;
-        }
-
-        /* ========== 登录框 - 现代化设计 ========== */
-        .login-container {
-            max-width: 450px;
-            margin: 80px auto;
-            padding: 3rem;
-            background: white;
-            border-radius: 24px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .login-container::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 5px;
-            background: linear-gradient(90deg, #059669, #0891b2, #7c3aed);
-        }
-
-        .login-title {
-            text-align: center;
-            font-size: 1.75rem;
-            font-weight: 700;
-            margin-bottom: 2rem;
-            background: linear-gradient(135deg, #059669, #0891b2);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        /* ========== 侧边栏增强 ========== */
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
-            border-right: 1px solid #e2e8f0;
-        }
-
-        [data-testid="stSidebarNav"] {
-            padding: 1rem 0;
-        }
-
-        /* ========== 按钮样式 - 渐变和动画 ========== */
-        .stButton > button {
-            background: linear-gradient(135deg, #059669 0%, #0891b2 100%);
-            color: white;
-            border: none;
-            border-radius: 12px;
-            padding: 0.75rem 1.5rem;
-            font-weight: 600;
-            font-size: 1rem;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(5, 150, 105, 0.3);
-        }
-
-        .stButton > button:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 8px 25px rgba(5, 150, 105, 0.4);
-        }
-
-        .stButton > button:active {
-            transform: translateY(-1px);
-        }
-
-        /* ========== 主要按钮 ========== */
-        .stButton > button[kind="primary"] {
-            background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%);
-        }
-
-        /* ========== 进度条 ========== */
-        .stProgress > div > div {
-            background: linear-gradient(90deg, #059669, #0891b2, #7c3aed);
-            border-radius: 10px;
-        }
-
-        /* ========== 文件上传区域 ========== */
-        [data-testid="stFileUploader"] {
-            border: 2px dashed #cbd5e1;
-            border-radius: 16px;
-            padding: 2rem;
-            background: rgba(5, 150, 105, 0.02);
-            transition: all 0.3s ease;
-        }
-
-        [data-testid="stFileUploader"]:hover {
-            border-color: #059669;
-            background: rgba(5, 150, 105, 0.05);
-        }
-
-        /* ========== 表格样式 ========== */
-        .dataframe {
-            font-size: 0.9rem;
-            border-radius: 12px;
-            overflow: hidden;
-        }
-
-        /* ========== 指标卡片 ========== */
-        [data-testid="stMetricValue"] {
-            font-size: 2rem !important;
-            font-weight: 700;
-            background: linear-gradient(135deg, #059669, #0891b2);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        /* ========== 评级标签颜色 ========== */
-        .level-1 { background: linear-gradient(135deg, #10b981, #059669); }
-        .level-2 { background: linear-gradient(135deg, #06b6d4, #0891b2); }
-        .level-3 { background: linear-gradient(135deg, #f59e0b, #d97706); }
-        .level-4 { background: linear-gradient(135deg, #f97316, #ea580c); }
-        .level-5 { background: linear-gradient(135deg, #6b7280, #4b5563); }
-
-        /* ========== 信息框增强 ========== */
-        .stAlert {
-            border-radius: 12px;
-            border-left: 4px solid;
-        }
-
-        /* ========== 分隔线 ========== */
-        hr {
-            border: none;
-            height: 2px;
-            background: linear-gradient(90deg, transparent, #e2e8f0, transparent);
-            margin: 2rem 0;
-        }
-
-        /* ========== 标题样式 ========== */
-        h1, h2, h3 {
-            color: #1e293b !important;
-            font-weight: 600 !important;
-        }
-
-        h2 {
-            font-size: 1.75rem;
-            margin-bottom: 1rem;
-        }
-
-        /* ========== 响应式调整 ========== */
-        @media (max-width: 768px) {
-            .main-header {
-                padding: 1.5rem 1rem;
-                border-radius: 16px;
-            }
-
-            .main-header h1 {
-                font-size: 1.75rem;
-            }
-
-            .stat-card {
-                padding: 1rem;
-                margin: 0.25rem;
-            }
-
-            .stat-number {
-                font-size: 2rem;
-            }
-        }
-
-        /* ========== 加载动画 ========== */
-        .loading-spinner {
-            display: inline-block;
-            width: 50px;
-            height: 50px;
-            border: 3px solid rgba(5, 150, 105, 0.2);
-            border-radius: 50%;
-            border-top-color: #059669;
-            animation: spin 1s ease-in-out infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        /* ========== 成功/警告/错误消息增强 ========== */
-        .success-box {
-            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
-            border-left: 4px solid #059669;
-            border-radius: 12px;
-            padding: 1rem;
-        }
-
-        .warning-box {
-            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
-            border-left: 4px solid #f59e0b;
-            border-radius: 12px;
-            padding: 1rem;
-        }
-
-        /* ========== 空状态设计 ========== */
-        .empty-state {
-            text-align: center;
-            padding: 3rem;
-            color: #94a3b8;
-        }
-
-        .empty-state svg {
-            width: 80px;
-            height: 80px;
-            margin-bottom: 1rem;
-            opacity: 0.5;
-        }
-
-        /* ========== 工具提示 ========== */
-        .tooltip {
-            position: relative;
-            display: inline-block;
-        }
-
-        .tooltip .tooltiptext {
-            visibility: hidden;
-            background-color: #1e293b;
-            color: white;
-            text-align: center;
-            padding: 8px 12px;
-            border-radius: 6px;
-            position: absolute;
-            z-index: 1;
-            bottom: 125%;
-            left: 50%;
-            transform: translateX(-50%);
-            opacity: 0;
-            transition: opacity 0.3s;
-        }
-
-        .tooltip:hover .tooltiptext {
-            visibility: visible;
-            opacity: 1;
-        }
-        
-        /* ========== 数据库信息卡片 ========== */
-        .db-info-card {
-            background: #ecfdf5;
-            border-radius: 12px;
-            padding: 1rem;
-            margin: 1rem 0;
-            border-left: 4px solid #059669;
-        }
+        * { font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif !important; }
+        .stApp { background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #f1f5f9 100%); min-height: 100vh; }
+        .main-header { background: linear-gradient(135deg, #059669 0%, #0891b2 50%, #7c3aed 100%); padding: 2.5rem 2rem; border-radius: 20px; margin-bottom: 2rem; color: white; box-shadow: 0 20px 40px rgba(5,150,105,0.3); position: relative; overflow: hidden; }
+        .main-header::before { content: ''; position: absolute; top: -50%; right: -50%; width: 100%; height: 200%; background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%); animation: pulse 3s ease-in-out infinite; }
+        @keyframes pulse { 0%, 100% { transform: scale(1); opacity: 0.5; } 50% { transform: scale(1.1); opacity: 0.8; } }
+        .main-header h1 { color: white !important; font-size: 2.5rem; font-weight: 700; margin: 0; position: relative; z-index: 1; }
+        .main-header p { color: rgba(255,255,255,0.9); font-size: 1.1rem; margin-top: 0.5rem; position: relative; z-index: 1; }
+        .stat-card { background: rgba(255,255,255,0.95); backdrop-filter: blur(10px); border-radius: 16px; padding: 1.5rem; text-align: center; margin: 0.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.08); border: 1px solid rgba(255,255,255,0.5); transition: all 0.3s ease; }
+        .stat-card:hover { transform: translateY(-5px); box-shadow: 0 8px 30px rgba(5,150,105,0.2); }
+        .stat-number { font-size: 2.5rem; font-weight: 700; background: linear-gradient(135deg, #059669, #0891b2); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .stat-label { font-size: 0.95rem; color: #64748b; margin-top: 0.5rem; font-weight: 500; }
+        .feature-card { background: white; border-radius: 16px; padding: 2rem; box-shadow: 0 4px 20px rgba(0,0,0,0.08); margin-bottom: 1.5rem; border-left: 5px solid; transition: all 0.3s ease; position: relative; overflow: hidden; }
+        .feature-card:hover { transform: translateX(5px); box-shadow: 0 8px 30px rgba(5,150,105,0.15); }
+        .feature-card h4 { color: #1e293b; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem; }
+        .feature-card p { color: #64748b; font-size: 0.95rem; line-height: 1.6; margin: 0; }
+        [data-testid="stSidebar"] { background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%); border-right: 1px solid #e2e8f0; }
+        .stButton > button { background: linear-gradient(135deg, #059669 0%, #0891b2 100%); color: white; border: none; border-radius: 12px; padding: 0.75rem 1.5rem; font-weight: 600; font-size: 1rem; transition: all 0.3s ease; box-shadow: 0 4px 15px rgba(5,150,105,0.3); }
+        .stButton > button:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(5,150,105,0.4); }
+        .stProgress > div > div { background: linear-gradient(90deg, #059669, #0891b2, #7c3aed); border-radius: 10px; }
+        [data-testid="stFileUploader"] { border: 2px dashed #cbd5e1; border-radius: 16px; padding: 2rem; background: rgba(5,150,105,0.02); transition: all 0.3s ease; }
+        [data-testid="stFileUploader"]:hover { border-color: #059669; background: rgba(5,150,105,0.05); }
+        .dataframe { font-size: 0.9rem; border-radius: 12px; overflow: hidden; }
+        [data-testid="stMetricValue"] { font-size: 2rem !important; font-weight: 700; background: linear-gradient(135deg, #059669, #0891b2); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .level-1, .level-2, .level-3, .level-4, .level-5 { border-radius: 4px; padding: 2px 6px; font-size: 0.8rem; font-weight: 500; display: inline-block; }
+        .level-1 { background: linear-gradient(135deg, #10b981, #059669); color: white; }
+        .level-2 { background: linear-gradient(135deg, #06b6d4, #0891b2); color: white; }
+        .level-3 { background: linear-gradient(135deg, #f59e0b, #d97706); color: white; }
+        .level-4 { background: linear-gradient(135deg, #f97316, #ea580c); color: white; }
+        .level-5 { background: linear-gradient(135deg, #6b7280, #4b5563); color: white; }
+        hr { border: none; height: 2px; background: linear-gradient(90deg, transparent, #e2e8f0, transparent); margin: 2rem 0; }
+        h1, h2, h3 { color: #1e293b !important; font-weight: 600 !important; }
+        h2 { font-size: 1.75rem; margin-bottom: 1rem; }
+        @media (max-width: 768px) { .main-header { padding: 1.5rem 1rem; border-radius: 16px; } .main-header h1 { font-size: 1.75rem; } .stat-card { padding: 1rem; margin: 0.25rem; } .stat-number { font-size: 2rem; } }
+        .empty-state { text-align: center; padding: 3rem; color: #94a3b8; }
+        .db-info-card { background: #ecfdf5; border-radius: 12px; padding: 1rem; margin: 1rem 0; border-left: 4px solid #059669; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1824,17 +1559,8 @@ def login_page():
     """, unsafe_allow_html=True)
 
     with st.form("login_form"):
-        username = st.text_input(
-            "用户名",
-            placeholder="请输入用户名",
-            help="默认用户名: ZY"
-        )
-        password = st.text_input(
-            "密码",
-            type="password",
-            placeholder="请输入密码",
-            help="默认密码: 513513"
-        )
+        username = st.text_input("用户名", placeholder="请输入用户名", help="默认用户名: ZY")
+        password = st.text_input("密码", type="password", placeholder="请输入密码", help="默认密码: 513513")
         submitted = st.form_submit_button("登录", use_container_width=True)
 
         if submitted:
@@ -1849,15 +1575,14 @@ def login_page():
 
     st.markdown("""
         <div style="margin-top: 2rem; color: #94a3b8; font-size: 0.85rem;">
-            <p>中药化合物智能鉴定平台 v5.12</p>
-            <p>支持主数据库 + 英文数据库联合鉴定 | 碎片多值映射</p>
+            <p>中药化合物智能鉴定平台 v5.13</p>
+            <p>支持主数据库 + 英文数据库联合鉴定 | 文献-碎片详细映射</p>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
 
 def logout_button():
-    """在侧边栏显示登出按钮"""
     if st.sidebar.button("🚪 登出", use_container_width=True):
         st.session_state.logged_in = False
         st.session_state.pop('username', None)
@@ -1865,29 +1590,22 @@ def logout_button():
 
 
 def create_header():
-    """创建优化后的应用头部"""
     username = st.session_state.get('username', 'Guest')
     st.markdown(f"""
     <div class="main-header">
         <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v5.12 支持英文数据库 + 碎片多值映射 | 欢迎回来，{username}</p>
+        <p>v5.13 文献-碎片详细映射 | 一级ppm/二级Da双容差控制 | 欢迎回来，{username}</p>
     </div>
     """, unsafe_allow_html=True)
 
 
 def create_sidebar():
-    """创建优化后的侧边栏"""
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1.5rem 0; border-bottom: 2px solid #e2e8f0;">
         <svg width="50" height="50" viewBox="0 0 60 60" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-bottom: 0.5rem;">
             <circle cx="30" cy="30" r="28" stroke="url(#grad2)" stroke-width="4" fill="none"/>
             <path d="M30 15C22 15 18 22 18 28C18 38 30 45 30 45C30 45 42 38 42 28C42 22 38 15 30 15Z" fill="url(#grad2)"/>
-            <defs>
-                <linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" style="stop-color:#059669"/>
-                    <stop offset="100%" style="stop-color:#0891b2"/>
-                </linearGradient>
-            </defs>
+            <defs><linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#059669"/><stop offset="100%" style="stop-color:#0891b2"/></linearGradient></defs>
         </svg>
         <h3 style="color: #1e293b; margin: 0.5rem 0; font-weight: 700;">TCM Identifier</h3>
         <p style="color: #64748b; font-size: 0.8rem; margin: 0;">中药化合物鉴定系统</p>
@@ -1907,35 +1625,28 @@ def create_sidebar():
     </div>
     """, unsafe_allow_html=True)
 
-    page = st.sidebar.radio(
-        "选择功能",
-        ["🏠 首页", "🔬 开始鉴定", "🧪 诊断离子筛查", "📖 使用指南", "🗃️ 数据库预览", "📊 结果分析"],
-        index=0
-    )
-
+    page = st.sidebar.radio("选择功能", ["🏠 首页", "🔬 开始鉴定", "🧪 诊断离子筛查", "📖 使用指南", "🗃️ 数据库预览", "📊 结果分析"], index=0)
     page = page.split(' ', 1)[1] if ' ' in page else page
 
     st.sidebar.markdown("---")
 
-    # 检查数据库状态
     english_db_exists = find_english_database_path() is not None
     
     st.sidebar.markdown(f"""
     <div style="background: white; border-radius: 12px; padding: 1rem; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
         <h4 style="color: #1e293b; margin: 0 0 0.75rem 0; font-size: 0.95rem;">📋 版本信息</h4>
         <ul style="color: #64748b; font-size: 0.85rem; padding-left: 1.2rem; margin: 0;">
-            <li>程序版本：v5.12</li>
+            <li>程序版本：v5.13</li>
             <li>主数据库：已加载</li>
             <li>英文数据库：{'✅ 已加载' if english_db_exists else '❌ 未找到'}</li>
-            <li>碎片多值映射：✅ 已启用</li>
-            <li>支持药材：291种</li>
-            <li>化合物类型：400+类</li>
+            <li>一级匹配：ppm控制</li>
+            <li>二级匹配：绝对Da容差</li>
+            <li>文献-碎片映射：✅ 已启用</li>
         </ul>
     </div>
     """, unsafe_allow_html=True)
 
     st.sidebar.markdown("---")
-
     st.sidebar.markdown("""
     <div style="text-align: center; color: #94a3b8; font-size: 0.7rem; padding: 1rem 0;">
         <p style="margin: 0;">© 2026 张永</p>
@@ -1947,7 +1658,6 @@ def create_sidebar():
 
 
 def show_home_page():
-    """优化后的首页"""
     create_header()
 
     st.markdown("## 📊 系统概览")
@@ -1955,14 +1665,9 @@ def show_home_page():
     english_db_exists = find_english_database_path() is not None
     
     cols = st.columns(5 if english_db_exists else 4)
-    stats_data = [
-        ("35,828", "主数据库记录数", "📚"),
-        ("291", "支持药材种类", "🌱"),
-        ("6", "鉴定评级级别", "⭐"),
-        ("400+", "化合物类型", "🧪")
-    ]
+    stats_data = [("35,828+", "数据库总记录数", "📚"), ("291", "支持药材种类", "🌱"), ("6", "鉴定评级级别", "⭐"), ("400+", "化合物类型", "🧪")]
     if english_db_exists:
-        stats_data.insert(1, ("英文数据库", "补充数据库", "🌍"))
+        stats_data.insert(1, ("英文库", "补充数据库", "🌍"))
 
     for col, (number, label, icon) in zip(cols, stats_data):
         with col:
@@ -1975,9 +1680,9 @@ def show_home_page():
             """, unsafe_allow_html=True)
 
     if english_db_exists:
-        st.info("🌍 英文数据库（数据库（英文）.xlsx）已加载，将作为补充数据库参与化合物鉴定")
+        st.info("🌍 英文数据库已加载，将作为补充数据库参与化合物鉴定")
     else:
-        st.warning("⚠️ 英文数据库（数据库（英文）.xlsx）未找到，仅使用主数据库进行鉴定")
+        st.warning("⚠️ 英文数据库未找到，仅使用主数据库进行鉴定")
 
     st.markdown("---")
     st.markdown("## ✨ 核心功能")
@@ -1985,15 +1690,15 @@ def show_home_page():
     col1, col2 = st.columns(2)
 
     features_left = [
-        ("🔍", "智能化合物鉴定", "基于高分辨质谱数据，在主数据库和英文数据库中进行精准匹配，支持正负离子模式。"),
+        ("🔍", "双层次匹配", "一级匹配（准分子离子）：ppm容差控制；二级匹配（碎片离子）：绝对Da容差控制，可独立调整。"),
         ("📈", "六级评级标准", "确证级、高置信级、推定级、提示级、参考级、排除级，科学评估鉴定结果可靠性。"),
-        ("🧪", "外部诊断离子", "支持上传自定义诊断离子文件，自动去重合并权重，避免重复。")
+        ("🧪", "文献-碎片映射", "支持碎片对应多篇文献，输出格式：139.05(文献1,文献2); 134.03(文献1,文献3)")
     ]
 
     features_right = [
         ("⚡", "综合评分系统", "基础分+ppm调整+碎片加分+诊断离子加分+中性丢失+RT得分+多加和离子融合。"),
         ("🌱", "药材来源合并", "同一化合物的所有药材来源自动合并显示，实现“所有的药材”。"),
-        ("📁", "碎片多值映射", "碎片离子列支持分号、逗号、空格、顿号等多值分隔，实现一篇文献映射多个碎片。")
+        ("📁", "双数据库支持", "自动加载主数据库和英文数据库，扩大化合物覆盖范围，提高鉴定命中率。")
     ]
 
     with col1:
@@ -2022,11 +1727,11 @@ def show_home_page():
         <h3 style="color: #059669; margin-top: 0;">使用步骤</h3>
         <ol style="color: #1e293b; line-height: 2; font-size: 1.05rem;">
             <li><strong>准备数据</strong>：准备好质谱数据文件（Excel格式）和数据库文件</li>
-            <li><strong>自动加载数据库</strong>：系统自动加载主数据库（TCM-SM-MS DB.xlsx）和英文数据库（数据库（英文）.xlsx）</li>
+            <li><strong>自动加载数据库</strong>：系统自动加载主数据库和英文数据库</li>
             <li><strong>上传文件</strong>：在"开始鉴定"页面上传正离子和/或负离子质谱数据</li>
-            <li><strong>配置参数</strong>：设置ppm容差、保留时间容差等参数</li>
+            <li><strong>配置参数</strong>：设置一级ppm容差、二级绝对Da容差等参数</li>
             <li><strong>运行鉴定</strong>：点击"开始鉴定"按钮进行分析</li>
-            <li><strong>查看结果</strong>：在"结果分析"页面查看和导出鉴定报告</li>
+            <li><strong>查看结果</strong>：在"结果分析"页面查看带文献映射的鉴定报告</li>
         </ol>
     </div>
     """, unsafe_allow_html=True)
@@ -2037,7 +1742,7 @@ def show_home_page():
 
 
 def show_analysis_page():
-    """鉴定分析页面（集成新参数）- 优化版"""
+    """鉴定分析页面"""
     create_header()
 
     st.markdown("## 📁 上传质谱数据")
@@ -2045,21 +1750,11 @@ def show_analysis_page():
 
     col1, col2 = st.columns(2)
     with col1:
-        ms_positive_file = st.file_uploader(
-            "上传正离子模式质谱数据 (.xlsx，可选)",
-            type=['xlsx'],
-            key='ms_positive',
-            help="支持Excel格式的质谱数据文件"
-        )
+        ms_positive_file = st.file_uploader("上传正离子模式质谱数据 (.xlsx，可选)", type=['xlsx'], key='ms_positive')
         if ms_positive_file:
             st.success(f"✅ 已上传: {ms_positive_file.name}")
     with col2:
-        ms_negative_file = st.file_uploader(
-            "上传负离子模式质谱数据 (.xlsx，可选)",
-            type=['xlsx'],
-            key='ms_negative',
-            help="支持Excel格式的质谱数据文件"
-        )
+        ms_negative_file = st.file_uploader("上传负离子模式质谱数据 (.xlsx，可选)", type=['xlsx'], key='ms_negative')
         if ms_negative_file:
             st.success(f"✅ 已上传: {ms_negative_file.name}")
 
@@ -2073,27 +1768,17 @@ def show_analysis_page():
     st.markdown("---")
     st.markdown("## 🧪 外部诊断离子（可选）")
 
-    diagnostic_file = st.file_uploader(
-        "上传自定义诊断离子文件 (.xlsx，可包含权重列)",
-        type=['xlsx'],
-        key='diagnostic',
-        help="若不上传，将自动加载项目目录下的诊断离子.xlsx"
-    )
+    diagnostic_file = st.file_uploader("上传自定义诊断离子文件 (.xlsx，可包含权重列)", type=['xlsx'], key='diagnostic')
     if diagnostic_file:
         st.success(f"✅ 已上传诊断离子文件: {diagnostic_file.name}")
 
     st.markdown("---")
     st.markdown("## 📚 自定义数据库（可选）")
 
-    custom_db_file = st.file_uploader(
-        "上传自定义数据库 (.xlsx，需与主数据库列一致)",
-        type=['xlsx'],
-        key='custom_db'
-    )
+    custom_db_file = st.file_uploader("上传自定义数据库 (.xlsx，需与主数据库列一致)", type=['xlsx'], key='custom_db')
     if custom_db_file:
         st.success(f"✅ 已上传自定义数据库: {custom_db_file.name}")
 
-    # 显示数据库状态
     st.markdown("---")
     st.markdown("## 🌍 数据库状态")
     
@@ -2105,38 +1790,33 @@ def show_analysis_page():
         except Exception as e:
             st.warning(f"⚠️ 英文数据库文件存在但读取失败: {e}")
     else:
-        st.info("ℹ️ 未找到英文数据库文件（数据库（英文）.xlsx），将仅使用主数据库进行鉴定。如需使用，请将文件放在项目目录下。")
+        st.info("ℹ️ 未找到英文数据库文件，将仅使用主数据库进行鉴定")
     
-    st.info("💡 碎片多值映射：碎片离子列支持分号(;)、逗号(,)、顿号(、)、空格分隔多个碎片值")
+    st.info("💡 文献-碎片映射：碎片离子列支持分号(;)、逗号(,)、顿号(、)、空格分隔，输出格式: 139.05(文献1,文献2); 134.03(文献1,文献3)")
 
     st.markdown("---")
     st.markdown("## ⚙️ 鉴定参数配置")
 
-    preset = st.radio(
-        "参数预设",
-        options=["自定义", "快速模式", "高精度模式"],
-        horizontal=True,
-        help="选择预设可以快速配置常用参数"
-    )
+    preset = st.radio("参数预设", options=["自定义", "快速模式", "高精度模式"], horizontal=True)
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        tolerance_ppm = st.number_input("ppm误差容限", min_value=10, max_value=100, value=50)
+        tolerance_ppm = st.number_input("一级ppm误差容限", min_value=10, max_value=100, value=50, help="准分子离子匹配使用ppm容差")
     with col2:
-        max_candidates = st.number_input("最大候选数", min_value=1, max_value=10, value=3)
+        fragment_tolerance_no_ppm = st.number_input("二级绝对Da容差", min_value=0.01, max_value=1.0, value=0.1, step=0.01, help="碎片离子匹配使用绝对Da容差")
     with col3:
-        min_intensity_abs = st.number_input("最小绝对强度", min_value=0, value=100)
+        max_candidates = st.number_input("最大候选数", min_value=1, max_value=10, value=3)
     with col4:
         use_parallel = st.checkbox("启用多进程并行", value=True)
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        tolerance_type = st.selectbox("碎片匹配容差类型", options=["Da", "ppm"], index=0)
+        tolerance_type = st.selectbox("诊断离子容差类型", options=["Da", "ppm"], index=0)
         if tolerance_type == "Da":
-            fragment_tolerance = st.number_input("碎片匹配容差 (Da)", min_value=0.01, max_value=1.0, value=0.05, step=0.01)
+            fragment_tolerance = st.number_input("诊断离子容差 (Da)", min_value=0.01, max_value=1.0, value=0.05, step=0.01)
             fragment_tolerance_ppm = 20
         else:
-            fragment_tolerance_ppm = st.number_input("碎片匹配容差 (ppm)", min_value=1, max_value=100, value=20, step=1)
+            fragment_tolerance_ppm = st.number_input("诊断离子容差 (ppm)", min_value=1, max_value=100, value=20, step=1)
             fragment_tolerance = 0.05
     with col2:
         rt_tolerance = st.number_input("保留时间容差 (min)", min_value=0.1, max_value=2.0, value=0.3, step=0.1)
@@ -2159,24 +1839,23 @@ def show_analysis_page():
 
     if preset == "快速模式":
         tolerance_ppm = 50
+        fragment_tolerance_no_ppm = 0.1
         fragment_tolerance = 0.05
-        fragment_tolerance_ppm = 20
         min_intensity_abs = 100
         intensity_rel_threshold = 1.0
-        tolerance_type = "Da"
     elif preset == "高精度模式":
         tolerance_ppm = 10
+        fragment_tolerance_no_ppm = 0.02
         fragment_tolerance = 0.02
-        fragment_tolerance_ppm = 5
         min_intensity_abs = 50
         intensity_rel_threshold = 0.5
-        tolerance_type = "ppm"
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("💾 保存当前参数为默认", use_container_width=True):
+        if st.button("💾 保存当前参数", use_container_width=True):
             st.session_state['saved_params'] = {
                 'tolerance_ppm': tolerance_ppm,
+                'fragment_tolerance_no_ppm': fragment_tolerance_no_ppm,
                 'fragment_tolerance': fragment_tolerance,
                 'fragment_tolerance_ppm': fragment_tolerance_ppm,
                 'tolerance_type': tolerance_type,
@@ -2188,11 +1867,11 @@ def show_analysis_page():
                 'cache_index': cache_index,
             }
             st.success("参数已保存")
-
     with col2:
         if 'saved_params' in st.session_state and st.button("🔄 加载已保存参数", use_container_width=True):
             params = st.session_state['saved_params']
             tolerance_ppm = params['tolerance_ppm']
+            fragment_tolerance_no_ppm = params['fragment_tolerance_no_ppm']
             fragment_tolerance = params['fragment_tolerance']
             fragment_tolerance_ppm = params['fragment_tolerance_ppm']
             tolerance_type = params['tolerance_type']
@@ -2256,6 +1935,7 @@ def show_analysis_page():
                         'min_intensity': min_intensity_abs,
                         'fragment_tolerance': fragment_tolerance,
                         'fragment_tolerance_ppm': fragment_tolerance_ppm,
+                        'fragment_tolerance_no_ppm': fragment_tolerance_no_ppm,
                         'tolerance_ppm': tolerance_ppm,
                         'max_candidates': max_candidates,
                     }
@@ -2276,7 +1956,8 @@ def show_analysis_page():
                         use_rt_score=use_rt_score,
                         custom_db_path=custom_db_path,
                         cache_index=cache_index,
-                        english_db_path=english_db_path
+                        english_db_path=english_db_path,
+                        fragment_tolerance_no_ppm=fragment_tolerance_no_ppm
                     )
 
                     status_text.text("【7/9】正在处理质谱数据...")
@@ -2315,11 +1996,11 @@ def show_analysis_page():
 
 
 def show_diagnostic_ion_page():
-    """诊断离子筛查页面 - 优化版"""
+    """诊断离子筛查页面"""
     create_header()
 
     st.markdown("## 🔬 诊断离子筛查")
-    st.markdown("根据输入的m/z值，在诊断离子数据库中查找匹配的化合物特征离子，帮助快速识别化合物类别。")
+    st.markdown("根据输入的m/z值，在诊断离子数据库中查找匹配的化合物特征离子")
 
     diagnostic_df = load_diagnostic_ions_cached()
 
@@ -2353,11 +2034,7 @@ def show_diagnostic_ion_page():
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        mz_input = st.text_area(
-            "输入m/z值（每行一个值，或用逗号分隔）",
-            placeholder="例如：\n151.003\n137.024, 121.029",
-            height=150
-        )
+        mz_input = st.text_area("输入m/z值（每行一个值，或用逗号分隔）", placeholder="例如：\n151.003\n137.024, 121.029", height=150)
     with col2:
         st.markdown("#### 参数设置")
         tolerance_ppm = st.number_input("ppm容差", min_value=1, max_value=100, value=10)
@@ -2427,83 +2104,52 @@ def show_diagnostic_ion_page():
 
 
 def show_guide_page():
-    """使用指南页面 - 优化版"""
+    """使用指南页面"""
     create_header()
-    st.markdown("## 📖 使用指南（v5.12 支持英文数据库 + 碎片多值映射）")
+    st.markdown("## 📖 使用指南（v5.13 文献-碎片详细映射）")
 
     st.markdown("""
     <div style="background: white; border-radius: 16px; padding: 2rem; box-shadow: 0 4px 20px rgba(0,0,0,0.08);">
-        <h3 style="color: #1e293b; margin-top: 0;">📊 综合评分规则</h3>
+        <h3 style="color: #1e293b; margin-top: 0;">🎯 匹配策略</h3>
+        <div style="background: #f1f5f9; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
+            <p><strong>一级匹配（准分子离子）</strong>：使用ppm容差控制，筛选候选化合物</p>
+            <p><strong>二级匹配（碎片离子）</strong>：使用绝对Da容差控制，在一级匹配结果中进行碎片比对</p>
+            <p><strong>文献-碎片映射</strong>：每个碎片自动绑定其来源文献，输出格式 <code>139.05(文献1,文献2); 134.03(文献1,文献3)</code></p>
+        </div>
 
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin-top: 1.5rem;">
+        <h3 style="color: #1e293b; margin-top: 2rem;">📊 综合评分规则</h3>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem;">
             <div style="background: #f8fafc; padding: 1rem; border-radius: 12px;">
                 <h4 style="color: #059669; margin: 0 0 0.75rem 0;">基础分</h4>
-                <ul style="margin: 0; padding-left: 1.2rem; color: #64748b;">
-                    <li>1级（确证级）：85分</li>
-                    <li>2级（高置信级）：65分</li>
-                    <li>3级（推定级）：45分</li>
-                    <li>4级（提示级）：25分</li>
-                    <li>5级（参考级）：0分</li>
-                </ul>
+                <ul><li>1级（确证级）：85分</li><li>2级（高置信级）：65分</li><li>3级（推定级）：45分</li><li>4级（提示级）：25分</li><li>5级（参考级）：0分</li></ul>
             </div>
-
             <div style="background: #f8fafc; padding: 1rem; border-radius: 12px;">
                 <h4 style="color: #0891b2; margin: 0 0 0.75rem 0;">ppm调整</h4>
-                <ul style="margin: 0; padding-left: 1.2rem; color: #64748b;">
-                    <li>≤5ppm：+5分</li>
-                    <li>5-10ppm：0分</li>
-                    <li>10-20ppm：-5分</li>
-                    <li>20-30ppm：-10分</li>
-                    <li>30-50ppm：-15分</li>
-                </ul>
+                <ul><li>≤5ppm：+5分</li><li>5-10ppm：0分</li><li>10-20ppm：-5分</li><li>20-30ppm：-10分</li><li>30-50ppm：-15分</li></ul>
             </div>
-
             <div style="background: #f8fafc; padding: 1rem; border-radius: 12px;">
                 <h4 style="color: #7c3aed; margin: 0 0 0.75rem 0;">加分项</h4>
-                <ul style="margin: 0; padding-left: 1.2rem; color: #64748b;">
-                    <li>匹配碎片：每个+2分（上限20）</li>
-                    <li>诊断离子：根据权重累计（上限15）</li>
-                    <li>中性丢失：每个+2分（上限10）</li>
-                    <li>RT偏差<0.2：+5分</li>
-                    <li>RT偏差<0.5：+2分</li>
-                </ul>
+                <ul><li>匹配碎片：每个+2分（上限20）</li><li>诊断离子：根据权重累计（上限15）</li><li>中性丢失：每个+2分（上限10）</li><li>RT偏差<0.2：+5分</li><li>RT偏差<0.5：+2分</li></ul>
             </div>
         </div>
 
-        <div style="margin-top: 1.5rem; padding: 1rem; background: linear-gradient(135deg, #ecfdf5, #d1fae5); border-radius: 12px;">
-            <h4 style="color: #059669; margin: 0 0 0.75rem 0;">特殊规则</h4>
-            <ul style="margin: 0; padding-left: 1.2rem; color: #1e293b;">
-                <li><strong>保底机制</strong>：1级不低于80分，2级不低于60分</li>
-                <li><strong>总分上限</strong>：100分</li>
-                <li><strong>多加和离子</strong>：每个额外+5分，根据碎片相似度调整（上限15）</li>
-            </ul>
-        </div>
-
-        <h3 style="color: #1e293b; margin-top: 2rem;">🆕 v5.12 新增功能说明</h3>
-        <ul style="color: #64748b; line-height: 1.8;">
-            <li><strong>英文数据库支持</strong>：自动加载"数据库（英文）.xlsx"作为补充数据库，扩大化合物覆盖范围</li>
-            <li><strong>碎片多值映射 v2.0</strong>：碎片离子列支持分号(;)、逗号(,)、顿号(、)、空格等多种分隔符，一篇文献可映射多个碎片值</li>
-            <li><strong>双数据库联合鉴定</strong>：主数据库和英文数据库独立索引，结果合并去重</li>
-            <li><strong>诊断离子去重</strong>：外部诊断离子文件中的重复 m/z 自动合并，权重累加</li>
-            <li><strong>加和离子显示优化</strong>：无加和离子时显示空白，更整洁</li>
-            <li><strong>综合得分保底</strong>：确保评分为非负数</li>
-        </ul>
-        
         <h3 style="color: #1e293b; margin-top: 2rem;">💡 碎片多值映射示例</h3>
         <div style="background: #f1f5f9; padding: 1rem; border-radius: 8px; font-family: monospace;">
-            <strong>支持的输入格式：</strong><br>
+            <strong>数据库中的碎片格式：</strong><br>
             • 139.05, 134.03, 151.01  （逗号分隔）<br>
             • 139.05; 134.03; 151.01  （分号分隔）<br>
             • 139.05、134.03、151.01  （顿号分隔）<br>
-            • 139.05 134.03 151.01    （空格分隔）<br>
-            • 139.05(100%), 134.03(50%) （自动提取数字部分）
+            <br>
+            <strong>输出格式：</strong><br>
+            • 简单合并：139.05; 134.03; 151.01<br>
+            • 详细映射：139.05(文献1,文献2); 134.03(文献1,文献3)  ← 新版
         </div>
     </div>
     """, unsafe_allow_html=True)
 
 
 def show_database_page():
-    """数据库预览页面 - 优化版（支持英文数据库）"""
+    """数据库预览页面"""
     create_header()
     st.markdown("## 🗃️ 数据库预览")
 
@@ -2565,16 +2211,6 @@ def show_database_page():
                 
                 st.markdown("#### 英文数据库预览（前10行）")
                 st.dataframe(english_df.head(10), use_container_width=True)
-                
-                # 显示碎片多值映射示例
-                st.markdown("#### 碎片离子格式示例")
-                if '碎片离子（正）' in english_df.columns:
-                    sample_with_frag = english_df[english_df['碎片离子（正）'].notna() & 
-                                                   (english_df['碎片离子（正）'].str.len() > 0)].head(3)
-                    if not sample_with_frag.empty:
-                        frag_samples = sample_with_frag[['名称（中文）', '名称（英文）', '碎片离子（正）']].head(3)
-                        st.dataframe(frag_samples, use_container_width=True, hide_index=True)
-                        st.caption("💡 碎片离子列支持分号(;)、逗号(,)、顿号(、)、空格分隔多个值，自动解析为多个碎片离子")
             except Exception as e:
                 st.warning(f"加载英文数据库时出错：{str(e)}")
         else:
@@ -2590,7 +2226,7 @@ def show_database_page():
 
 
 def show_results_page():
-    """结果分析页面 - 优化版"""
+    """结果分析页面"""
     create_header()
 
     if 'analysis_results' not in st.session_state:
@@ -2610,7 +2246,7 @@ def show_results_page():
 
     report = st.session_state['analysis_results']
 
-    st.markdown("## 📊 鉴定结果分析（v5.12 支持英文数据库 + 碎片多值映射）")
+    st.markdown("## 📊 鉴定结果分析（v5.13 文献-碎片详细映射）")
 
     if report.empty:
         st.warning("鉴定结果为空，可能是因为没有匹配的化合物。")
@@ -2641,7 +2277,7 @@ def show_results_page():
     st.markdown("### 📋 完整鉴定结果")
 
     all_columns = report.columns.tolist()
-    default_cols = ['序号', '化合物中文名', '分子式', 'ppm', '评级名称', '药材名称', '综合得分']
+    default_cols = ['序号', '化合物中文名', '分子式', 'ppm', '评级名称', '药材名称', '主要碎片离子(文献映射)', '综合得分']
     selected_cols = st.multiselect("选择显示的列", all_columns, default=[c for c in default_cols if c in all_columns])
 
     display_df = report[selected_cols] if selected_cols else report
@@ -2676,7 +2312,6 @@ def show_results_page():
 
 
 def main():
-    """主函数"""
     load_optimized_css()
 
     if 'logged_in' not in st.session_state:
