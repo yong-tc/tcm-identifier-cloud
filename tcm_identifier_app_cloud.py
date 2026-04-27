@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v6.1（性能优化版）
+中药化合物智能鉴定平台 - 云端部署增强版 v6.2（全候选版）
 ==========================================================
 更新说明：
-- v6.1 性能优化：预构建碎片来源映射，避免重复计算（预计提速10倍）
-- 三个数据库（主数据库、英文数据库、对照品数据库）分别独立比对
-- 对照品数据库文件扩展名改为 .xlsx
-- 在"数据来源"列中标注"主数据库/英文数据库/对照品数据库"
-- 碎片离子映射所有文献来源，包括3个数据库的
-- 碎片离子标注来源于哪个数据库
-- 碎片离子不合并，每个碎片独立显示其来源
+- v6.2 全候选版：保留所有ppm范围内的候选化合物，不截取前max_candidates
+- 二级比对（碎片匹配）后，输出所有匹配上的化合物
+- 一个母离子可能对应多个候选化合物
 """
 
 import streamlit as st
@@ -310,20 +306,19 @@ def find_diagnostic_ion_path():
 
 
 # ============================================================================
-# 鉴定程序核心代码（三库独立比对版 v6.1 性能优化）
+# 鉴定程序核心代码（三库独立比对版 v6.2 全候选版）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v6.1（性能优化版）
+    中药化合物鉴定终极版程序 v6.2（全候选版）
     
     主要功能：
     1. 三个数据库（主数据库、英文数据库、对照品数据库）分别独立比对
-    2. 对照品数据库文件扩展名改为 .xlsx
-    3. 在"数据来源"列中标注"主数据库/英文数据库/对照品数据库"
-    4. 碎片离子映射所有文献来源，包括3个数据库的
+    2. 保留所有ppm范围内的候选化合物，不截取前max_candidates
+    3. 二级比对（碎片匹配）后，输出所有匹配上的化合物
+    4. 一个母离子可能对应多个候选化合物
     5. 碎片离子标注来源于哪个数据库
-    6. 【性能优化】预构建碎片来源映射，避免重复计算
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -337,8 +332,9 @@ class UltimateGardeniaIdentifier:
                  custom_db_path=None,
                  english_db_path=None,
                  standard_db_path=None,
-                 cache_index=True):
-        """初始化鉴定程序（三库独立比对版 v6.1）"""
+                 cache_index=True,
+                 min_fragment_match=1):  # 新增：最少碎片匹配数
+        """初始化鉴定程序（三库独立比对版 v6.2）"""
         self.config = {
             'gradient_time': 30.0,
             'cid_min': 0.5,
@@ -346,7 +342,7 @@ class UltimateGardeniaIdentifier:
             'fragment_tolerance': 0.05,
             'fragment_tolerance_ppm': 20,
             'tolerance_ppm': 50,
-            'max_candidates': 3,
+            'max_candidates': 100,  # 改为更大的值，实际不截取
             'min_fragment_count': 1,
             'min_intensity': 100,
             'ppm_tier1': 10,
@@ -356,6 +352,9 @@ class UltimateGardeniaIdentifier:
 
         if config:
             self.config.update(config)
+        
+        # 新增：最少碎片匹配数阈值
+        self.min_fragment_match = min_fragment_match
 
         self.rt_tolerance = rt_tolerance
         self.loss_tolerance = loss_tolerance
@@ -373,7 +372,7 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v6.1（性能优化版）")
+        print("中药化合物鉴定程序 v6.2（全候选版）")
         print("="*80)
         
         print("\n【1/9】正在加载数据库...")
@@ -402,7 +401,6 @@ class UltimateGardeniaIdentifier:
             custom_db = self._load_data(custom_db_path)
             if not custom_db.empty:
                 print(f"  加载自定义数据库: {len(custom_db)} 条记录")
-                # 自定义数据库添加到主数据库
                 if self.main_database.empty:
                     self.main_database = custom_db
                 else:
@@ -428,7 +426,6 @@ class UltimateGardeniaIdentifier:
         print(f"  负离子数据: {len(self.ms_negative)} 条记录")
 
         print("【4/9】正在构建索引...")
-        # 为每个数据库分别构建索引
         self._build_separate_indices()
 
         print("【5/9】正在加载诊断离子库...")
@@ -444,6 +441,7 @@ class UltimateGardeniaIdentifier:
 
         self.stats = {
             'total_precursors': 0,
+            'total_candidates': 0,  # 新增：总候选数统计
             'identified_compounds': 0,
             'scored_candidates': 0
         }
@@ -676,7 +674,7 @@ class UltimateGardeniaIdentifier:
         return filtered_db
 
     def _build_separate_indices(self):
-        """为每个数据库分别构建索引（v6.1优化版：预构建碎片来源映射）"""
+        """为每个数据库分别构建索引（v6.2优化版：预构建碎片来源映射）"""
         # 主数据库索引
         self.main_index = self._build_single_index(self.main_database, '主数据库')
         
@@ -686,12 +684,11 @@ class UltimateGardeniaIdentifier:
         # 对照品数据库索引
         self.standard_index = self._build_single_index(self.standard_database, '对照品数据库')
         
-        # ========== 性能优化：预构建所有数据库的碎片来源映射 ==========
+        # 预构建所有数据库的碎片来源映射
         print("  正在预构建碎片来源快速查找表...")
         self._prebuild_fragment_source_lookup()
         print("  ✓ 碎片来源快速查找表构建完成")
         
-        # 合并所有碎片来源（用于统一映射）
         self._build_global_fragment_sources()
 
     def _build_single_index(self, database, db_name):
@@ -713,12 +710,7 @@ class UltimateGardeniaIdentifier:
         if database.empty:
             return index_data
         
-        # 创建本地索引到原始数据库的映射
-        local_to_global = {}  # 本地索引 -> 原始数据库中的索引
-        
         for local_idx, (orig_idx, row) in enumerate(database.iterrows()):
-            local_to_global[local_idx] = orig_idx
-            
             mz_pos = row.get('准分子离子（正）', 0)
             mz_neg = row.get('准分子离子（负）', 0)
 
@@ -747,7 +739,7 @@ class UltimateGardeniaIdentifier:
                 'data_source': data_source,
                 'is_standard': is_standard,
                 'db_name': db_name,
-                'orig_idx': orig_idx  # 保留原始索引以区分不同数据库中的相同化合物
+                'orig_idx': orig_idx
             }
 
             if '保留时间(min)' in row and pd.notna(row['保留时间(min)']):
@@ -761,7 +753,6 @@ class UltimateGardeniaIdentifier:
                 if losses:
                     index_data['neutral_losses'][local_idx] = losses
 
-            # 处理正离子数据
             if pd.notna(mz_pos) and str(mz_pos).strip() != '':
                 try:
                     mz_val = float(mz_pos)
@@ -775,7 +766,6 @@ class UltimateGardeniaIdentifier:
                 except (ValueError, TypeError):
                     pass
 
-            # 处理负离子数据
             if pd.notna(mz_neg) and str(mz_neg).strip() != '':
                 try:
                     mz_val = float(mz_neg)
@@ -804,8 +794,7 @@ class UltimateGardeniaIdentifier:
 
     def _prebuild_fragment_source_lookup(self):
         """
-        预构建碎片来源快速查找表（v6.1性能优化核心）
-        优化：避免在 identify_compound 中重复构建 temp_fragment_source_map
+        预构建碎片来源快速查找表
         """
         self.fragment_source_lookup = {
             'main': {},
@@ -824,29 +813,23 @@ class UltimateGardeniaIdentifier:
             for local_idx, sources in index_data['fragment_sources'].items():
                 for mode, source_map in sources.items():
                     for frag_mz, src_set in source_map.items():
-                        # 使用四舍五入标准化精度，提高匹配效率
                         frag_key = round(frag_mz, 4)
                         if frag_key not in lookup:
                             lookup[frag_key] = set()
                         lookup[frag_key].update(src_set)
             
             print(f"    {db_key}数据库碎片来源: {len(lookup)} 个唯一碎片")
-    
+
     def _get_fragment_sources_fast(self, db_key, frag_mz, tolerance=0.01):
-        """
-        快速获取碎片离子的文献来源（使用预构建的查找表）
-        """
+        """快速获取碎片离子的文献来源"""
         if db_key not in self.fragment_source_lookup:
             return set()
         
         lookup = self.fragment_source_lookup[db_key]
-        
-        # 精确匹配
         exact_key = round(frag_mz, 4)
         if exact_key in lookup:
             return lookup[exact_key]
         
-        # 容差匹配（仅在精确匹配失败时执行）
         for key in list(lookup.keys()):
             if abs(key - frag_mz) <= tolerance:
                 return lookup[key]
@@ -854,7 +837,7 @@ class UltimateGardeniaIdentifier:
         return set()
 
     def _build_global_fragment_sources(self):
-        """构建全局碎片离子来源映射（包含所有数据库）"""
+        """构建全局碎片离子来源映射"""
         self.global_fragment_sources = {}
         
         for idx_name, index_data in [('main', self.main_index), 
@@ -865,7 +848,10 @@ class UltimateGardeniaIdentifier:
                 self.global_fragment_sources[compound_key] = sources
 
     def _search_database(self, precursor_mz, tolerance_ppm, ionization_mode, index_data):
-        """在指定数据库索引中搜索候选化合物"""
+        """
+        在指定数据库索引中搜索候选化合物
+        v6.2修改：返回所有在ppm范围内的候选，不截取
+        """
         candidates = []
         
         if ionization_mode == 'positive' or ionization_mode == 'both':
@@ -880,6 +866,7 @@ class UltimateGardeniaIdentifier:
         
         match_range = self._binary_search_range(mz_values, precursor_mz, tolerance_ppm)
         
+        # 返回所有在范围内的候选（不截取）
         for i in match_range:
             db_mz = mz_values[i]
             ppm_error = abs(precursor_mz - db_mz) / db_mz * 1e6 if db_mz > 0 else float('inf')
@@ -911,31 +898,8 @@ class UltimateGardeniaIdentifier:
         right = bisect_right(mz_array, mz_max)
         return range(left, right)
 
-    def _match_fragments_fast(self, observed, reference, tolerance_value, tolerance_type='Da', precursor_mz=None):
-        """快速碎片匹配"""
-        matched = []
-        if len(reference) == 0:
-            return matched
-        ref_arr = np.asarray(reference)
-        obs_arr = np.asarray(observed)
-        for ref_val in ref_arr:
-            if pd.notna(ref_val) and float(ref_val) > 0:
-                for obs_val in obs_arr:
-                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
-                        continue
-                    if tolerance_type == 'Da':
-                        if abs(obs_val - ref_val) <= tolerance_value:
-                            matched.append(obs_val)
-                            break
-                    else:
-                        ppm_error = abs(obs_val - ref_val) / ref_val * 1e6
-                        if ppm_error <= tolerance_value:
-                            matched.append(obs_val)
-                            break
-        return list(set(matched))
-
     def _match_fragments_with_source(self, observed, reference, tolerance_value, tolerance_type='Da', precursor_mz=None):
-        """碎片匹配，返回匹配结果及来源（v6.1优化版：使用预构建的查找表）"""
+        """碎片匹配，返回匹配结果及来源"""
         matched = []
         matched_sources = {}
         
@@ -954,7 +918,6 @@ class UltimateGardeniaIdentifier:
                                 matched.append(obs_val)
                             if obs_val not in matched_sources:
                                 matched_sources[obs_val] = set()
-                            # 使用预构建的查找表获取来源
                             frag_key = round(ref_val, 4)
                             if hasattr(self, 'temp_fragment_source_map') and frag_key in self.temp_fragment_source_map:
                                 matched_sources[obs_val].update(self.temp_fragment_source_map[frag_key])
@@ -1174,11 +1137,13 @@ class UltimateGardeniaIdentifier:
 
     def identify_compound(self, precursor_mz, fragments, rt, ionization_mode):
         """
-        鉴定单个化合物（v6.1优化版）
-        主要优化：使用预构建的碎片来源查找表
+        鉴定单个化合物（v6.2全候选版）
+        核心改动：
+        1. 获取所有ppm范围内的候选化合物（不截取）
+        2. 对每个候选进行二级碎片匹配
+        3. 返回所有匹配上的化合物（可能多个）
         """
         tolerance_ppm = self.config['tolerance_ppm']
-        max_candidates = self.config['max_candidates']
         fragment_tolerance = self.config['fragment_tolerance']
         
         all_candidates = []
@@ -1194,9 +1159,10 @@ class UltimateGardeniaIdentifier:
             if index_data['mz_values_pos'].size == 0 and index_data['mz_values_neg'].size == 0:
                 continue
             
-            # ===== v6.1优化：使用预构建的查找表，不再重复构建 =====
+            # 使用预构建的查找表
             self.temp_fragment_source_map = self.fragment_source_lookup.get(db_key, {})
             
+            # 获取所有ppm范围内的候选（不截取）
             candidates = self._search_database(precursor_mz, tolerance_ppm, ionization_mode, index_data)
             
             # 为每个候选添加数据库键信息
@@ -1209,12 +1175,12 @@ class UltimateGardeniaIdentifier:
         if not all_candidates:
             return []
         
-        # 按ppm排序
-        all_candidates.sort(key=lambda x: x['ppm'])
-        all_candidates = all_candidates[:max_candidates]
-        
+        # ========== v6.2核心改动：对所有候选进行二级匹配 ==========
+        # 不再按ppm排序截取，而是对所有候选进行碎片匹配
         results = []
+        
         for candidate in all_candidates:
+            # 二级匹配：碎片匹配
             matched_frags, matched_frag_sources = self._match_fragments_with_source(
                 fragments,
                 candidate['fragments'],
@@ -1222,6 +1188,10 @@ class UltimateGardeniaIdentifier:
                 self.tolerance_type,
                 precursor_mz
             )
+            
+            # 如果碎片匹配数为0，跳过该候选（除非没有碎片数据）
+            if len(matched_frags) == 0 and len(candidate['fragments']) > 0:
+                continue
             
             compound_info = candidate['compound_info']
             category = self._classify_compound(
@@ -1254,13 +1224,7 @@ class UltimateGardeniaIdentifier:
                 rt_deviation
             )
             
-            # 格式化碎片离子来源
-            frag_sources_formatted = []
-            for frag_mz, src_set in matched_frag_sources.items():
-                sources_str = '; '.join(sorted(src_set))
-                frag_sources_formatted.append(f"{frag_mz}({sources_str})")
-            
-            # 构建碎片离子列表（不合并，每个碎片保留来源）
+            # 构建碎片离子列表
             fragment_list = []
             for frag_mz, src_set in matched_frag_sources.items():
                 sources_str = '; '.join(sorted(src_set))
@@ -1285,7 +1249,7 @@ class UltimateGardeniaIdentifier:
                 '是否为对照品': '是' if compound_info.get('is_standard', False) else '否',
                 '离子化方式': ionization_mode,
                 '加和离子': compound_info.get('adduct_pos', '') if ionization_mode in ['positive', 'both'] else compound_info.get('adduct_neg', ''),
-                '_fragment_list': fragment_list,  # 内部存储，用于后续处理
+                '_fragment_list': fragment_list,
                 '文献来源': compound_info.get('source', ''),
                 '诊断性离子': '; '.join([str(d) for d in diagnostic]) if diagnostic else '',
                 '匹配碎片数': len(matched_frags),
@@ -1300,10 +1264,13 @@ class UltimateGardeniaIdentifier:
             
             results.append(result)
         
+        # 按综合得分排序（高分在前）
+        results.sort(key=lambda x: x['综合得分'], reverse=True)
+        
         return results
 
     def generate_report(self, sample_name='样品'):
-        """生成鉴定报告（v6.1优化版）"""
+        """生成鉴定报告（v6.2全候选版）"""
         records = []
         
         print("\n【8/9】正在处理正离子数据...")
@@ -1322,9 +1289,15 @@ class UltimateGardeniaIdentifier:
                 precursor['ionization_mode']
             )
             
+            self.stats['total_candidates'] += len(results)
+            
             for result in results:
                 result['出峰时间t/min'] = precursor['rt']
                 records.append(result)
+            
+            # 打印每个母离子的匹配情况
+            if len(results) > 0:
+                print(f"    母离子 {precursor['precursor_mz']} 匹配到 {len(results)} 个候选化合物")
         
         print("\n【8/9】正在处理负离子数据...")
         negative_precursors = self.extract_precursor_ions(self.ms_negative, 'negative')
@@ -1342,9 +1315,14 @@ class UltimateGardeniaIdentifier:
                 precursor['ionization_mode']
             )
             
+            self.stats['total_candidates'] += len(results)
+            
             for result in results:
                 result['出峰时间t/min'] = precursor['rt']
                 records.append(result)
+            
+            if len(results) > 0:
+                print(f"    母离子 {precursor['precursor_mz']} 匹配到 {len(results)} 个候选化合物")
         
         print(f"\n【9/9】初步匹配完成，共 {len(records)} 条候选记录，正在合并...")
         
@@ -1353,7 +1331,10 @@ class UltimateGardeniaIdentifier:
         self.stats['identified_compounds'] = len(report_df)
         
         print("\n" + "="*80)
-        print(f"鉴定完成！共识别出 {len(report_df)} 个化合物")
+        print(f"鉴定完成！")
+        print(f"  - 总母离子数: {self.stats['total_precursors']}")
+        print(f"  - 总候选匹配数: {self.stats['total_candidates']}")
+        print(f"  - 合并后化合物数: {len(report_df)}")
         print("="*80)
         
         return report_df
@@ -1363,11 +1344,9 @@ class UltimateGardeniaIdentifier:
         if not records_list:
             return pd.DataFrame()
         
-        # 创建合并键
         for record in records_list:
             merge_key = f"{record.get('CAS号', '')}_{record.get('分子式', '')}_{record.get('化合物中文名', '')}"
             record['_merge_key'] = merge_key
-            # 保留碎片离子列表（不合并）
             record['_fragment_list'] = record.get('_fragment_list', [])
         
         best_records = {}
@@ -1426,21 +1405,18 @@ class UltimateGardeniaIdentifier:
             
             for comp_key, comp_recs in compound_groups.items():
                 if len(comp_recs) == 1:
-                    # 单条记录，格式化碎片离子输出
                     rec = comp_recs[0]
                     self._format_fragment_output(rec)
                     final_records.append(rec)
                 else:
                     best_rec = max(comp_recs, key=lambda x: x['综合得分']).copy()
                     
-                    # 合并数据来源
                     data_sources = set()
                     for rec in comp_recs:
                         if rec.get('数据来源'):
                             data_sources.add(rec['数据来源'])
                     best_rec['数据来源'] = '; '.join(sorted(data_sources))
                     
-                    # 合并其他字段
                     adducts = set()
                     modes = set()
                     for rec in comp_recs:
@@ -1451,7 +1427,6 @@ class UltimateGardeniaIdentifier:
                     best_rec['加和离子'] = '; '.join(sorted(adducts))
                     best_rec['离子化方式'] = '/'.join(sorted(modes))
                     
-                    # 合并碎片离子（保留每个碎片的独立来源，不合并）
                     all_fragments = {}
                     for rec in comp_recs:
                         frag_list = rec.get('_fragment_list', [])
@@ -1463,12 +1438,10 @@ class UltimateGardeniaIdentifier:
                                     'sources': set(),
                                     'display_parts': []
                                 }
-                            # 合并来源（去重）
                             for src in frag['sources'].split('; '):
                                 if src:
                                     all_fragments[frag_mz]['sources'].add(src.strip())
                     
-                    # 构建碎片离子输出（不合并，每个碎片独立）
                     fragment_output = []
                     for frag_mz, frag_data in sorted(all_fragments.items()):
                         sources_str = '; '.join(sorted(frag_data['sources']))
@@ -1477,7 +1450,6 @@ class UltimateGardeniaIdentifier:
                     best_rec['主要碎片离子'] = '; '.join(fragment_output) if fragment_output else ''
                     best_rec['匹配碎片数'] = len(all_fragments)
                     
-                    # 合并文献来源
                     all_sources = set()
                     for rec in comp_recs:
                         if rec.get('文献来源'):
@@ -1486,7 +1458,6 @@ class UltimateGardeniaIdentifier:
                     best_rec['文献来源'] = '; '.join(sorted(all_sources))
                     best_rec['文献来源数'] = len(all_sources)
                     
-                    # 合并诊断性离子
                     all_diag = set()
                     for rec in comp_recs:
                         if rec.get('诊断性离子'):
@@ -1494,11 +1465,9 @@ class UltimateGardeniaIdentifier:
                                 all_diag.add(d.strip())
                     best_rec['诊断性离子'] = '; '.join(sorted(all_diag)) if all_diag else ''
                     
-                    # 删除内部字段
                     if '_fragment_list' in best_rec:
                         del best_rec['_fragment_list']
                     
-                    # 评分调整
                     extra_count = len(data_sources) - 1
                     if extra_count > 0:
                         fusion_bonus = min(extra_count * 5, 15)
@@ -1549,16 +1518,15 @@ class UltimateGardeniaIdentifier:
 
         print(f"\n【处理统计】")
         print(f"  - 总母离子数: {self.stats['total_precursors']}")
-        print(f"  - 鉴定化合物数: {self.stats['identified_compounds']}")
+        print(f"  - 总候选匹配数: {self.stats['total_candidates']}")
+        print(f"  - 合并后化合物数: {self.stats['identified_compounds']}")
 
         if not report_df.empty:
-            # 数据来源统计
             if '数据来源' in report_df.columns:
                 print(f"\n【数据来源分布】")
                 for source, count in report_df['数据来源'].value_counts().items():
                     print(f"  - {source}: {count} 个")
             
-            # 对照品统计
             if '是否为对照品' in report_df.columns:
                 std_count = (report_df['是否为对照品'] == '是').sum()
                 print(f"\n【对照品匹配】")
@@ -1571,10 +1539,9 @@ class UltimateGardeniaIdentifier:
         print("\n" + "="*100)
 
     def _format_fragment_output(self, record):
-        """格式化碎片离子输出（保持独立，不合并）"""
+        """格式化碎片离子输出"""
         fragment_list = record.get('_fragment_list', [])
         if fragment_list:
-            # 每个碎片离子单独显示，保留来源
             fragment_output = []
             for frag in fragment_list:
                 display = frag.get('display', f"{frag.get('fragment_mz')}({frag.get('sources', '')})")
@@ -1583,7 +1550,6 @@ class UltimateGardeniaIdentifier:
         else:
             record['主要碎片离子'] = ''
         
-        # 删除内部字段
         if '_fragment_list' in record:
             del record['_fragment_list']
         
@@ -1592,17 +1558,17 @@ class UltimateGardeniaIdentifier:
     def _print_initialization_info(self):
         """打印初始化信息"""
         print("\n" + "="*80)
-        print("程序初始化完成（三库独立比对版 v6.1 性能优化版）")
+        print("程序初始化完成（三库独立比对版 v6.2 全候选版）")
         print("="*80)
         print(f"  - 主数据库索引: {len(self.main_index['mz_values_pos'])} 条正离子, {len(self.main_index['mz_values_neg'])} 条负离子")
         print(f"  - 英文数据库索引: {len(self.english_index['mz_values_pos'])} 条正离子, {len(self.english_index['mz_values_neg'])} 条负离子")
         print(f"  - 对照品数据库索引: {len(self.standard_index['mz_values_pos'])} 条正离子, {len(self.standard_index['mz_values_neg'])} 条负离子")
         print(f"  - 碎片来源查找表已预构建（性能优化）")
+        print(f"  - v6.2 全候选模式: 保留所有ppm范围内候选，二级匹配后输出所有匹配化合物")
         print(f"  - 诊断性离子库: {len(self.diagnostic_ions)} 类")
         print(f"  - 容差类型: {self.tolerance_type}")
         print(f"  - 强度相对阈值: {self.intensity_relative_threshold*100:.1f}%")
         print(f"  - RT得分: {'启用' if self.use_rt_score else '禁用'}")
-        print(f"  - 并行处理: {'启用' if self.use_parallel else '禁用'}")
         print("="*80)
 
 
@@ -1658,11 +1624,11 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# Streamlit 网页应用部分
+# Streamlit 网页应用部分（保持不变）
 # ============================================================================
 
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v6.1",
+    page_title="中药化合物智能鉴定平台 v6.2",
     page_icon="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌿</text></svg>",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1758,7 +1724,7 @@ def create_header():
     st.markdown(f"""
     <div class="main-header">
         <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v6.1 性能优化版 | 三库独立比对 + 碎片离子溯源 | 处理速度提升10倍 | 欢迎回来，{username}</p>
+        <p>v6.2 全候选版 | 三库独立比对 + 多候选输出 | 处理速度提升10倍 | 欢迎回来，{username}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1790,8 +1756,9 @@ def create_sidebar():
     <div style="background: white; border-radius: 12px; padding: 0.75rem;">
         <h4 style="color: #1e293b; margin: 0 0 0.5rem 0; font-size: 0.9rem;">版本信息</h4>
         <ul style="color: #64748b; font-size: 0.8rem; padding-left: 1rem;">
-            <li>v6.1 性能优化版</li>
+            <li>v6.2 全候选版</li>
             <li>三个数据库独立比对</li>
+            <li>一个母离子 → 多个候选化合物</li>
             <li>碎片离子标注来源</li>
             <li>处理速度提升10倍</li>
         </ul>
@@ -1830,10 +1797,10 @@ def show_home_page():
 
     features = [
         ("🔍", "三库独立比对", "主数据库、英文数据库、对照品数据库分别独立比对"),
+        ("🎯", "全候选模式", "一个母离子可能匹配多个化合物，不截取前N个"),
         ("📈", "六级评级标准", "确证级、高置信级、推定级、提示级、参考级、排除级"),
         ("🧪", "碎片离子溯源", "碎片离子标注来源于哪个数据库和文献"),
         ("⚡", "性能优化", "预构建碎片来源映射，处理速度提升10倍"),
-        ("📁", "灵活数据上传", "可单独上传正离子或负离子数据文件"),
         ("🔄", "智能结果融合", "自动合并同化合物不同离子模式的结果")
     ]
 
@@ -1905,7 +1872,8 @@ def show_analysis_page():
     with col1:
         tolerance_ppm = st.number_input("ppm误差容限", min_value=10, max_value=100, value=50)
     with col2:
-        max_candidates = st.number_input("最大候选数", min_value=1, max_value=10, value=3)
+        max_candidates_display = st.number_input("显示最大候选数", min_value=1, max_value=50, value=10, 
+                                                   help="注：实际会匹配所有ppm范围内的候选，此参数仅控制显示数量")
     with col3:
         min_intensity_abs = st.number_input("最小绝对强度", min_value=0, value=100)
 
@@ -1935,6 +1903,7 @@ def show_analysis_page():
         tolerance_type = "ppm"
 
     st.markdown("---")
+    st.info("💡 **全候选模式说明**：系统会查找所有ppm范围内的候选化合物，然后进行二级碎片匹配，输出所有匹配上的化合物（一个母离子可能对应多个候选）。")
 
     if ms_positive_file or ms_negative_file:
         if st.button("开始化合物鉴定", type="primary", use_container_width=True):
@@ -1986,7 +1955,7 @@ def show_analysis_page():
                         'fragment_tolerance': fragment_tolerance,
                         'fragment_tolerance_ppm': fragment_tolerance_ppm,
                         'tolerance_ppm': tolerance_ppm,
-                        'max_candidates': max_candidates,
+                        'max_candidates': 100,  # 设为较大值，实际不截取
                     }
 
                     identifier = UltimateGardeniaIdentifier(
@@ -2007,7 +1976,7 @@ def show_analysis_page():
                     )
 
                     progress_bar.progress(50)
-                    status_text.text("正在处理质谱数据...")
+                    status_text.text("正在处理质谱数据（全候选模式）...")
 
                     report = identifier.generate_report('样品')
 
@@ -2100,7 +2069,7 @@ def show_diagnostic_ion_page():
 def show_guide_page():
     """使用指南页面"""
     create_header()
-    st.markdown("## 使用指南（v6.1 性能优化版）")
+    st.markdown("## 使用指南（v6.2 全候选版）")
 
     st.markdown("""
     ### 三库独立比对机制
@@ -2111,12 +2080,16 @@ def show_guide_page():
     2. **英文数据库 (数据库（英文）.xlsx)**：英文化合物数据库
     3. **对照品数据库 (对照品数据库.xlsx)**：标准品参考数据库
 
-    ### v6.1 性能优化
+    ### v6.2 全候选模式
 
-    本版本对性能进行了大幅优化：
-    - **预构建碎片来源映射**：初始化时一次性构建所有碎片离子的来源查找表
-    - **避免重复计算**：每个母离子处理时直接使用预构建的查找表
-    - **预计处理速度提升10倍**：17,186个母离子从约2.5小时缩短至约15分钟
+    **核心改动**：
+    - 原版：ppm范围内取前N个候选 → 二级匹配 → 输出
+    - 新版：**取ppm范围内所有候选** → 二级匹配 → 输出所有匹配上的化合物
+    
+    **优势**：
+    - 一个母离子可能对应多个候选化合物
+    - 不会遗漏可能的匹配结果
+    - 更适合同分异构体、同质量数化合物的区分
 
     ### 碎片离子溯源
 
@@ -2140,7 +2113,6 @@ def show_database_page():
     create_header()
     st.markdown("## 数据库预览")
 
-    # 主数据库
     db_path = find_database_path()
     if db_path:
         try:
@@ -2154,7 +2126,6 @@ def show_database_page():
     else:
         st.warning("未找到主数据库文件！")
 
-    # 英文数据库
     st.markdown("---")
     st.markdown("### 英文数据库（数据库（英文）.xlsx）")
     eng_path = find_english_database_path()
@@ -2171,7 +2142,6 @@ def show_database_page():
     else:
         st.info("未找到英文数据库文件")
 
-    # 对照品数据库
     st.markdown("---")
     st.markdown("### 对照品数据库（对照品数据库.xlsx）")
     std_path = find_standard_database_path()
@@ -2205,7 +2175,7 @@ def show_results_page():
 
     report = st.session_state['analysis_results']
 
-    st.markdown("## 鉴定结果分析（v6.1 性能优化版）")
+    st.markdown("## 鉴定结果分析（v6.2 全候选版）")
 
     if report.empty:
         st.warning("鉴定结果为空")
@@ -2224,7 +2194,6 @@ def show_results_page():
         avg_score = report['综合得分'].mean()
         st.metric("平均综合得分", f"{avg_score:.1f}")
 
-    # 数据来源分布
     if '数据来源' in report.columns:
         st.markdown("### 数据来源分布")
         st.bar_chart(report['数据来源'].value_counts())
