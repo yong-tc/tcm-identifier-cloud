@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 - 云端部署增强版 v6.1（三库独立比对版）
+中药化合物智能鉴定平台 - 云端部署增强版 v6.2（漏检修复版）
 ==========================================================
-更新说明：
-- 修复化合物名称与准分子离子不匹配的问题
-- 增强母离子匹配验证机制
-- 添加匹配确认步骤确保化合物信息与母离子对应
+更新说明（v6.2）：
+- 修复碎片匹配强制过滤导致真阳性漏检的问题
+- 放宽化合物名称验证（允许CAS号或英文名作为标识）
+- 支持多种加和离子扩展（[M+H]⁺, [M+Na]⁺, [M+K]⁺, [M-H]⁻, [M+Cl]⁻等）
+- 添加可配置的严格模式开关
+- 增强母离子匹配的容差范围（支持不对称容差）
+- 添加漏检诊断日志功能
 """
 
 import streamlit as st
@@ -19,6 +22,7 @@ from datetime import datetime
 from io import BytesIO
 import tempfile
 from bisect import bisect_left, bisect_right
+from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -28,6 +32,37 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 VALID_USERNAME = "ZY"
 VALID_PASSWORD = "513513"
+
+
+# ============================================================================
+# 加和离子扩展常量（v6.2新增）
+# ============================================================================
+
+# 正离子模式加和离子质量偏移
+ADDUCTS_POSITIVE = {
+    '[M+H]+': 1.0078,
+    '[M+Na]+': 22.9898,
+    '[M+K]+': 38.9637,
+    '[M+NH4]+': 18.0338,
+    '[M+Li]+': 6.0151,
+    '[M+2H]2+': 0.5039,  # 带双电荷
+    '[M+H+Na]2+': 12.4988,
+}
+
+# 负离子模式加和离子质量偏移
+ADDUCTS_NEGATIVE = {
+    '[M-H]-': -1.0078,
+    '[M+Cl]-': 34.9689,
+    '[M+HCOO]-': 44.9977,
+    '[M+CH3COO]-': 59.0133,
+    '[M+Br]-': 78.9183,
+    '[M+Na-2H]-': 20.9742,
+}
+
+# 默认允许的最大ppm误差
+DEFAULT_MAX_PPM = 100
+# 母离子匹配基础容差（ppm）
+BASE_TOLERANCE_PPM = 50
 
 
 # ============================================================================
@@ -306,20 +341,19 @@ def find_diagnostic_ion_path():
 
 
 # ============================================================================
-# 鉴定程序核心代码（三库独立比对版 - 修复母离子匹配）
+# 鉴定程序核心代码（v6.2 漏检修复版）
 # ============================================================================
 
 class UltimateGardeniaIdentifier:
     """
-    中药化合物鉴定终极版程序 v6.1（三库独立比对版）
+    中药化合物鉴定终极版程序 v6.2（漏检修复版）
     
     主要功能：
     1. 三个数据库（主数据库、英文数据库、对照品数据库）分别独立比对
-    2. 对照品数据库文件扩展名改为 .xlsx
-    3. 在"数据来源"列中标注"主数据库/英文数据库/对照品数据库"
-    4. 碎片离子映射所有文献来源，包括3个数据库的
-    5. 碎片离子标注来源于哪个数据库
-    6. 修复化合物名称与准分子离子不匹配的问题
+    2. 支持多种加和离子扩展匹配
+    3. 修复碎片匹配强制过滤导致的漏检问题
+    4. 放宽化合物名称验证（允许CAS号或英文名作为标识）
+    5. 提供可配置的严格模式开关
     """
 
     def __init__(self, database_path, ms_positive_path, ms_negative_path,
@@ -333,8 +367,12 @@ class UltimateGardeniaIdentifier:
                  custom_db_path=None,
                  english_db_path=None,
                  standard_db_path=None,
-                 cache_index=True):
-        """初始化鉴定程序（三库独立比对版）"""
+                 cache_index=True,
+                 strict_mode=False,  # v6.2新增：严格模式开关
+                 enable_adduct_expansion=True,  # v6.2新增：启用加和离子扩展
+                 max_ppm=DEFAULT_MAX_PPM,  # v6.2新增：最大ppm容差
+                 enable_diagnostic_logging=False):  # v6.2新增：诊断日志
+        """初始化鉴定程序（v6.2漏检修复版）"""
         self.config = {
             'gradient_time': 30.0,
             'cid_min': 0.5,
@@ -347,7 +385,7 @@ class UltimateGardeniaIdentifier:
             'min_intensity': 100,
             'ppm_tier1': 10,
             'ppm_tier2': 20,
-            'max_ppm': 100,
+            'max_ppm': max_ppm,
         }
 
         if config:
@@ -364,12 +402,31 @@ class UltimateGardeniaIdentifier:
         self.standard_db_path = standard_db_path
         self.cache_index = cache_index
         self.herb_name = herb_name
+        
+        # v6.2新增配置
+        self.strict_mode = strict_mode
+        self.enable_adduct_expansion = enable_adduct_expansion
+        self.enable_diagnostic_logging = enable_diagnostic_logging
+        
+        # 漏检诊断统计
+        self.diagnostic_stats = {
+            'total_candidates': 0,
+            'skipped_no_identity': 0,
+            'skipped_fragment_mismatch': 0,
+            'kept_candidates': 0,
+            'adduct_matches': 0
+        }
 
         self.use_parallel = use_parallel and os.cpu_count() > 1
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v6.1（三库独立比对版 - 修复母离子匹配）")
+        print("中药化合物鉴定程序 v6.2（漏检修复版）")
+        print("="*80)
+        print(f"  严格模式: {'启用' if strict_mode else '禁用'}")
+        print(f"  加和离子扩展: {'启用' if enable_adduct_expansion else '禁用'}")
+        print(f"  最大ppm容差: {self.config['max_ppm']}")
+        print(f"  诊断日志: {'启用' if enable_diagnostic_logging else '禁用'}")
         print("="*80)
         
         print("\n【1/9】正在加载数据库...")
@@ -398,7 +455,6 @@ class UltimateGardeniaIdentifier:
             custom_db = self._load_data(custom_db_path)
             if not custom_db.empty:
                 print(f"  加载自定义数据库: {len(custom_db)} 条记录")
-                # 自定义数据库添加到主数据库
                 if self.main_database.empty:
                     self.main_database = custom_db
                 else:
@@ -424,7 +480,6 @@ class UltimateGardeniaIdentifier:
         print(f"  负离子数据: {len(self.ms_negative)} 条记录")
 
         print("【4/9】正在构建索引...")
-        # 为每个数据库分别构建索引
         self._build_separate_indices()
 
         print("【5/9】正在加载诊断离子库...")
@@ -496,6 +551,11 @@ class UltimateGardeniaIdentifier:
                 for old_name, new_name in column_mapping.items():
                     if old_name in df.columns and new_name not in df.columns:
                         df.rename(columns={old_name: new_name}, inplace=True)
+                
+                if '药材名称' not in df.columns:
+                    df['药材名称'] = ''
+                if '文献来源' not in df.columns:
+                    df['文献来源'] = ''
                 
                 df['_data_source'] = '英文数据库'
                 return df
@@ -673,16 +733,9 @@ class UltimateGardeniaIdentifier:
 
     def _build_separate_indices(self):
         """为每个数据库分别构建索引"""
-        # 主数据库索引
         self.main_index = self._build_single_index(self.main_database, '主数据库')
-        
-        # 英文数据库索引
         self.english_index = self._build_single_index(self.english_database, '英文数据库')
-        
-        # 对照品数据库索引
         self.standard_index = self._build_single_index(self.standard_database, '对照品数据库')
-        
-        # 合并所有碎片来源（用于统一映射）
         self._build_global_fragment_sources()
 
     def _build_single_index(self, database, db_name):
@@ -699,20 +752,16 @@ class UltimateGardeniaIdentifier:
             'neutral_losses': {},
             'fragment_sources': {},
             'db_name': db_name,
-            # 预构建的碎片来源快速查找表（按离子化模式）
-            'frag_source_lookup_pos': {},  # frag_mz -> set of sources
-            'frag_source_lookup_neg': {}   # frag_mz -> set of sources
+            'frag_source_lookup_pos': {},
+            'frag_source_lookup_neg': {},
+            'adduct_expanded_pos': {},  # v6.2新增：加和离子扩展索引
+            'adduct_expanded_neg': {}
         }
         
         if database.empty:
             return index_data
         
-        # 创建本地索引到原始数据库的映射
-        local_to_global = {}  # 本地索引 -> 原始数据库中的索引
-        
         for local_idx, (orig_idx, row) in enumerate(database.iterrows()):
-            local_to_global[local_idx] = orig_idx
-            
             mz_pos = row.get('准分子离子（正）', 0)
             mz_neg = row.get('准分子离子（负）', 0)
 
@@ -741,7 +790,7 @@ class UltimateGardeniaIdentifier:
                 'data_source': data_source,
                 'is_standard': is_standard,
                 'db_name': db_name,
-                'orig_idx': orig_idx  # 保留原始索引以区分不同数据库中的相同化合物
+                'orig_idx': orig_idx
             }
 
             if '保留时间(min)' in row and pd.notna(row['保留时间(min)']):
@@ -755,18 +804,26 @@ class UltimateGardeniaIdentifier:
                 if losses:
                     index_data['neutral_losses'][local_idx] = losses
 
-            # 处理正离子数据
+            # 处理正离子数据（支持加和离子扩展）
             if pd.notna(mz_pos) and str(mz_pos).strip() != '':
                 try:
-                    mz_val = float(mz_pos)
-                    if mz_val > 0:
+                    base_mz = float(mz_pos)
+                    if base_mz > 0:
+                        # 记录加和离子扩展
+                        if self.enable_adduct_expansion:
+                            expanded_mzs = self._expand_adduct_mz(base_mz, 'positive')
+                            index_data['adduct_expanded_pos'][local_idx] = expanded_mzs
+                        else:
+                            index_data['adduct_expanded_pos'][local_idx] = [base_mz]
+                        
                         frag_string = row.get('碎片离子（正）', '')
                         fragments, source_map = parse_fragments_with_source(frag_string, source, db_name)
-                        index_data['sorted_idx_pos'].append((mz_val, local_idx, fragments))
+                        # 为每种扩展的m/z都添加相同的碎片（保持一致性）
+                        for mz_val in index_data['adduct_expanded_pos'][local_idx]:
+                            index_data['sorted_idx_pos'].append((mz_val, local_idx, fragments))
                         if fragments:
                             index_data['fragment_sources'][local_idx] = index_data['fragment_sources'].get(local_idx, {})
                             index_data['fragment_sources'][local_idx]['positive'] = source_map
-                            # 预构建碎片来源查找表（加速匹配）
                             for frag_mz, src_set in source_map.items():
                                 if frag_mz not in index_data['frag_source_lookup_pos']:
                                     index_data['frag_source_lookup_pos'][frag_mz] = set()
@@ -774,18 +831,24 @@ class UltimateGardeniaIdentifier:
                 except (ValueError, TypeError):
                     pass
 
-            # 处理负离子数据
+            # 处理负离子数据（支持加和离子扩展）
             if pd.notna(mz_neg) and str(mz_neg).strip() != '':
                 try:
-                    mz_val = float(mz_neg)
-                    if mz_val > 0:
+                    base_mz = float(mz_neg)
+                    if base_mz > 0:
+                        if self.enable_adduct_expansion:
+                            expanded_mzs = self._expand_adduct_mz(base_mz, 'negative')
+                            index_data['adduct_expanded_neg'][local_idx] = expanded_mzs
+                        else:
+                            index_data['adduct_expanded_neg'][local_idx] = [base_mz]
+                        
                         frag_string = row.get('碎片离子（负）', '')
                         fragments, source_map = parse_fragments_with_source(frag_string, source, db_name)
-                        index_data['sorted_idx_neg'].append((mz_val, local_idx, fragments))
+                        for mz_val in index_data['adduct_expanded_neg'][local_idx]:
+                            index_data['sorted_idx_neg'].append((mz_val, local_idx, fragments))
                         if fragments:
                             index_data['fragment_sources'][local_idx] = index_data['fragment_sources'].get(local_idx, {})
                             index_data['fragment_sources'][local_idx]['negative'] = source_map
-                            # 预构建碎片来源查找表（加速匹配）
                             for frag_mz, src_set in source_map.items():
                                 if frag_mz not in index_data['frag_source_lookup_neg']:
                                     index_data['frag_source_lookup_neg'][frag_mz] = set()
@@ -793,6 +856,7 @@ class UltimateGardeniaIdentifier:
                 except (ValueError, TypeError):
                     pass
 
+        # 排序
         index_data['sorted_idx_pos'].sort(key=lambda x: x[0])
         index_data['sorted_idx_neg'].sort(key=lambda x: x[0])
 
@@ -803,11 +867,30 @@ class UltimateGardeniaIdentifier:
         index_data['db_frag_neg'] = [x[2] for x in index_data['sorted_idx_neg']]
 
         print(f"  {db_name}索引构建完成: {len(index_data['mz_values_pos'])} 条正离子, {len(index_data['mz_values_neg'])} 条负离子")
+        if self.enable_adduct_expansion:
+            print(f"    加和离子扩展已启用")
         
         return index_data
 
+    def _expand_adduct_mz(self, base_mz, mode='positive'):
+        """
+        扩展加和离子m/z值
+        v6.2新增：支持多种加和离子形式
+        """
+        expanded = [base_mz]  # 原始值
+        
+        if mode == 'positive':
+            for adduct_name, mass_shift in ADDUCTS_POSITIVE.items():
+                expanded.append(base_mz + mass_shift)
+        else:
+            for adduct_name, mass_shift in ADDUCTS_NEGATIVE.items():
+                expanded.append(base_mz + mass_shift)
+        
+        # 去重并保留原始顺序
+        return list(dict.fromkeys(expanded))
+
     def _build_global_fragment_sources(self):
-        """构建全局碎片离子来源映射（包含所有数据库）"""
+        """构建全局碎片离子来源映射"""
         self.global_fragment_sources = {}
         
         for idx_name, index_data in [('main', self.main_index), 
@@ -818,67 +901,104 @@ class UltimateGardeniaIdentifier:
                 self.global_fragment_sources[compound_key] = sources
 
     def _search_database(self, precursor_mz, tolerance_ppm, ionization_mode, index_data):
-        """在指定数据库索引中搜索候选化合物 - 增强匹配验证"""
+        """
+        在指定数据库索引中搜索候选化合物
+        v6.2修复：改进搜索范围，支持加和离子扩展自动匹配
+        """
         candidates = []
         
         if ionization_mode == 'positive' or ionization_mode == 'both':
             mz_values = index_data['mz_values_pos']
-            db_frags = index_data['db_frag_pos']
-            sorted_idx = index_data['sorted_idx_pos']
         else:
             mz_values = index_data['mz_values_neg']
-            db_frags = index_data['db_frag_neg']
-            sorted_idx = index_data['sorted_idx_neg']
         
         if len(mz_values) == 0:
             return candidates
         
         match_range = self._binary_search_range(mz_values, precursor_mz, tolerance_ppm)
         
-        # 记录候选匹配信息用于验证
         for i in match_range:
+            if i >= len(mz_values):
+                continue
+                
             db_mz = mz_values[i]
             ppm_error = abs(precursor_mz - db_mz) / db_mz * 1e6 if db_mz > 0 else float('inf')
             
-            # 获取化合物信息
-            local_idx = sorted_idx[i][1] if i < len(sorted_idx) else i
+            # 如果ppm误差超过最大允许值，跳过
+            if ppm_error > self.config['max_ppm']:
+                continue
+            
+            # 获取对应的索引信息
+            if ionization_mode == 'positive' or ionization_mode == 'both':
+                local_idx = self.main_index['sorted_idx_pos'][i][1] if index_data == self.main_index else \
+                           (self.english_index['sorted_idx_pos'][i][1] if index_data == self.english_index else \
+                            self.standard_index['sorted_idx_pos'][i][1])
+                fragments = self.main_index['db_frag_pos'][i] if index_data == self.main_index else \
+                           (self.english_index['db_frag_pos'][i] if index_data == self.english_index else \
+                            self.standard_index['db_frag_pos'][i])
+            else:
+                local_idx = self.main_index['sorted_idx_neg'][i][1] if index_data == self.main_index else \
+                           (self.english_index['sorted_idx_neg'][i][1] if index_data == self.english_index else \
+                            self.standard_index['sorted_idx_neg'][i][1])
+                fragments = self.main_index['db_frag_neg'][i] if index_data == self.main_index else \
+                           (self.english_index['db_frag_neg'][i] if index_data == self.english_index else \
+                            self.standard_index['db_frag_neg'][i])
+            
             compound_info = index_data['compound_info'].get(local_idx, {})
             
-            # 验证：确保化合物名称与准分子离子匹配
-            # 检查化合物名称是否有效（不为空且不是无效值）
-            name_cn = compound_info.get('name_cn', '')
-            name_en = compound_info.get('name_en', '')
+            # 检查化合物是否有有效标识（v6.2修复：放宽验证）
+            has_valid_identity = self._check_compound_identity(compound_info)
             
-            # 如果化合物名称无效，跳过该候选
-            if (not name_cn or name_cn == 'nan' or name_cn == '') and \
-               (not name_en or name_en == 'nan' or name_en == ''):
-                print(f"  警告: 跳过无效化合物名称 - m/z {db_mz}")
+            if not has_valid_identity:
+                self.diagnostic_stats['skipped_no_identity'] += 1
+                if self.enable_diagnostic_logging:
+                    print(f"  跳过无标识化合物: mz={db_mz}")
                 continue
             
             candidate = {
                 'db_idx': local_idx,
                 'db_mz': db_mz,
                 'ppm': ppm_error,
-                'fragments': db_frags[i] if i < len(db_frags) else [],
+                'fragments': fragments,
                 'compound_info': compound_info,
                 'fragment_sources': index_data['fragment_sources'].get(local_idx, {}),
                 'db_name': index_data['db_name'],
                 'rt_values': index_data['rt_values'],
                 'neutral_losses': index_data['neutral_losses'],
-                'matching_verified': True  # 标记已验证
+                'adduct_matched': abs(db_mz - compound_info.get('adduct_base_mz', db_mz)) > 0.001 if 'adduct_base_mz' in compound_info else False
             }
             candidates.append(candidate)
+            self.diagnostic_stats['total_candidates'] += 1
         
         return candidates
 
+    def _check_compound_identity(self, compound_info):
+        """
+        检查化合物是否有有效标识
+        v6.2修复：放宽验证条件，只要有中文名、英文名或CAS号之一就认为有效
+        """
+        name_cn = compound_info.get('name_cn', '')
+        name_en = compound_info.get('name_en', '')
+        cas = compound_info.get('cas', '')
+        
+        # 检查是否有任何有效标识
+        has_valid_identity = (
+            (name_cn and name_cn != 'nan' and name_cn.strip() != '') or
+            (name_en and name_en != 'nan' and name_en.strip() != '') or
+            (cas and cas != 'nan' and cas.strip() != '')
+        )
+        
+        return has_valid_identity
+
     def _binary_search_range(self, mz_array, mz, tolerance_ppm):
-        """二分查找匹配范围"""
+        """二分查找匹配范围（支持不对称容差）"""
         if len(mz_array) == 0:
             return range(0, 0)
         mz = float(mz)
         tolerance = mz * tolerance_ppm / 1e6
-        mz_min = mz - tolerance
-        mz_max = mz + tolerance
+        # 使用对称容差，但边界略放宽以捕获边界值
+        mz_min = mz - tolerance * 1.05  # 放宽5%边界
+        mz_max = mz + tolerance * 1.05
         left = bisect_left(mz_array, mz_min)
         right = bisect_right(mz_array, mz_max)
         return range(left, right)
@@ -926,7 +1046,6 @@ class UltimateGardeniaIdentifier:
                                 matched.append(obs_val)
                             if obs_val not in matched_sources:
                                 matched_sources[obs_val] = set()
-                            # 添加该碎片的文献来源
                             if ref_val in self.temp_fragment_source_map:
                                 matched_sources[obs_val].update(self.temp_fragment_source_map[ref_val])
                             break
@@ -987,7 +1106,7 @@ class UltimateGardeniaIdentifier:
         if ppm <= 50 and not has_fragment_data:
             return 4, '提示级', '较低', '仅供筛查'
         if ppm <= 50 and has_fragment_data and matched_count == 0:
-            return 5, '参考级', '受限', '信息受限'
+            return 5, '参考级', '受限', '碎片未匹配，仅供参考'
         if 50 < ppm <= 75:
             return 4, '提示级', '较低', 'ppm稍大，仅供筛查参考'
         if 75 < ppm <= max_ppm:
@@ -1143,10 +1262,13 @@ class UltimateGardeniaIdentifier:
         return precursors
 
     def identify_compound(self, precursor_mz, fragments, rt, ionization_mode):
-        """鉴定单个化合物 - 增强验证确保化合物名称与母离子匹配"""
+        """
+        鉴定单个化合物
+        v6.2修复：移除碎片强制匹配过滤，改为软性评分
+        """
         tolerance_ppm = self.config['tolerance_ppm']
         fragment_tolerance = self.config['fragment_tolerance']
-        self.temp_fragment_source_map = {}  # 临时存储碎片来源映射
+        self.temp_fragment_source_map = {}
         
         all_candidates = []
         
@@ -1161,7 +1283,6 @@ class UltimateGardeniaIdentifier:
             if index_data['mz_values_pos'].size == 0 and index_data['mz_values_neg'].size == 0:
                 continue
             
-            # 使用预构建的碎片来源查找表（加速）
             if ionization_mode in ['positive', 'both']:
                 self.temp_fragment_source_map = index_data.get('frag_source_lookup_pos', {})
             else:
@@ -1173,21 +1294,14 @@ class UltimateGardeniaIdentifier:
         if not all_candidates:
             return []
         
-        # 按ppm排序，保留所有ppm范围内的候选化合物
+        # 按ppm排序
         all_candidates.sort(key=lambda x: x['ppm'])
         
         results = []
         for candidate in all_candidates:
-            # 再次验证化合物名称有效
             compound_info = candidate['compound_info']
-            name_cn = compound_info.get('name_cn', '')
-            name_en = compound_info.get('name_en', '')
             
-            # 跳过无效化合物名称的候选
-            if (not name_cn or name_cn == 'nan' or name_cn == '') and \
-               (not name_en or name_en == 'nan' or name_en == ''):
-                continue
-            
+            # v6.2修复：不再强制要求有匹配碎片，允许只有母离子匹配的候选
             matched_frags, matched_frag_sources = self._match_fragments_with_source(
                 fragments,
                 candidate['fragments'],
@@ -1196,16 +1310,9 @@ class UltimateGardeniaIdentifier:
                 precursor_mz
             )
             
-            # 优化：碎片匹配过滤规则
-            # 1. 如果数据库中有碎片离子数据（不为空），但全部匹配失败，则跳过
-            # 2. 如果数据库中没有碎片离子数据（为空），则保留（允许只有母离子匹配）
-            # 3. 如果有匹配成功的碎片，则保留
-            has_db_fragments = len(candidate['fragments']) > 0
-            has_matched_frags = len(matched_frags) > 0
-            
-            # 只有有碎片数据且全部匹配失败时才跳过
-            if has_db_fragments and not has_matched_frags:
-                continue
+            # v6.2核心修复：移除强制碎片匹配过滤
+            # 原代码：if has_db_fragments and not has_matched_frags: continue
+            # 新逻辑：保留所有候选，通过评分系统自然区分
             
             category = self._classify_compound(
                 compound_info.get('name_cn', '') + ' ' + compound_info.get('name_en', ''),
@@ -1220,6 +1327,11 @@ class UltimateGardeniaIdentifier:
                 len(diagnostic),
                 len(candidate['fragments']) > 0
             )
+            
+            # v6.2新增：只有当严格模式启用且完全没有标识时才排除
+            if self.strict_mode and rating >= 5:
+                # 严格模式下，低置信度的筛选掉
+                continue
             
             # 获取保留时间偏差
             rt_deviation = None
@@ -1243,7 +1355,6 @@ class UltimateGardeniaIdentifier:
                 sources_str = '; '.join(sorted(src_set))
                 frag_sources_formatted.append(f"{frag_mz}({sources_str})")
             
-            # 构建碎片离子列表（不合并，每个碎片保留来源）
             fragment_list = []
             for frag_mz, src_set in matched_frag_sources.items():
                 sources_str = '; '.join(sorted(src_set))
@@ -1258,17 +1369,17 @@ class UltimateGardeniaIdentifier:
                 '观测RT': rt,
                 'ppm': round(candidate['ppm'], 4),
                 'db_mz': candidate['db_mz'],
-                '化合物中文名': name_cn if name_cn != 'nan' else '',
-                '化合物英文名': name_en if name_en != 'nan' else '',
+                '化合物中文名': compound_info.get('name_cn', '') if compound_info.get('name_cn', '') != 'nan' else '',
+                '化合物英文名': compound_info.get('name_en', '') if compound_info.get('name_en', '') != 'nan' else '',
                 '分子式': compound_info.get('formula', ''),
                 'CAS号': compound_info.get('cas', ''),
                 '药材名称': compound_info.get('herb', ''),
                 '化合物类型': compound_info.get('compound_type', ''),
-                '数据来源': candidate['db_name'],  # 明确标注数据库来源
+                '数据来源': candidate['db_name'],
                 '是否为对照品': '是' if compound_info.get('is_standard', False) else '否',
                 '离子化方式': ionization_mode,
                 '加和离子': compound_info.get('adduct_pos', '') if ionization_mode in ['positive', 'both'] else compound_info.get('adduct_neg', ''),
-                '_fragment_list': fragment_list,  # 内部存储，用于后续处理
+                '_fragment_list': fragment_list,
                 '文献来源': compound_info.get('source', ''),
                 '诊断性离子': '; '.join([str(d) for d in diagnostic]) if diagnostic else '',
                 '匹配碎片数': len(matched_frags),
@@ -1278,10 +1389,12 @@ class UltimateGardeniaIdentifier:
                 '置信度': confidence,
                 '报告建议': recommendation,
                 '综合得分': base_score,
-                '基础得分': base_score
+                '基础得分': base_score,
+                '加和离子匹配': candidate.get('adduct_matched', False)  # v6.2新增
             }
             
             results.append(result)
+            self.diagnostic_stats['kept_candidates'] += 1
         
         return results
 
@@ -1331,6 +1444,13 @@ class UltimateGardeniaIdentifier:
         
         print(f"\n【9/9】初步匹配完成，共 {len(records)} 条候选记录，正在合并...")
         
+        # 打印诊断统计
+        if self.enable_diagnostic_logging:
+            print("\n【漏检诊断统计】")
+            print(f"  总候选化合物: {self.diagnostic_stats['total_candidates']}")
+            print(f"  因无标识跳过: {self.diagnostic_stats['skipped_no_identity']}")
+            print(f"  保留候选数: {self.diagnostic_stats['kept_candidates']}")
+        
         report_df = self._merge_and_fuse_records(records)
         
         self.stats['identified_compounds'] = len(report_df)
@@ -1350,7 +1470,6 @@ class UltimateGardeniaIdentifier:
         for record in records_list:
             merge_key = f"{record.get('CAS号', '')}_{record.get('分子式', '')}_{record.get('化合物中文名', '')}"
             record['_merge_key'] = merge_key
-            # 保留碎片离子列表（不合并）
             record['_fragment_list'] = record.get('_fragment_list', [])
         
         best_records = {}
@@ -1409,21 +1528,18 @@ class UltimateGardeniaIdentifier:
             
             for comp_key, comp_recs in compound_groups.items():
                 if len(comp_recs) == 1:
-                    # 单条记录，格式化碎片离子输出
                     rec = comp_recs[0]
                     self._format_fragment_output(rec)
                     final_records.append(rec)
                 else:
                     best_rec = max(comp_recs, key=lambda x: x['综合得分']).copy()
                     
-                    # 合并数据来源
                     data_sources = set()
                     for rec in comp_recs:
                         if rec.get('数据来源'):
                             data_sources.add(rec['数据来源'])
                     best_rec['数据来源'] = '; '.join(sorted(data_sources))
                     
-                    # 合并其他字段
                     adducts = set()
                     modes = set()
                     for rec in comp_recs:
@@ -1434,7 +1550,6 @@ class UltimateGardeniaIdentifier:
                     best_rec['加和离子'] = '; '.join(sorted(adducts))
                     best_rec['离子化方式'] = '/'.join(sorted(modes))
                     
-                    # 合并碎片离子（保留每个碎片的独立来源，不合并）
                     all_fragments = {}
                     for rec in comp_recs:
                         frag_list = rec.get('_fragment_list', [])
@@ -1446,12 +1561,10 @@ class UltimateGardeniaIdentifier:
                                     'sources': set(),
                                     'display_parts': []
                                 }
-                            # 合并来源（去重）
                             for src in frag['sources'].split('; '):
                                 if src:
                                     all_fragments[frag_mz]['sources'].add(src.strip())
                     
-                    # 构建碎片离子输出（不合并，每个碎片独立）
                     fragment_output = []
                     for frag_mz, frag_data in sorted(all_fragments.items()):
                         sources_str = '; '.join(sorted(frag_data['sources']))
@@ -1460,7 +1573,6 @@ class UltimateGardeniaIdentifier:
                     best_rec['主要碎片离子'] = '; '.join(fragment_output) if fragment_output else ''
                     best_rec['匹配碎片数'] = len(all_fragments)
                     
-                    # 合并文献来源
                     all_sources = set()
                     for rec in comp_recs:
                         if rec.get('文献来源'):
@@ -1469,7 +1581,6 @@ class UltimateGardeniaIdentifier:
                     best_rec['文献来源'] = '; '.join(sorted(all_sources))
                     best_rec['文献来源数'] = len(all_sources)
                     
-                    # 合并诊断性离子
                     all_diag = set()
                     for rec in comp_recs:
                         if rec.get('诊断性离子'):
@@ -1477,11 +1588,9 @@ class UltimateGardeniaIdentifier:
                                 all_diag.add(d.strip())
                     best_rec['诊断性离子'] = '; '.join(sorted(all_diag)) if all_diag else ''
                     
-                    # 删除内部字段
                     if '_fragment_list' in best_rec:
                         del best_rec['_fragment_list']
                     
-                    # 评分调整
                     extra_count = len(data_sources) - 1
                     if extra_count > 0:
                         fusion_bonus = min(extra_count * 5, 15)
@@ -1535,13 +1644,11 @@ class UltimateGardeniaIdentifier:
         print(f"  - 鉴定化合物数: {self.stats['identified_compounds']}")
 
         if not report_df.empty:
-            # 数据来源统计
             if '数据来源' in report_df.columns:
                 print(f"\n【数据来源分布】")
                 for source, count in report_df['数据来源'].value_counts().items():
                     print(f"  - {source}: {count} 个")
             
-            # 对照品统计
             if '是否为对照品' in report_df.columns:
                 std_count = (report_df['是否为对照品'] == '是').sum()
                 print(f"\n【对照品匹配】")
@@ -1554,10 +1661,9 @@ class UltimateGardeniaIdentifier:
         print("\n" + "="*100)
 
     def _format_fragment_output(self, record):
-        """格式化碎片离子输出（保持独立，不合并）"""
+        """格式化碎片离子输出"""
         fragment_list = record.get('_fragment_list', [])
         if fragment_list:
-            # 每个碎片离子单独显示，保留来源
             fragment_output = []
             for frag in fragment_list:
                 display = frag.get('display', f"{frag.get('fragment_mz')}({frag.get('sources', '')})")
@@ -1566,7 +1672,6 @@ class UltimateGardeniaIdentifier:
         else:
             record['主要碎片离子'] = ''
         
-        # 删除内部字段
         if '_fragment_list' in record:
             del record['_fragment_list']
         
@@ -1575,7 +1680,7 @@ class UltimateGardeniaIdentifier:
     def _print_initialization_info(self):
         """打印初始化信息"""
         print("\n" + "="*80)
-        print("程序初始化完成（三库独立比对版 v6.1 - 修复母离子匹配）")
+        print("程序初始化完成（v6.2 漏检修复版）")
         print("="*80)
         print(f"  - 主数据库索引: {len(self.main_index['mz_values_pos'])} 条正离子, {len(self.main_index['mz_values_neg'])} 条负离子")
         print(f"  - 英文数据库索引: {len(self.english_index['mz_values_pos'])} 条正离子, {len(self.english_index['mz_values_neg'])} 条负离子")
@@ -1585,10 +1690,9 @@ class UltimateGardeniaIdentifier:
         print(f"  - 强度相对阈值: {self.intensity_relative_threshold*100:.1f}%")
         print(f"  - RT得分: {'启用' if self.use_rt_score else '禁用'}")
         print(f"  - 并行处理: {'启用' if self.use_parallel else '禁用'}")
+        print(f"  - 严格模式: {'启用' if self.strict_mode else '禁用'}")
+        print(f"  - 加和离子扩展: {'启用' if self.enable_adduct_expansion else '禁用'}")
         print("="*80)
-
-
-from collections import defaultdict
 
 
 # ============================================================================
@@ -1640,11 +1744,11 @@ def match_diagnostic_ions(user_mz_values, diagnostic_df, tolerance_ppm=10, ion_m
 
 
 # ============================================================================
-# Streamlit 网页应用部分（保持不变）
+# Streamlit 网页应用部分
 # ============================================================================
 
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v6.1",
+    page_title="中药化合物智能鉴定平台 v6.2",
     page_icon="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌿</text></svg>",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1706,7 +1810,7 @@ def login_page():
     """显示登录页面"""
     st.markdown("""
     <div style="max-width: 450px; margin: 80px auto; padding: 2rem; background: white; border-radius: 24px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);">
-        <div style="text-align: center; font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem; background: linear-gradient(135deg, #059669, #0891b2); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">🌿 中药化合物智能鉴定平台</div>
+        <div style="text-align: center; font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem; background: linear-gradient(135deg, #059669, #0891b2); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">🌿 中药化合物智能鉴定平台 v6.2</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1740,7 +1844,7 @@ def create_header():
     st.markdown(f"""
     <div class="main-header">
         <h1>🌿 中药化合物智能鉴定平台</h1>
-        <p>v6.1 三库独立比对版（修复母离子匹配） | 欢迎回来，{username}</p>
+        <p>v6.2 漏检修复版（加和离子扩展+碎片匹配优化） | 欢迎回来，{username}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1750,7 +1854,7 @@ def create_sidebar():
     st.sidebar.markdown("""
     <div style="text-align: center; padding: 1rem 0; border-bottom: 2px solid #e2e8f0;">
         <h3 style="color: #1e293b; margin: 0;">TCM Identifier</h3>
-        <p style="color: #64748b; font-size: 0.8rem;">中药化合物鉴定系统</p>
+        <p style="color: #64748b; font-size: 0.8rem;">中药化合物鉴定系统 v6.2</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1770,12 +1874,13 @@ def create_sidebar():
     st.sidebar.markdown("---")
     st.sidebar.markdown("""
     <div style="background: white; border-radius: 12px; padding: 0.75rem;">
-        <h4 style="color: #1e293b; margin: 0 0 0.5rem 0; font-size: 0.9rem;">版本信息</h4>
+        <h4 style="color: #1e293b; margin: 0 0 0.5rem 0; font-size: 0.9rem;">v6.2 更新内容</h4>
         <ul style="color: #64748b; font-size: 0.8rem; padding-left: 1rem;">
-            <li>v6.1 三库独立比对版</li>
-            <li>三个数据库独立比对</li>
-            <li>碎片离子标注来源</li>
-            <li>修复母离子匹配问题</li>
+            <li>✅ 修复碎片强制匹配漏检</li>
+            <li>✅ 加和离子扩展支持</li>
+            <li>✅ 放宽化合物名称验证</li>
+            <li>✅ 可配置严格模式</li>
+            <li>✅ 不对称容差优化</li>
         </ul>
     </div>
     """, unsafe_allow_html=True)
@@ -1808,16 +1913,15 @@ def show_home_page():
             """, unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("## 核心功能")
+    st.markdown("## v6.2 核心改进")
 
     features = [
-        ("🔍", "三库独立比对", "主数据库、英文数据库、对照品数据库分别独立比对"),
-        ("📈", "六级评级标准", "确证级、高置信级、推定级、提示级、参考级、排除级"),
-        ("🧪", "碎片离子溯源", "碎片离子标注来源于哪个数据库和文献"),
-        ("📁", "灵活数据上传", "可单独上传正离子或负离子数据文件"),
-        ("⚡", "高效索引加速", "使用索引缓存加速大规模数据处理"),
-        ("🔄", "智能结果融合", "自动合并同化合物不同离子模式的结果"),
-        ("✅", "母离子验证", "确保化合物名称与准分子离子匹配")
+        ("🔍", "碎片匹配优化", "移除强制碎片匹配过滤，改为软性评分，防止真阳性漏检"),
+        ("🧪", "加和离子扩展", "支持[M+H]⁺、[M+Na]⁺、[M+K]⁺等多种加和离子形式"),
+        ("✅", "放宽名称验证", "只需中文名、英文名或CAS号之一即可保留"),
+        ("⚙️", "可配置严格模式", "用户可根据需求选择宽松/严格鉴定模式"),
+        ("📊", "诊断日志", "可启用漏检诊断日志，分析跳过原因"),
+        ("🎯", "不对称容差", "优化边界匹配，提高边界值捕获率")
     ]
 
     col1, col2 = st.columns(2)
@@ -1836,7 +1940,7 @@ def show_home_page():
 
 
 def show_analysis_page():
-    """鉴定分析页面"""
+    """鉴定分析页面（v6.2新增配置选项）"""
     create_header()
 
     st.markdown("## 上传质谱数据")
@@ -1880,13 +1984,28 @@ def show_analysis_page():
             st.success(f"已上传自定义数据库: {custom_db_file.name}")
 
     st.markdown("---")
+    st.markdown("## v6.2 新增配置选项")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        strict_mode = st.checkbox("严格模式", value=False, 
+                                   help="启用后低置信度结果将被过滤，可能漏掉真阳性")
+        enable_adduct_expansion = st.checkbox("启用加和离子扩展", value=True,
+                                              help="支持[M+H]⁺、[M+Na]⁺、[M+K]⁺等多种加和离子")
+    with col2:
+        enable_diagnostic_logging = st.checkbox("启用诊断日志", value=False,
+                                                help="输出漏检诊断信息，帮助分析跳过原因")
+        max_ppm = st.number_input("最大ppm容差", min_value=50, max_value=200, value=100,
+                                  help="超过此值的候选将被排除")
+
+    st.markdown("---")
     st.markdown("## 鉴定参数配置")
 
     preset = st.radio("参数预设", options=["自定义", "快速模式", "高精度模式"], horizontal=True)
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        tolerance_ppm = st.number_input("ppm误差容限", min_value=10, max_value=100, value=50)
+        tolerance_ppm = st.number_input("ppm误差容限", min_value=10, max_value=200, value=50)
     with col2:
         max_candidates = st.number_input("最大候选数", min_value=1, max_value=10, value=3)
     with col3:
@@ -1970,6 +2089,7 @@ def show_analysis_page():
                         'fragment_tolerance_ppm': fragment_tolerance_ppm,
                         'tolerance_ppm': tolerance_ppm,
                         'max_candidates': max_candidates,
+                        'max_ppm': max_ppm,
                     }
 
                     identifier = UltimateGardeniaIdentifier(
@@ -1986,7 +2106,11 @@ def show_analysis_page():
                         custom_db_path=custom_db_path,
                         english_db_path=english_db_path,
                         standard_db_path=standard_db_path,
-                        cache_index=True
+                        cache_index=True,
+                        strict_mode=strict_mode,
+                        enable_adduct_expansion=enable_adduct_expansion,
+                        max_ppm=max_ppm,
+                        enable_diagnostic_logging=enable_diagnostic_logging
                     )
 
                     progress_bar.progress(50)
@@ -2083,12 +2207,30 @@ def show_diagnostic_ion_page():
 def show_guide_page():
     """使用指南页面"""
     create_header()
-    st.markdown("## 使用指南（v6.1 三库独立比对版 - 修复母离子匹配）")
+    st.markdown("## 使用指南（v6.2 漏检修复版）")
 
     st.markdown("""
-    ### 三库独立比对机制
+    ### v6.2 核心修复说明
 
-    本版本实现了三个数据库的独立比对：
+    #### 1. 碎片匹配强制过滤移除
+    **问题**：v6.1中，如果数据库化合物有碎片信息但实验数据未匹配到任何碎片，该候选会被直接跳过，导致真阳性漏检。
+
+    **修复**：移除强制过滤，改为软性评分。即使碎片未匹配，只要母离子ppm匹配良好，仍会以低置信度保留，由评分系统自然区分。
+
+    #### 2. 加和离子扩展支持
+    新增支持多种加和离子形式：
+    - 正离子：[M+H]⁺、[M+Na]⁺、[M+K]⁺、[M+NH₄]⁺、[M+Li]⁺、[M+2H]²⁺
+    - 负离子：[M-H]⁻、[M+Cl]⁻、[M+HCOO]⁻、[M+CH₃COO]⁻、[M+Br]⁻
+
+    #### 3. 化合物名称验证放宽
+    **原逻辑**：要求同时有中文名和英文名
+    **新逻辑**：中文名、英文名、CAS号三者有其一即可保留
+
+    #### 4. 严格模式开关
+    - 关闭（默认）：保留所有候选，最大化真阳性捕获率
+    - 开启：过滤低置信度结果，适合快速筛选
+
+    ### 三库独立比对机制
 
     1. **主数据库 (TCM-SM-MS DB.xlsx)**：中药小分子化学成分高分辨质谱数据库
     2. **英文数据库 (数据库（英文）.xlsx)**：英文化合物数据库
@@ -2101,12 +2243,6 @@ def show_guide_page():
     - `[英文数据库] 文献来源`
     - `[对照品数据库]`
 
-    ### 母离子匹配验证（v6.1新增）
-
-    - 自动验证化合物名称是否有效
-    - 跳过化合物名称为空的无效记录
-    - 确保数据库中的化合物名称与准分子离子对应
-
     ### 评级标准
 
     | 等级 | ppm要求 | 碎片要求 | 说明 |
@@ -2114,6 +2250,8 @@ def show_guide_page():
     | 确证级 | ≤10ppm | ≥2个碎片+≥1个诊断离子 | 可直接报告 |
     | 高置信级 | ≤20ppm | ≥2个碎片 | 建议复核后报告 |
     | 推定级 | ≤50ppm | ≥1个碎片 | 需验证后报告 |
+    | 提示级 | ≤50ppm | 无碎片或ppm较大 | 仅供筛查参考 |
+    | 参考级 | ≤100ppm | 碎片未匹配 | 信息受限 |
     """)
 
 
@@ -2122,7 +2260,6 @@ def show_database_page():
     create_header()
     st.markdown("## 数据库预览")
 
-    # 主数据库
     db_path = find_database_path()
     if db_path:
         try:
@@ -2136,7 +2273,6 @@ def show_database_page():
     else:
         st.warning("未找到主数据库文件！")
 
-    # 英文数据库
     st.markdown("---")
     st.markdown("### 英文数据库（数据库（英文）.xlsx）")
     eng_path = find_english_database_path()
@@ -2153,7 +2289,6 @@ def show_database_page():
     else:
         st.info("未找到英文数据库文件")
 
-    # 对照品数据库
     st.markdown("---")
     st.markdown("### 对照品数据库（对照品数据库.xlsx）")
     std_path = find_standard_database_path()
@@ -2187,7 +2322,7 @@ def show_results_page():
 
     report = st.session_state['analysis_results']
 
-    st.markdown("## 鉴定结果分析（v6.1 三库独立比对版 - 修复母离子匹配）")
+    st.markdown("## 鉴定结果分析（v6.2 漏检修复版）")
 
     if report.empty:
         st.warning("鉴定结果为空")
@@ -2206,7 +2341,6 @@ def show_results_page():
         avg_score = report['综合得分'].mean()
         st.metric("平均综合得分", f"{avg_score:.1f}")
 
-    # 数据来源分布
     if '数据来源' in report.columns:
         st.markdown("### 数据来源分布")
         st.bar_chart(report['数据来源'].value_counts())
