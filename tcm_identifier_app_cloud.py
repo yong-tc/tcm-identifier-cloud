@@ -409,14 +409,15 @@ class UltimateGardeniaIdentifier:
             'gradient_time': 30.0,
             'cid_min': 0.5,
             'cid_max': 1.0,
-            'fragment_tolerance': 0.05,
+            'fragment_tolerance': 0.15,  # 固定Da容差，用于二级匹配
             'fragment_tolerance_ppm': 20,
             'tolerance_ppm': 50,
             'max_candidates': 3,
             'min_fragment_count': 1,
             'min_intensity': 100,
-            'ppm_tier1': 10,
-            'ppm_tier2': 20,
+            'ppm_tier1': 10,   # 确证级ppm阈值
+            'ppm_tier2': 20,   # 高置信级ppm阈值
+            'ppm_tier3': 50,   # 推定级ppm阈值
             'max_ppm': max_ppm,
         }
 
@@ -453,57 +454,37 @@ class UltimateGardeniaIdentifier:
         self.num_workers = min(os.cpu_count(), 8)
 
         print("="*80)
-        print("中药化合物鉴定程序 v6.2（漏检修复版）")
+        print("中药化合物鉴定程序 v6.2（仅使用主数据库TCM-SM-MS DB.csv）")
         print("="*80)
         print(f"  严格模式: {'启用' if strict_mode else '禁用'}")
         print(f"  加和离子扩展: {'启用' if enable_adduct_expansion else '禁用'}")
         print(f"  最大ppm容差: {self.config['max_ppm']}")
         print(f"  诊断日志: {'启用' if enable_diagnostic_logging else '禁用'}")
         print("="*80)
-        
+
         print("\n【1/9】正在加载数据库...")
-        
-        # 加载主数据库
+
+        # 只加载主数据库（TCM-SM-MS DB.csv）
         self.main_database = self._load_data(database_path)
         if self.main_database.empty:
             print("  警告: 主数据库为空或未找到")
         else:
             print(f"  主数据库加载成功: {len(self.main_database)} 条记录")
-        
-        # 加载英文数据库
-        self.english_database = self._load_english_data(english_db_path)
-        if not self.english_database.empty:
-            print(f"  英文数据库加载成功: {len(self.english_database)} 条记录")
-        
-        # 加载对照品数据库
-        self.standard_database = self._load_standard_data(standard_db_path)
-        if not self.standard_database.empty:
-            print(f"  对照品数据库加载成功: {len(self.standard_database)} 条记录")
-        else:
-            print("  对照品数据库未找到或为空")
 
-        # 加载自定义数据库
-        if custom_db_path and os.path.exists(custom_db_path):
-            custom_db = self._load_data(custom_db_path)
-            if not custom_db.empty:
-                print(f"  加载自定义数据库: {len(custom_db)} 条记录")
-                if self.main_database.empty:
-                    self.main_database = custom_db
-                else:
-                    self.main_database = pd.concat([self.main_database, custom_db], ignore_index=True)
+        # 英文数据库和对照品数据库设为空
+        self.english_database = pd.DataFrame()
+        self.standard_database = pd.DataFrame()
+        print("  英文数据库: 禁用")
+        print("  对照品数据库: 禁用")
 
         # 筛选药材（如果指定）
         if herb_name:
             print(f"【2/9】正在筛选 {herb_name} 相关数据...")
             self.main_database = self._filter_by_herb(self.main_database, herb_name)
-            self.english_database = self._filter_by_herb(self.english_database, herb_name)
-            self.standard_database = self._filter_by_herb(self.standard_database, herb_name)
         else:
             print("【2/9】使用全部数据库进行化合物鉴定")
 
         print(f"  主数据库筛选后: {len(self.main_database)} 条")
-        print(f"  英文数据库筛选后: {len(self.english_database)} 条")
-        print(f"  对照品数据库筛选后: {len(self.standard_database)} 条")
 
         print("【3/9】正在加载质谱数据...")
         self.ms_positive = self._load_data(ms_positive_path) if ms_positive_path else pd.DataFrame()
@@ -1054,62 +1035,62 @@ class UltimateGardeniaIdentifier:
         return range(left, right)
 
     def _match_fragments_fast(self, observed, reference, tolerance_value, tolerance_type='Da', precursor_mz=None):
-        """快速碎片匹配"""
+        """
+        快速碎片匹配 - 使用固定Da容差
+        用户核心逻辑：二级匹配不考虑ppm，使用可控容差
+        """
         matched = []
         if len(reference) == 0:
             return matched
         ref_arr = np.asarray(reference)
         obs_arr = np.asarray(observed)
+
+        # 强制使用Da容差进行碎片匹配
+        da_tolerance = tolerance_value if tolerance_type == 'Da' else 0.15  # 默认0.15Da
+
         for ref_val in ref_arr:
             if pd.notna(ref_val) and float(ref_val) > 0:
                 for obs_val in obs_arr:
-                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
+                    # 排除母离子本身
+                    if precursor_mz is not None and abs(obs_val - precursor_mz) <= da_tolerance:
                         continue
-                    if tolerance_type == 'Da':
-                        if abs(obs_val - ref_val) <= tolerance_value:
-                            matched.append(obs_val)
-                            break
-                    else:
-                        ppm_error = abs(obs_val - ref_val) / ref_val * 1e6
-                        if ppm_error <= tolerance_value:
-                            matched.append(obs_val)
-                            break
+                    # 使用固定Da容差匹配
+                    if abs(obs_val - ref_val) <= da_tolerance:
+                        matched.append(obs_val)
+                        break
         return list(set(matched))
 
     def _match_fragments_with_source(self, observed, reference, tolerance_value, tolerance_type='Da', precursor_mz=None):
-        """碎片匹配，返回匹配结果及来源"""
+        """
+        碎片匹配，返回匹配结果及来源
+        用户核心逻辑：二级匹配不考虑ppm，使用可控固定Da容差
+        """
         matched = []
         matched_sources = {}
-        
+
         if len(reference) == 0:
             return matched, matched_sources
-            
+
+        # 强制使用固定Da容差（用户核心要求）
+        da_tolerance = tolerance_value if tolerance_type == 'Da' else 0.15
+
         for obs_val in observed:
-            if precursor_mz is not None and abs(obs_val - precursor_mz) <= tolerance_value:
+            # 排除母离子
+            if precursor_mz is not None and abs(obs_val - precursor_mz) <= da_tolerance:
                 continue
-                
+
             for ref_val in reference:
                 if pd.notna(ref_val) and float(ref_val) > 0:
-                    if tolerance_type == 'Da':
-                        if abs(obs_val - ref_val) <= tolerance_value:
-                            if obs_val not in matched:
-                                matched.append(obs_val)
-                            if obs_val not in matched_sources:
-                                matched_sources[obs_val] = set()
-                            if ref_val in self.temp_fragment_source_map:
-                                matched_sources[obs_val].update(self.temp_fragment_source_map[ref_val])
-                            break
-                    else:
-                        ppm_error = abs(obs_val - ref_val) / ref_val * 1e6
-                        if ppm_error <= tolerance_value:
-                            if obs_val not in matched:
-                                matched.append(obs_val)
-                            if obs_val not in matched_sources:
-                                matched_sources[obs_val] = set()
-                            if ref_val in self.temp_fragment_source_map:
-                                matched_sources[obs_val].update(self.temp_fragment_source_map[ref_val])
-                            break
-        
+                    # 使用固定Da容差匹配
+                    if abs(obs_val - ref_val) <= da_tolerance:
+                        if obs_val not in matched:
+                            matched.append(obs_val)
+                        if obs_val not in matched_sources:
+                            matched_sources[obs_val] = set()
+                        if ref_val in self.temp_fragment_source_map:
+                            matched_sources[obs_val].update(self.temp_fragment_source_map[ref_val])
+                        break
+
         return matched, matched_sources
 
     def _find_diagnostic_ions_fast(self, matched_fragments, category, precursor_mz=None):
@@ -1138,34 +1119,59 @@ class UltimateGardeniaIdentifier:
         return diagnostic, weights_used
 
     def _determine_confidence_level(self, ppm, matched_count, diagnostic_count, has_fragment_data):
-        """确定置信等级"""
+        """
+        确定置信等级 - 简化版
+        核心逻辑：一级匹配考虑ppm，二级匹配不考虑ppm
+        评级以ppm为主，碎片匹配为辅
+        """
         ppm_tier1 = self.config.get('ppm_tier1', 10)
         ppm_tier2 = self.config.get('ppm_tier2', 20)
+        ppm_tier3 = self.config.get('ppm_tier3', 50)
         max_ppm = self.config.get('max_ppm', 100)
 
+        # 一级过滤：ppm超过最大允许值
         if ppm > max_ppm:
-            return 6, '排除级', '未识别', f'ppm > {max_ppm}，不符合报告要求'
-        if ppm <= 5 and matched_count >= 3:
-            return 1, '确证级', '最高', '高精度+丰富碎片，可直接报告'
-        if ppm <= ppm_tier1 and matched_count >= 2 and diagnostic_count >= 1:
-            return 1, '确证级', '最高', '可直接报告'
-        if ppm <= ppm_tier2 and matched_count >= 2:
-            return 2, '高置信级', '良好', '建议复核后报告'
-        if ppm <= 50 and matched_count >= 1:
-            return 3, '推定级', '中等', '需验证后报告'
-        if ppm <= 50 and not has_fragment_data:
-            return 4, '提示级', '较低', '仅供筛查'
-        if ppm <= 50 and has_fragment_data and matched_count == 0:
-            return 5, '参考级', '受限', '碎片未匹配，仅供参考'
-        if 50 < ppm <= 75:
-            return 4, '提示级', '较低', 'ppm稍大，仅供筛查参考'
-        if 75 < ppm <= max_ppm:
-            return 5, '参考级', '受限', 'ppm较大，需谨慎使用'
+            return 6, '排除级', '未识别', f'ppm({ppm:.2f}) > {max_ppm}，不符合报告要求'
+
+        # 确证级：ppm极精确
+        if ppm <= ppm_tier1:
+            if matched_count >= 2 or diagnostic_count >= 1:
+                return 1, '确证级', '最高', f'ppm({ppm:.2f})≤{ppm_tier1}且有碎片支持'
+            elif has_fragment_data:
+                return 2, '高置信级', '良好', f'ppm({ppm:.2f})≤{ppm_tier1}，建议复核'
+            else:
+                return 3, '推定级', '中等', f'ppm({ppm:.2f})≤{ppm_tier1}，需验证'
+
+        # 高置信级：ppm较精确
+        if ppm <= ppm_tier2:
+            if matched_count >= 1:
+                return 2, '高置信级', '良好', f'ppm({ppm:.2f})≤{ppm_tier2}且有碎片支持'
+            else:
+                return 3, '推定级', '中等', f'ppm({ppm:.2f})≤{ppm_tier2}，建议验证'
+
+        # 推定级：ppm一般
+        if ppm <= ppm_tier3:
+            if matched_count >= 1:
+                return 3, '推定级', '中等', f'ppm({ppm:.2f})≤{ppm_tier3}，需进一步验证'
+            else:
+                return 4, '提示级', '较低', f'ppm({ppm:.2f})≤{ppm_tier3}，仅供筛查'
+
+        # 提示级：ppm较大但在允许范围内
+        if ppm <= max_ppm:
+            if matched_count >= 1:
+                return 4, '提示级', '较低', f'ppm({ppm:.2f})较大，供参考'
+            else:
+                return 5, '参考级', '受限', f'ppm({ppm:.2f})大且无碎片，需谨慎'
+
         return 6, '排除级', '未识别', '不符合评级标准'
 
     def _calculate_base_score(self, rating, ppm, matched_frag_count, diag_count,
                               diag_weights=None, neutral_loss_match_count=0, rt_deviation=None):
-        """计算基础得分"""
+        """
+        计算基础得分 - 简化版
+        核心逻辑：ppm主导评分，碎片为辅助加分
+        """
+        # 基础分（根据评级）
         if rating == 1:
             base = 85
         elif rating == 2:
@@ -1174,29 +1180,33 @@ class UltimateGardeniaIdentifier:
             base = 45
         elif rating == 4:
             base = 25
+        elif rating == 5:
+            base = 15
         else:
             base = 0
 
+        # ppm精确度加分（ppm越低加分越多）
         if ppm <= 5:
-            ppm_adj = 5
+            ppm_adj = 10
         elif ppm <= 10:
-            ppm_adj = 0
+            ppm_adj = 5
         elif ppm <= 20:
-            ppm_adj = -5
+            ppm_adj = 0
         elif ppm <= 30:
+            ppm_adj = -5
+        else:
             ppm_adj = -10
-        else:
-            ppm_adj = -15
 
-        frag_adj = min(matched_frag_count * 2, 20)
+        # 碎片匹配加分（辅助）
+        frag_adj = min(matched_frag_count * 3, 15)
 
+        # 诊断离子加分（辅助）
         if diag_weights:
-            diag_score = min(sum(diag_weights) * 5, 15)
+            diag_score = min(sum(diag_weights) * 3, 10)
         else:
-            diag_score = min(diag_count * 5, 15)
+            diag_score = min(diag_count * 3, 10)
 
-        loss_adj = min(neutral_loss_match_count * 2, 10)
-
+        # RT加分（辅助）
         rt_adj = 0
         if rt_deviation is not None and self.use_rt_score:
             if rt_deviation < 0.2:
@@ -1204,15 +1214,9 @@ class UltimateGardeniaIdentifier:
             elif rt_deviation < 0.5:
                 rt_adj = 2
 
-        total = base + ppm_adj + frag_adj + diag_score + loss_adj + rt_adj
-        total = max(0, total)
+        total = base + ppm_adj + frag_adj + diag_score + rt_adj
+        total = max(0, min(total, 100))
 
-        if rating == 1 and total < 80:
-            total = 80
-        if rating == 2 and total < 60:
-            total = 60
-
-        total = min(total, 100)
         return round(total, 2)
 
     def extract_precursor_ions(self, ms_data, ionization_mode):
@@ -1315,35 +1319,34 @@ class UltimateGardeniaIdentifier:
         """
         鉴定单个化合物
         v6.2修复：移除碎片强制匹配过滤，改为软性评分
+        仅使用主数据库（TCM-SM-MS DB.csv）
         """
         tolerance_ppm = self.config['tolerance_ppm']
         fragment_tolerance = self.config['fragment_tolerance']
         self.temp_fragment_source_map = {}
-        
+
         all_candidates = []
-        
-        # 在三个数据库中分别搜索
+
+        # 只在主数据库中搜索
         databases = [
-            (self.main_index, '主数据库'),
-            (self.english_index, '英文数据库'),
-            (self.standard_index, '对照品数据库')
+            (self.main_index, '主数据库')
         ]
-        
+
         for index_data, db_name in databases:
             if index_data['mz_values_pos'].size == 0 and index_data['mz_values_neg'].size == 0:
                 continue
-            
+
             if ionization_mode in ['positive', 'both']:
                 self.temp_fragment_source_map = index_data.get('frag_source_lookup_pos', {})
             else:
                 self.temp_fragment_source_map = index_data.get('frag_source_lookup_neg', {})
-            
+
             candidates = self._search_database(precursor_mz, tolerance_ppm, ionization_mode, index_data)
             all_candidates.extend(candidates)
-        
+
         if not all_candidates:
             return []
-        
+
         # 按ppm排序
         all_candidates.sort(key=lambda x: x['ppm'])
         
@@ -1512,176 +1515,266 @@ class UltimateGardeniaIdentifier:
         return report_df
 
     def _merge_and_fuse_records(self, records_list):
-        """合并和融合记录"""
+        """
+        合并和融合记录 - 完全按化合物名合并版
+
+        合并规则：
+        1. 同一化合物名（不管RT和m/z）→ 合并为一条记录
+        2. 收集所有RT时间点 → 输出为"可能出峰时间"
+        """
         if not records_list:
             return pd.DataFrame()
-        
-        # 创建合并键
+
+        # 完全按化合物名分组（不管RT和m/z）
+        compound_groups = defaultdict(list)
         for record in records_list:
-            merge_key = f"{record.get('CAS号', '')}_{record.get('分子式', '')}_{record.get('化合物中文名', '')}"
-            record['_merge_key'] = merge_key
-            record['_fragment_list'] = record.get('_fragment_list', [])
-        
-        best_records = {}
-        herbs_collection = defaultdict(set)
-        
-        for record in records_list:
-            merge_key = record['_merge_key']
-            base_score = record.get('综合得分', 0)
-            
-            herbs_collection[merge_key].add(record['药材名称'])
-            
-            current_score = base_score
-            if merge_key not in best_records or current_score > best_records[merge_key][1]:
-                best_records[merge_key] = (record, current_score)
-        
+            compound_name = record.get('化合物中文名', '') or record.get('化合物英文名', '')
+            if compound_name:  # 只处理有化合物名的记录
+                compound_groups[compound_name].append(record)
+
         fused_records = []
-        for merge_key, (record, score) in best_records.items():
-            herbs = herbs_collection[merge_key]
-            record['药材名称'] = '; '.join(sorted(herbs))
-            if '_merge_key' in record:
-                del record['_merge_key']
-            if '基础得分' in record:
-                del record['基础得分']
-            fused_records.append(record)
-        
+
+        for compound_name, comp_records in compound_groups.items():
+            if len(comp_records) == 1:
+                # 只有一个记录，直接保留
+                rec = comp_records[0].copy()
+                # 添加可能出峰时间字段（只有一个时间点）
+                rt = rec.get('出峰时间t/min', 0)
+                rec['可能出峰时间'] = f"{rt:.2f}min"
+                self._clean_record(rec)
+                fused_records.append(rec)
+            else:
+                # 多个记录，需要融合
+                fused_rec = self._fuse_compound_records(comp_records)
+                fused_records.append(fused_rec)
+
         if not fused_records:
             return pd.DataFrame()
-        
-        fused_records.sort(key=lambda x: x['出峰时间t/min'] if x['出峰时间t/min'] is not None else 0)
-        
-        rt_tol = self.rt_fusion_tolerance
-        final_records = []
-        i = 0
-        n = len(fused_records)
-        
-        while i < n:
-            group = [fused_records[i]]
-            j = i + 1
-            while j < n:
-                rt1 = group[0]['出峰时间t/min']
-                rt2 = fused_records[j]['出峰时间t/min']
-                if rt1 is None or rt2 is None:
-                    break
-                if abs(rt1 - rt2) <= rt_tol:
-                    group.append(fused_records[j])
-                    j += 1
-                else:
-                    break
-            
-            compound_groups = {}
-            for rec in group:
-                key = rec.get('CAS号', rec.get('化合物英文名', ''))
-                if key not in compound_groups:
-                    compound_groups[key] = []
-                compound_groups[key].append(rec)
-            
-            for comp_key, comp_recs in compound_groups.items():
-                if len(comp_recs) == 1:
-                    rec = comp_recs[0]
-                    self._format_fragment_output(rec)
-                    final_records.append(rec)
-                else:
-                    best_rec = max(comp_recs, key=lambda x: x['综合得分']).copy()
-                    
-                    data_sources = set()
-                    for rec in comp_recs:
-                        if rec.get('数据来源'):
-                            data_sources.add(rec['数据来源'])
-                    best_rec['数据来源'] = '; '.join(sorted(data_sources))
-                    
-                    adducts = set()
-                    modes = set()
-                    for rec in comp_recs:
-                        if rec.get('加和离子'):
-                            adducts.add(rec['加和离子'])
-                        if rec.get('离子化方式'):
-                            modes.add(rec['离子化方式'])
-                    best_rec['加和离子'] = '; '.join(sorted(adducts))
-                    best_rec['离子化方式'] = '/'.join(sorted(modes))
-                    
-                    all_fragments = {}
-                    for rec in comp_recs:
-                        frag_list = rec.get('_fragment_list', [])
-                        for frag in frag_list:
-                            frag_mz = frag['fragment_mz']
-                            if frag_mz not in all_fragments:
-                                all_fragments[frag_mz] = {
-                                    'fragment_mz': frag_mz,
-                                    'sources': set(),
-                                    'display_parts': []
-                                }
-                            for src in frag['sources'].split('; '):
-                                if src:
-                                    all_fragments[frag_mz]['sources'].add(src.strip())
-                    
-                    fragment_output = []
-                    for frag_mz, frag_data in sorted(all_fragments.items()):
-                        sources_str = '; '.join(sorted(frag_data['sources']))
-                        fragment_output.append(f"{frag_mz}({sources_str})")
-                    
-                    best_rec['主要碎片离子'] = '; '.join(fragment_output) if fragment_output else ''
-                    best_rec['匹配碎片数'] = len(all_fragments)
-                    
-                    all_sources = set()
-                    for rec in comp_recs:
-                        if rec.get('文献来源'):
-                            for s in str(rec['文献来源']).split(';'):
-                                all_sources.add(s.strip())
-                    best_rec['文献来源'] = '; '.join(sorted(all_sources))
-                    best_rec['文献来源数'] = len(all_sources)
-                    
-                    all_diag = set()
-                    for rec in comp_recs:
-                        if rec.get('诊断性离子'):
-                            for d in str(rec['诊断性离子']).split('; '):
-                                all_diag.add(d.strip())
-                    best_rec['诊断性离子'] = '; '.join(sorted(all_diag)) if all_diag else ''
-                    
-                    if '_fragment_list' in best_rec:
-                        del best_rec['_fragment_list']
-                    
-                    extra_count = len(data_sources) - 1
-                    if extra_count > 0:
-                        fusion_bonus = min(extra_count * 5, 15)
-                    else:
-                        fusion_bonus = 0
-                    
-                    final_score = min(best_rec['综合得分'] + fusion_bonus, 100)
-                    
-                    if best_rec['评级'] == 1 and final_score < 80:
-                        final_score = 80
-                    if best_rec['评级'] == 2 and final_score < 60:
-                        final_score = 60
-                    
-                    best_rec['综合得分'] = final_score
-                    
-                    if len(comp_recs) >= 2 and all(rec.get('评级', 5) <= 2 for rec in comp_recs):
-                        best_rec['评级'] = 1
-                        best_rec['评级名称'] = '确证级'
-                        best_rec['置信度'] = '最高'
-                        best_rec['报告建议'] = '可直接报告'
-                    
-                    final_records.append(best_rec)
-            
-            i = j
-        
-        report_df = pd.DataFrame(final_records)
-        
+
+        # 按化合物中文名排序
+        fused_records.sort(key=lambda x: x.get('化合物中文名', '') or x.get('化合物英文名', ''))
+
+        # 返回DataFrame格式
+        report_df = pd.DataFrame(fused_records)
         if not report_df.empty:
-            report_df = report_df.sort_values(by=['评级', '综合得分', 'ppm'], ascending=[True, False, True])
             report_df = report_df.reset_index(drop=True)
             report_df['序号'] = range(1, len(report_df) + 1)
-        
+
         return report_df
 
+    def _fuse_compound_records(self, records):
+        """
+        融合同一化合物的多条记录（正负离子模式）
+        收集所有RT时间点作为可能出峰时间
+        收集所有一级碎片（母离子）和二级碎片
+        """
+        # 选择综合得分最高的记录作为基础
+        best = max(records, key=lambda x: x.get('综合得分', 0))
+        fused = best.copy()
+
+        # 收集所有RT时间点作为可能出峰时间
+        all_rts = []
+        for rec in records:
+            rt = rec.get('出峰时间t/min', 0)
+            if rt:
+                all_rts.append(rt)
+        if len(all_rts) == 1:
+            fused['可能出峰时间'] = f"{all_rts[0]:.2f}min"
+        elif len(all_rts) > 1:
+            # 去重并排序
+            unique_rts = sorted(set(all_rts))
+            fused['可能出峰时间'] = '; '.join([f"{rt:.2f}min" for rt in unique_rts])
+        else:
+            fused['可能出峰时间'] = ''
+
+        # 收集所有离子化方式和加合离子
+        ionization_modes = set()
+        adducts = set()
+        # 收集所有一级碎片（母离子）
+        precursor_mzs = set()
+        obs_mzs = set()
+
+        for rec in records:
+            if rec.get('离子化方式'):
+                ionization_modes.add(str(rec['离子化方式']))
+            if rec.get('加和离子'):
+                adducts.add(str(rec['加和离子']))
+            # 收集库中的母离子m/z
+            if rec.get('db_mz'):
+                precursor_mzs.add(rec.get('db_mz'))
+            # 收集观测的母离子m/z
+            if rec.get('母离子m/z'):
+                obs_mzs.add(rec.get('母离子m/z'))
+
+        fused['离子化方式'] = '/'.join(sorted(ionization_modes))
+        fused['加和离子'] = '; '.join(sorted(adducts))
+
+        # ppm范围：库值范围和观测值范围
+        if precursor_mzs and obs_mzs:
+            db_min, db_max = min(precursor_mzs), max(precursor_mzs)
+            obs_min, obs_max = min(obs_mzs), max(obs_mzs)
+            fused['ppm范围'] = f"库:{db_min:.4f}-{db_max:.4f} 观:{obs_min:.4f}-{obs_max:.4f}"
+        elif precursor_mzs:
+            db_min, db_max = min(precursor_mzs), max(precursor_mzs)
+            fused['ppm范围'] = f"库:{db_min:.4f}-{db_max:.4f}"
+        elif obs_mzs:
+            obs_min, obs_max = min(obs_mzs), max(obs_mzs)
+            fused['ppm范围'] = f"观:{obs_min:.4f}-{obs_max:.4f}"
+
+        # 收集所有一级碎片（母离子）
+        all_precursors = {}
+        for rec in records:
+            db_mz = rec.get('db_mz', 0)
+            obs_mz = rec.get('母离子m/z', 0)
+            if db_mz and db_mz > 0:
+                key = f"一级:{db_mz:.4f}"
+                if key not in all_precursors:
+                    all_precursors[key] = {
+                        'type': '一级',
+                        'db_mz': db_mz,
+                        'obs_mz': obs_mz,
+                        'sources': set()
+                    }
+                if rec.get('药材名称'):
+                    all_precursors[key]['sources'].add(rec.get('药材名称'))
+            elif obs_mz and obs_mz > 0:
+                key = f"一级:{obs_mz:.4f}"
+                if key not in all_precursors:
+                    all_precursors[key] = {
+                        'type': '一级',
+                        'db_mz': 0,
+                        'obs_mz': obs_mz,
+                        'sources': set()
+                    }
+                if rec.get('药材名称'):
+                    all_precursors[key]['sources'].add(rec.get('药材名称'))
+
+        # 收集所有二级碎片离子
+        all_fragments = {}
+        for rec in records:
+            frag_list = rec.get('_fragment_list', [])
+            for frag in frag_list:
+                frag_mz = frag['fragment_mz']
+                key = f"二级:{frag_mz:.4f}"
+                if key not in all_fragments:
+                    all_fragments[key] = {
+                        'type': '二级',
+                        'fragment_mz': frag_mz,
+                        'sources': set()
+                    }
+                for src in frag.get('sources', '').split('; '):
+                    if src:
+                        all_fragments[key]['sources'].add(src.strip())
+                if rec.get('药材名称'):
+                    all_fragments[key]['sources'].add(rec.get('药材名称'))
+
+        # 合并一级和二级碎片
+        all_ions = {}
+        all_ions.update(all_precursors)
+        all_ions.update(all_fragments)
+
+        # 格式化输出所有碎片
+        all_ions_output = []
+        for key, ion_data in sorted(all_ions.items(), key=lambda x: x[1].get('fragment_mz', 0) or x[1].get('db_mz', 0)):
+            sources_str = '; '.join(sorted(ion_data['sources'])) if ion_data['sources'] else ''
+            if ion_data.get('fragment_mz'):
+                all_ions_output.append(f"{ion_data['fragment_mz']:.4f}({sources_str})")
+            elif ion_data.get('db_mz'):
+                all_ions_output.append(f"{ion_data['db_mz']:.4f}({sources_str})")
+
+        fused['所有碎片离子'] = '; '.join(all_ions_output) if all_ions_output else ''
+
+        # 更新碎片信息
+        fragment_output = []
+        for key, frag_data in sorted(all_fragments.items(), key=lambda x: x[1].get('fragment_mz', 0)):
+            sources_str = '; '.join(sorted(frag_data['sources'])) if frag_data['sources'] else ''
+            fragment_output.append(f"{frag_data['fragment_mz']:.4f}({sources_str})")
+
+        fused['主要碎片离子'] = '; '.join(fragment_output) if fragment_output else ''
+        fused['匹配碎片数'] = len(all_fragments)
+
+        # 收集所有文献来源
+        all_sources = set()
+        for rec in records:
+            if rec.get('文献来源'):
+                for s in str(rec['文献来源']).split(';'):
+                    if s.strip():
+                        all_sources.add(s.strip())
+        fused['文献来源'] = '; '.join(sorted(all_sources))
+        fused['文献来源数'] = len(all_sources)
+
+        # 收集所有药材来源
+        all_herbs = set()
+        for rec in records:
+            if rec.get('药材名称'):
+                for h in str(rec['药材名称']).split(';'):
+                    if h.strip():
+                        all_herbs.add(h.strip())
+        fused['药材名称'] = '; '.join(sorted(all_herbs))
+
+        # 收集所有诊断离子
+        all_diag = set()
+        for rec in records:
+            if rec.get('诊断性离子'):
+                for d in str(rec['诊断性离子']).split('; '):
+                    if d.strip():
+                        all_diag.add(d.strip())
+        fused['诊断性离子'] = '; '.join(sorted(all_diag)) if all_diag else ''
+
+        # 收集数据来源
+        data_sources = set()
+        for rec in records:
+            if rec.get('数据来源'):
+                data_sources.add(rec['数据来源'])
+        fused['数据来源'] = '; '.join(sorted(data_sources))
+
+        self._clean_record(fused)
+        return fused
+
+    def _clean_record(self, record):
+        """清理记录中的临时字段"""
+        for key in ['_merge_key', '_fragment_list', '基础得分']:
+            if key in record:
+                del record[key]
+        return record
+
     def save_report(self, report_df, output_path):
-        """保存报告"""
-        report_df.to_excel(output_path, index=False)
+        """
+        保存报告 - 分成两个表：
+        1. 有碎片匹配表（匹配碎片数 > 0）
+        2. 无碎片匹配表（匹配碎片数 = 0 或无碎片信息）
+        """
+        if report_df.empty:
+            report_df.to_excel(output_path, index=False)
+            print(f"\n报告已保存至: {output_path}")
+            return
+
+        # 确定碎片数字段
+        frag_count_col = '匹配碎片数'
+        if frag_count_col not in report_df.columns:
+            # 如果没有匹配碎片数字段，按无碎片处理
+            no_frag_df = report_df.copy()
+            with_frag_df = pd.DataFrame()
+        else:
+            # 分割成两个表
+            with_frag_df = report_df[report_df[frag_count_col] > 0].copy()
+            no_frag_df = report_df[report_df[frag_count_col] == 0].copy()
+
+        # 使用ExcelWriter保存到同一个文件的两个sheet
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            if not with_frag_df.empty:
+                with_frag_df.to_excel(writer, sheet_name='有碎片匹配', index=False)
+                print(f"\n有碎片匹配表: {len(with_frag_df)} 个化合物")
+            if not no_frag_df.empty:
+                no_frag_df.to_excel(writer, sheet_name='无碎片匹配', index=False)
+                print(f"无碎片匹配表: {len(no_frag_df)} 个化合物")
+
         print(f"\n报告已保存至: {output_path}")
+        print(f"  - Sheet '有碎片匹配': {len(with_frag_df)} 个化合物")
+        print(f"  - Sheet '无碎片匹配': {len(no_frag_df)} 个化合物")
 
     def print_summary(self, report_df, herb_name):
-        """打印摘要"""
+        """打印摘要 - 包含分表统计"""
         print("\n" + "="*100)
         print(f"【{herb_name}化合物鉴定报告】")
         print("="*100)
@@ -1693,12 +1786,21 @@ class UltimateGardeniaIdentifier:
         print(f"  - 总母离子数: {self.stats['total_precursors']}")
         print(f"  - 鉴定化合物数: {self.stats['identified_compounds']}")
 
+        # 分表统计
+        if not report_df.empty and '匹配碎片数' in report_df.columns:
+            with_frag = report_df[report_df['匹配碎片数'] > 0]
+            no_frag = report_df[report_df['匹配碎片数'] == 0]
+            print(f"\n【分表统计】")
+            print(f"  - 有碎片匹配: {len(with_frag)} 个化合物")
+            print(f"  - 无碎片匹配: {len(no_frag)} 个化合物")
+            print(f"  - 碎片匹配率: {len(with_frag)/len(report_df)*100:.1f}%")
+
         if not report_df.empty:
             if '数据来源' in report_df.columns:
                 print(f"\n【数据来源分布】")
                 for source, count in report_df['数据来源'].value_counts().items():
                     print(f"  - {source}: {count} 个")
-            
+
             if '是否为对照品' in report_df.columns:
                 std_count = (report_df['是否为对照品'] == '是').sum()
                 print(f"\n【对照品匹配】")
