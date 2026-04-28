@@ -1125,134 +1125,140 @@ class UltimateGardeniaIdentifier:
 
         return precursors
 
-    def identify_compound(self, precursor_mz, fragments, rt, ionization_mode):
-        """鉴定单个化合物"""
-        tolerance_ppm = self.config['tolerance_ppm']
-        max_candidates = self.config['max_candidates']
-        fragment_tolerance = self.config['fragment_tolerance']
-        self.temp_fragment_source_map = {}  # 临时存储碎片来源映射
+  def identify_compound(self, precursor_mz, fragments, rt, ionization_mode):
+    """鉴定单个化合物"""
+    tolerance_ppm = self.config['tolerance_ppm']
+    max_candidates = self.config['max_candidates']
+    fragment_tolerance = self.config['fragment_tolerance']
+    self.temp_fragment_source_map = {}  # 临时存储碎片来源映射
+    
+    all_candidates = []
+    
+    # 在三个数据库中分别搜索
+    databases = [
+        (self.main_index, '主数据库'),
+        (self.english_index, '英文数据库'),
+        (self.standard_index, '对照品数据库')
+    ]
+    
+    for index_data, db_name in databases:
+        if index_data['mz_values_pos'].size == 0 and index_data['mz_values_neg'].size == 0:
+            continue
         
-        all_candidates = []
+        # 使用预构建的碎片来源查找表（加速）
+        if ionization_mode in ['positive', 'both']:
+            self.temp_fragment_source_map = index_data.get('frag_source_lookup_pos', {})
+        else:
+            self.temp_fragment_source_map = index_data.get('frag_source_lookup_neg', {})
         
-        # 在三个数据库中分别搜索
-        databases = [
-            (self.main_index, '主数据库'),
-            (self.english_index, '英文数据库'),
-            (self.standard_index, '对照品数据库')
-        ]
+        candidates = self._search_database(precursor_mz, tolerance_ppm, ionization_mode, index_data)
+        all_candidates.extend(candidates)
+    
+    if not all_candidates:
+        return []
+    
+    # 按ppm排序，保留所有ppm范围内的候选化合物（不限制数量）
+    all_candidates.sort(key=lambda x: x['ppm'])
+    
+    results = []
+    for candidate in all_candidates:
+        matched_frags, matched_frag_sources = self._match_fragments_with_source(
+            fragments,
+            candidate['fragments'],
+            fragment_tolerance,
+            self.tolerance_type,
+            precursor_mz
+        )
         
-        for index_data, db_name in databases:
-            if index_data['mz_values_pos'].size == 0 and index_data['mz_values_neg'].size == 0:
-                continue
-            
-            # 使用预构建的碎片来源查找表（加速）
-            if ionization_mode in ['positive', 'both']:
-                self.temp_fragment_source_map = index_data.get('frag_source_lookup_pos', {})
-            else:
-                self.temp_fragment_source_map = index_data.get('frag_source_lookup_neg', {})
-            
-            candidates = self._search_database(precursor_mz, tolerance_ppm, ionization_mode, index_data)
-            all_candidates.extend(candidates)
+        # 优化：碎片匹配过滤规则
+        # 1. 如果数据库中有碎片离子数据（不为空），但全部匹配失败，则跳过
+        # 2. 如果数据库中没有碎片离子数据（为空），则保留（允许只有母离子匹配）
+        # 3. 如果有匹配成功的碎片，则保留
+        has_db_fragments = len(candidate['fragments']) > 0
+        has_matched_frags = len(matched_frags) > 0
         
-        if not all_candidates:
-            return []
+        # 只有有碎片数据且全部匹配失败时才跳过
+        if has_db_fragments and not has_matched_frags:
+            continue
         
-        # 按ppm排序，移除max_candidates限制，保留所有ppm范围内的候选化合物
-        all_candidates.sort(key=lambda x: x['ppm'])
+        compound_info = candidate['compound_info']
+        category = self._classify_compound(
+            compound_info.get('name_cn', '') + ' ' + compound_info.get('name_en', ''),
+            compound_info.get('compound_type', '')
+        )
         
-        results = []
-        for candidate in all_candidates:
-            matched_frags, matched_frag_sources = self._match_fragments_with_source(
-                fragments,
-                candidate['fragments'],
-                fragment_tolerance,
-                self.tolerance_type,
-                precursor_mz
-            )
-            
-            # 只有当碎片离子匹配成功时才加入结果列表
-            if len(matched_frags) == 0:
-                continue
-            
-            compound_info = candidate['compound_info']
-            category = self._classify_compound(
-                compound_info.get('name_cn', '') + ' ' + compound_info.get('name_en', ''),
-                compound_info.get('compound_type', '')
-            )
-            
-            diagnostic, diag_weights = self._find_diagnostic_ions_fast(matched_frags, category, precursor_mz)
-            
-            rating, rating_name, confidence, recommendation = self._determine_confidence_level(
-                candidate['ppm'],
-                len(matched_frags),
-                len(diagnostic),
-                len(candidate['fragments']) > 0
-            )
-            
-            # 获取保留时间偏差
-            rt_deviation = None
-            if rt is not None and candidate['db_idx'] in candidate['rt_values']:
-                db_rt = candidate['rt_values'][candidate['db_idx']]
-                rt_deviation = abs(rt - db_rt) if db_rt else None
-            
-            base_score = self._calculate_base_score(
-                rating,
-                candidate['ppm'],
-                len(matched_frags),
-                len(diagnostic),
-                diag_weights,
-                0,
-                rt_deviation
-            )
-            
-            # 格式化碎片离子来源
-            frag_sources_formatted = []
-            for frag_mz, src_set in matched_frag_sources.items():
-                sources_str = '; '.join(sorted(src_set))
-                frag_sources_formatted.append(f"{frag_mz}({sources_str})")
-            
-            # 构建碎片离子列表（不合并，每个碎片保留来源）
-            fragment_list = []
-            for frag_mz, src_set in matched_frag_sources.items():
-                sources_str = '; '.join(sorted(src_set))
-                fragment_list.append({
-                    'fragment_mz': frag_mz,
-                    'sources': sources_str,
-                    'display': f"{frag_mz}({sources_str})"
-                })
-            
-            result = {
-                '母离子m/z': precursor_mz,
-                '观测RT': rt,
-                'ppm': round(candidate['ppm'], 4),
-                'db_mz': candidate['db_mz'],
-                '化合物中文名': compound_info.get('name_cn', ''),
-                '化合物英文名': compound_info.get('name_en', ''),
-                '分子式': compound_info.get('formula', ''),
-                'CAS号': compound_info.get('cas', ''),
-                '药材名称': compound_info.get('herb', ''),
-                '化合物类型': compound_info.get('compound_type', ''),
-                '数据来源': candidate['db_name'],  # 明确标注数据库来源
-                '是否为对照品': '是' if compound_info.get('is_standard', False) else '否',
-                '离子化方式': ionization_mode,
-                '加和离子': compound_info.get('adduct_pos', '') if ionization_mode in ['positive', 'both'] else compound_info.get('adduct_neg', ''),
-                # 碎片离子不合并，保留每个碎片的独立来源
-                '_fragment_list': fragment_list,  # 内部存储，用于后续处理
-                '文献来源': compound_info.get('source', ''),
-                '诊断性离子': '; '.join([str(d) for d in diagnostic]) if diagnostic else '',
-                '匹配碎片数': len(matched_frags),
-                '诊断离子数': len(diagnostic),
-                '评级': rating,
-                '评级名称': rating_name,
-                '置信度': confidence,
-                '报告建议': recommendation,
-                '综合得分': base_score,
-                '基础得分': base_score
-            }
-            
-            results.append(result)
+        diagnostic, diag_weights = self._find_diagnostic_ions_fast(matched_frags, category, precursor_mz)
         
-        return results
+        rating, rating_name, confidence, recommendation = self._determine_confidence_level(
+            candidate['ppm'],
+            len(matched_frags),
+            len(diagnostic),
+            len(candidate['fragments']) > 0
+        )
+        
+        # 获取保留时间偏差
+        rt_deviation = None
+        if rt is not None and candidate['db_idx'] in candidate['rt_values']:
+            db_rt = candidate['rt_values'][candidate['db_idx']]
+            rt_deviation = abs(rt - db_rt) if db_rt else None
+        
+        base_score = self._calculate_base_score(
+            rating,
+            candidate['ppm'],
+            len(matched_frags),
+            len(diagnostic),
+            diag_weights,
+            0,
+            rt_deviation
+        )
+        
+        # 格式化碎片离子来源
+        frag_sources_formatted = []
+        for frag_mz, src_set in matched_frag_sources.items():
+            sources_str = '; '.join(sorted(src_set))
+            frag_sources_formatted.append(f"{frag_mz}({sources_str})")
+        
+        # 构建碎片离子列表（不合并，每个碎片保留来源）
+        fragment_list = []
+        for frag_mz, src_set in matched_frag_sources.items():
+            sources_str = '; '.join(sorted(src_set))
+            fragment_list.append({
+                'fragment_mz': frag_mz,
+                'sources': sources_str,
+                'display': f"{frag_mz}({sources_str})"
+            })
+        
+        result = {
+            '母离子m/z': precursor_mz,
+            '观测RT': rt,
+            'ppm': round(candidate['ppm'], 4),
+            'db_mz': candidate['db_mz'],
+            '化合物中文名': compound_info.get('name_cn', ''),
+            '化合物英文名': compound_info.get('name_en', ''),
+            '分子式': compound_info.get('formula', ''),
+            'CAS号': compound_info.get('cas', ''),
+            '药材名称': compound_info.get('herb', ''),
+            '化合物类型': compound_info.get('compound_type', ''),
+            '数据来源': candidate['db_name'],  # 明确标注数据库来源
+            '是否为对照品': '是' if compound_info.get('is_standard', False) else '否',
+            '离子化方式': ionization_mode,
+            '加和离子': compound_info.get('adduct_pos', '') if ionization_mode in ['positive', 'both'] else compound_info.get('adduct_neg', ''),
+            '_fragment_list': fragment_list,  # 内部存储，用于后续处理
+            '文献来源': compound_info.get('source', ''),
+            '诊断性离子': '; '.join([str(d) for d in diagnostic]) if diagnostic else '',
+            '匹配碎片数': len(matched_frags),
+            '诊断离子数': len(diagnostic),
+            '评级': rating,
+            '评级名称': rating_name,
+            '置信度': confidence,
+            '报告建议': recommendation,
+            '综合得分': base_score,
+            '基础得分': base_score
+        }
+        
+        results.append(result)
+    
+    return results
 
     def generate_report(self, sample_name='样品'):
         """生成鉴定报告"""
