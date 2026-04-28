@@ -143,12 +143,15 @@ def parse_fragments_with_source(fragment_string, source_name, db_source=''):
 
 @st.cache_data
 def load_database_cached(db_filename=None):
-    """加载主数据库（TCM-SM-MS DB）"""
+    """加载主数据库（TCM-SM-MS DB），支持xlsx和csv格式"""
     db_filenames = [
+        "TCM-SM-MS DB.csv",
         "TCM-SM-MS DB.xlsx",
         "TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+        "data/TCM-SM-MS DB.csv",
         "data/TCM-SM-MS DB.xlsx",
         "data/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+        "user_input_files/TCM-SM-MS DB.csv",
         "user_input_files/TCM-SM-MS DB.xlsx",
         "user_input_files/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx"
     ]
@@ -157,19 +160,45 @@ def load_database_cached(db_filename=None):
     for path in db_filenames:
         if os.path.exists(path):
             try:
-                df = pd.read_excel(path)
+                # 根据文件扩展名选择读取方式
+                if path.endswith('.csv'):
+                    df = pd.read_csv(path, encoding='utf-8-sig')
+                else:
+                    df = pd.read_excel(path)
+
+                # CSV格式列名映射（CSV原始列名 -> 程序内部标准列名）
+                csv_column_mapping = {
+                    '药材名': '药材名称',
+                    '文献': '文献来源',
+                    '中文名': '名称（中文）',
+                    '英文名': '名称（英文）',
+                    '保留时间(min)': '保留时间',
+                    '中丢失': '中性丢失',
+                    '准分子离子(正离子模式)': '准分子离子（正）',
+                    '碎片离子(正离子模式)': '碎片离子（正）',
+                    '准分子离子(负离子模式)': '准分子离子（负）',
+                    '碎片离子(负离子模式)': '碎片离子（负）'
+                }
+
+                # 通用列名映射
                 column_mapping = {
                     '药材名': '药材名称',
                     '文献': '文献来源',
                     '保留时间(min)': '保留时间',
                     '中丢失': '中性丢失'
                 }
-                for old_name, new_name in column_mapping.items():
+
+                # 合并映射并应用（CSV映射优先级更高）
+                all_mappings = {**column_mapping, **csv_column_mapping}
+                for old_name, new_name in all_mappings.items():
                     if old_name in df.columns and new_name not in df.columns:
                         df.rename(columns={old_name: new_name}, inplace=True)
+
                 df['_data_source'] = '主数据库'
+                print(f"  主数据库加载成功: {path}, {len(df)} 条记录")
                 return df
             except Exception as e:
+                print(f"  加载数据库失败: {path}, 错误: {e}")
                 continue
     return pd.DataFrame()
 
@@ -265,12 +294,15 @@ def load_standard_database_cached(db_filename="对照品数据库.xlsx"):
 
 
 def find_database_path():
-    """查找主数据库路径"""
+    """查找主数据库路径（支持xlsx和csv格式）"""
     db_paths = [
+        "TCM-SM-MS DB.csv",
         "TCM-SM-MS DB.xlsx",
         "TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+        "data/TCM-SM-MS DB.csv",
         "data/TCM-SM-MS DB.xlsx",
         "data/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx",
+        "user_input_files/TCM-SM-MS DB.csv",
         "user_input_files/TCM-SM-MS DB.xlsx",
         "user_input_files/TCM-SM-MS DB（中药小分子化学成分高分辨质谱数据库）.xlsx"
     ]
@@ -503,23 +535,41 @@ class UltimateGardeniaIdentifier:
         print("【7/9】初始化完成，准备鉴定")
 
     def _load_data(self, filepath):
-        """加载数据文件（Excel/CSV）"""
+        """加载数据文件（Excel/CSV），支持CSV格式列名映射"""
         if filepath and os.path.exists(filepath):
             try:
-                if filepath.endswith('.xlsx'):
+                if filepath.endswith('.csv'):
+                    df = pd.read_csv(filepath, encoding='utf-8-sig')
+                elif filepath.endswith('.xlsx'):
                     df = pd.read_excel(filepath)
-                elif filepath.endswith('.csv'):
-                    return pd.read_csv(filepath)
                 else:
                     return pd.DataFrame()
 
+                # CSV格式列名映射（CSV原始列名 -> 程序内部标准列名）
+                csv_column_mapping = {
+                    '药材名': '药材名称',
+                    '文献': '文献来源',
+                    '中文名': '名称（中文）',
+                    '英文名': '名称（英文）',
+                    '保留时间(min)': '保留时间',
+                    '中丢失': '中性丢失',
+                    '准分子离子(正离子模式)': '准分子离子（正）',
+                    '碎片离子(正离子模式)': '碎片离子（正）',
+                    '准分子离子(负离子模式)': '准分子离子（负）',
+                    '碎片离子(负离子模式)': '碎片离子（负）'
+                }
+
+                # 通用列名映射
                 column_mapping = {
                     '药材名': '药材名称',
                     '文献': '文献来源',
                     '保留时间(min)': '保留时间',
                     '中丢失': '中性丢失'
                 }
-                for old_name, new_name in column_mapping.items():
+
+                # 合并映射并应用（CSV映射优先级更高）
+                all_mappings = {**column_mapping, **csv_column_mapping}
+                for old_name, new_name in all_mappings.items():
                     if old_name in df.columns and new_name not in df.columns:
                         df.rename(columns={old_name: new_name}, inplace=True)
 
