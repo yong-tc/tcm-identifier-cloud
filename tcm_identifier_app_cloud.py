@@ -700,7 +700,10 @@ class UltimateGardeniaIdentifier:
             'rt_values': {},
             'neutral_losses': {},
             'fragment_sources': {},
-            'db_name': db_name
+            'db_name': db_name,
+            # 预构建的碎片来源快速查找表（按离子化模式）
+            'frag_source_lookup_pos': {},  # frag_mz -> set of sources
+            'frag_source_lookup_neg': {}   # frag_mz -> set of sources
         }
         
         if database.empty:
@@ -765,6 +768,11 @@ class UltimateGardeniaIdentifier:
                         if fragments:
                             index_data['fragment_sources'][local_idx] = index_data['fragment_sources'].get(local_idx, {})
                             index_data['fragment_sources'][local_idx]['positive'] = source_map
+                            # 预构建碎片来源查找表（加速匹配）
+                            for frag_mz, src_set in source_map.items():
+                                if frag_mz not in index_data['frag_source_lookup_pos']:
+                                    index_data['frag_source_lookup_pos'][frag_mz] = set()
+                                index_data['frag_source_lookup_pos'][frag_mz].update(src_set)
                 except (ValueError, TypeError):
                     pass
 
@@ -779,6 +787,11 @@ class UltimateGardeniaIdentifier:
                         if fragments:
                             index_data['fragment_sources'][local_idx] = index_data['fragment_sources'].get(local_idx, {})
                             index_data['fragment_sources'][local_idx]['negative'] = source_map
+                            # 预构建碎片来源查找表（加速匹配）
+                            for frag_mz, src_set in source_map.items():
+                                if frag_mz not in index_data['frag_source_lookup_neg']:
+                                    index_data['frag_source_lookup_neg'][frag_mz] = set()
+                                index_data['frag_source_lookup_neg'][frag_mz].update(src_set)
                 except (ValueError, TypeError):
                     pass
 
@@ -1132,14 +1145,11 @@ class UltimateGardeniaIdentifier:
             if index_data['mz_values_pos'].size == 0 and index_data['mz_values_neg'].size == 0:
                 continue
             
-            # 设置临时碎片来源映射
-            self.temp_fragment_source_map = {}
-            for local_idx, sources in index_data['fragment_sources'].items():
-                for mode, source_map in sources.items():
-                    for frag_mz, src_set in source_map.items():
-                        if frag_mz not in self.temp_fragment_source_map:
-                            self.temp_fragment_source_map[frag_mz] = set()
-                        self.temp_fragment_source_map[frag_mz].update(src_set)
+            # 使用预构建的碎片来源查找表（加速）
+            if ionization_mode in ['positive', 'both']:
+                self.temp_fragment_source_map = index_data.get('frag_source_lookup_pos', {})
+            else:
+                self.temp_fragment_source_map = index_data.get('frag_source_lookup_neg', {})
             
             candidates = self._search_database(precursor_mz, tolerance_ppm, ionization_mode, index_data)
             all_candidates.extend(candidates)
@@ -1147,9 +1157,8 @@ class UltimateGardeniaIdentifier:
         if not all_candidates:
             return []
         
-        # 按ppm排序
+        # 按ppm排序，移除max_candidates限制，保留所有ppm范围内的候选化合物
         all_candidates.sort(key=lambda x: x['ppm'])
-        all_candidates = all_candidates[:max_candidates]
         
         results = []
         for candidate in all_candidates:
@@ -1160,6 +1169,10 @@ class UltimateGardeniaIdentifier:
                 self.tolerance_type,
                 precursor_mz
             )
+            
+            # 只有当碎片离子匹配成功时才加入结果列表
+            if len(matched_frags) == 0:
+                continue
             
             compound_info = candidate['compound_info']
             category = self._classify_compound(
