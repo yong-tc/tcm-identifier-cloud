@@ -947,6 +947,7 @@ elif page == "🔬 开始鉴定":
                         st.metric("排除级", excluded)
 
                     st.markdown("---")
+                    st.rerun()  # 刷新页面更新session_state
                     if st.button("📊 查看详细结果"):
                         st.session_state['current_page'] = "📋 结果分析"
                         st.rerun()
