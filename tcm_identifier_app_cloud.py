@@ -106,6 +106,13 @@ def check_login():
     return True
 
 # ============================================================================
+# 内置数据库配置
+# ============================================================================
+# 获取当前文件所在目录的绝对路径
+_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BUILTIN_DB_PATH = os.path.join(_CURRENT_DIR, 'TCM-SM-MS DB.CSV')
+
+# ============================================================================
 # 配置参数
 # ============================================================================
 PRIMARY_PPM_TOLERANCE = 50       # 一级母离子ppm容差
@@ -945,28 +952,40 @@ elif page == "🔬 开始鉴定":
     st.markdown("---")
     st.markdown("## 📂 数据库文件")
 
-    db_file = st.file_uploader(
-        "上传TCM数据库文件 (.csv)",
-        type=['csv'],
-        help="上传TCM-SM-MS DB.CSV数据库文件"
+    # 数据库选项
+    db_option = st.radio(
+        "选择数据库来源",
+        ["使用内置数据库", "上传自定义数据库"],
+        help="内置数据库包含48886条化合物，可直接使用"
     )
 
-    if db_file:
-        st.success(f"已上传数据库: {db_file.name}")
+    use_builtin_db = (db_option == "使用内置数据库")
+    db_file = None
+    db_path = BUILTIN_DB_PATH
+
+    if not use_builtin_db:
+        db_file = st.file_uploader(
+            "上传TCM数据库文件 (.csv)",
+            type=['csv'],
+            help="上传TCM-SM-MS DB.CSV数据库文件"
+        )
+        if db_file:
+            st.success(f"已上传数据库: {db_file.name}")
+            # 保存上传的文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as db_tmp:
+                db_tmp.write(db_file.getvalue())
+                db_path = db_tmp.name
+    else:
+        st.info(f"✅ 使用内置数据库: TCM-SM-MS DB.CSV")
 
     # 开始鉴定
     if st.button("🚀 开始化合物鉴定", type="primary", use_container_width=True):
         if not ms_positive_file and not ms_negative_file:
             st.error("请至少上传一个质谱数据文件（正离子或负离子）")
-        elif not db_file:
-            st.error("请上传数据库文件")
+        elif not use_builtin_db and not db_file:
+            st.error("请上传数据库文件或选择使用内置数据库")
         else:
             with st.spinner("正在加载数据..."):
-                # 保存上传的文件
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as db_tmp:
-                    db_tmp.write(db_file.getvalue())
-                    db_path = db_tmp.name
-
                 pos_path = neg_path = None
 
                 if ms_positive_file:
