@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 v12.7（Web版）
+中药化合物智能鉴定平台 v15.2（区分化评级版）
 ==========================================
 
-基于run_analysis_v12.py的比对逻辑构建的Streamlit应用
+版本说明：
+- v15.2: 基础分提升至100分，来源/非来源药材区分处理
+- v15.1: 来源匹配优先级加成从60调整为50
+- 去掉覆盖率评分（简化评分体系）
+- 去掉高置信级覆盖率要求
 
-v12.7核心特性：
-1. 二分查找数据库索引（高效）
-2. 碎片匹配直接计数
-3. 多级置信度评分体系
-4. 支持CSV/Excel报告导出
+v15.2核心修改：
+1. 置信度评分：基础分从最高90提升到100分
+2. 评级标准区分：
+   - 非来源药材：严格标准（分数门槛更高，碎片数更多）
+   - 来源药材：宽松标准（仅提高分数门槛，碎片数要求不变）
+3. 非来源药材确证级：分数≥85 AND 碎片数≥5 AND ppm≤10
+4. 来源药材确证级：分数≥85 AND 碎片数≥1 AND ppm≤50
 
 Author: MiniMax Agent
 """
@@ -224,42 +230,52 @@ def parse_diagnostic_ions(frag_list):
 def calculate_confidence(matched_frag_count, total_ref_frags, diag_count, lit_count,
                          has_pos_neg, rt_match, ppm, has_fragment_data, is_priority=False):
     """
-    计算置信度得分（基础分最高100分，优先级加成60分另外算）
+    计算置信度得分（v15.2区分化评级版）
 
-    评分体系（v12.7）：
+    评分体系（不含覆盖率）：
     基础分（不含优先级，最高100分）：
-      - 碎片匹配：最高60分（主因素）
+      - 碎片匹配：最高68分【v15.2修改：58→68】
       - 文献来源：最高20分
       - ppm误差：最高10分
       - 正负离子确认：最高5分
       - 诊断离子：最高5分
-    优先级加成：60分（另外加）
+    优先级加成：50分（另外加）【v15.1修改：60→50】
+
+    【v15.2修改】基础分从最高90提升到100分（碎片匹配权重增加）
     """
     base_score = 0
 
-    # 1. 碎片匹配个数（最高60分）- v12.7优化
+    # 【v13.0修复】碎片数为0时，重置基础分
+    if matched_frag_count == 0:
+        if has_fragment_data:
+            base_score = 5
+        else:
+            base_score = 0
+        return base_score
+
+    # 1. 碎片匹配个数（最高68分）【v15.2修改：58→68】
     if matched_frag_count >= 10:
-        base_score += 60
+        base_score += 68
     elif matched_frag_count >= 8:
-        base_score += 58
+        base_score += 64
     elif matched_frag_count >= 7:
-        base_score += 56
+        base_score += 60
     elif matched_frag_count >= 6:
-        base_score += 54
+        base_score += 56
     elif matched_frag_count >= 5:
         base_score += 52
     elif matched_frag_count >= 4:
         base_score += 48
     elif matched_frag_count >= 3:
-        base_score += 58  # v12.7: 3碎片=58分
+        base_score += 42
     elif matched_frag_count >= 2:
-        base_score += 55  # v12.7: 2碎片=55分
+        base_score += 36
     elif matched_frag_count >= 1:
-        base_score += 25
-    elif has_fragment_data:
-        base_score += 5
+        base_score += 24
 
-    # 2. 文献来源数量（最高20分）
+    # 【v15.0删除】2. 碎片覆盖率评分（已删除）
+
+    # 3. 文献来源数量（最高20分）
     if lit_count >= 10:
         base_score += 20
     elif lit_count >= 7:
@@ -273,7 +289,7 @@ def calculate_confidence(matched_frag_count, total_ref_frags, diag_count, lit_co
     elif lit_count >= 1:
         base_score += 4
 
-    # 3. ppm误差（最高10分）
+    # 4. ppm误差（最高10分）
     if ppm <= 5:
         base_score += 10
     elif ppm <= 10:
@@ -285,11 +301,11 @@ def calculate_confidence(matched_frag_count, total_ref_frags, diag_count, lit_co
     elif ppm <= 50:
         base_score += 2
 
-    # 4. 正负离子同时确认（最高5分）
+    # 5. 正负离子同时确认（最高5分）
     if has_pos_neg:
         base_score += 5
 
-    # 5. 诊断离子数量（最高5分）
+    # 6. 诊断离子数量（最高5分）
     if diag_count >= 5:
         base_score += 5
     elif diag_count >= 3:
@@ -302,23 +318,64 @@ def calculate_confidence(matched_frag_count, total_ref_frags, diag_count, lit_co
     # 基础分限制100分
     base_score = min(base_score, 100)
 
-    # 优先级加成（60分另外加）
-    priority_bonus = 60 if is_priority else 0
+    # 优先级加成（50分另外加）【v15.1修改：60→50】
+    priority_bonus = 50 if is_priority else 0
 
     return base_score + priority_bonus
 
-def get_confidence_level(score, matched_frag_count=0):
-    """根据置信度得分确定评级（v12.7优化版）"""
-    if score >= 80 and matched_frag_count >= 1:
-        return 'I', '确证级', '高置信度，可作为定性依据'
-    elif score >= 65 and matched_frag_count >= 1:
-        return 'II', '高置信级', '较强置信度，建议进一步验证'
-    elif score >= 50:
-        return 'III', '推定级', '中等置信度，需要更多证据支持'
-    elif score >= 30:
-        return 'IV', '提示级', '低置信度，仅供参考'
+def get_confidence_level(score, matched_frag_count=0, ppm=999, coverage_ratio=0, total_ref_frags=0, is_source_herb_match=False):
+    """根据置信度得分确定评级（v15.2区分化评级版）
+
+    【v15.2修改】区分来源药材与非来源药材的评级标准
+
+    评级标准：
+    - 非来源药材：严格标准（分数门槛更高，碎片数更多）
+    - 来源药材：宽松标准（仅提高分数门槛，碎片数要求不变）
+
+    非来源药材条件：
+    - 确证级：分数≥85 AND 碎片数≥5 AND ppm≤10
+    - 高置信级：分数≥70 AND 碎片数≥4 AND ppm≤50
+
+    来源药材条件：
+    - 确证级：分数≥85 AND 碎片数≥3 AND ppm≤50
+    - 高置信级：分数≥70 AND 碎片数≥2 AND ppm≤50
+
+    推定级(III)：分数≥50 AND 碎片数≥2（通用）
+    提示级(IV)：分数≥30 AND 碎片数≥1（通用）
+    """
+    source_match = is_source_herb_match
+
+    # ========== 非来源药材标准（严格） ==========
+    if not source_match:
+        # 确证级（非来源）：更严格
+        if score >= 85 and matched_frag_count >= 5 and ppm <= 10:
+            return 'I', '确证级', '高置信度，可作为定性依据'
+
+        # 高置信级（非来源）：更严格
+        if score >= 70 and matched_frag_count >= 4 and ppm <= 50:
+            return 'II', '高置信级', '较强置信度，建议进一步验证'
+
+    # ========== 来源药材标准（宽松） ==========
     else:
-        return 'V', '排除级', '置信度不足，建议排除'
+        # 确证级（来源）：分数≥85 AND 碎片数≥3 AND ppm≤50
+        if score >= 85 and matched_frag_count >= 3 and ppm <= 50:
+            return 'I', '确证级', '高置信度，来源药材匹配'
+
+        # 高置信级（来源）：分数≥70 AND 碎片数≥2 AND ppm≤50
+        if score >= 70 and matched_frag_count >= 2 and ppm <= 50:
+            return 'II', '高置信级', '来源药材匹配'
+
+    # ========== 通用标准 ==========
+    # 推定级：中等置信度
+    if score >= 50 and matched_frag_count >= 2:
+        return 'III', '推定级', '中等置信度，需要更多证据支持'
+
+    # 提示级：低置信度
+    if score >= 30 and matched_frag_count >= 1:
+        return 'IV', '提示级', '低置信度，仅供参考'
+
+    # 排除级
+    return 'V', '排除级', '置信度不足，建议排除'
 
 # ============================================================================
 # 高效数据库索引（v12.0 - 使用二分查找）
@@ -505,7 +562,8 @@ class UniversalIdentifier:
 
         self.db_idx = MultiPriorityDB(self.db, priority_herbs)
         self.results = {}
-        self._matched_compound_keys = set()
+        # 【v13.0修复】移除 _matched_compound_keys 机制，允许同一母离子的多个观测碎片匹配多次
+        # 旧代码：self._matched_compound_keys = set()  # 这导致同一候选只匹配一次
 
     def match_fragments_v12(self, obs_frags, ref_frags, prec_mz, frag_source_lookup):
         """碎片匹配 v12.1修复版"""
@@ -636,36 +694,36 @@ class UniversalIdentifier:
                 }
 
             res = self.results[key]
-            frag_match_key = f"{key}_{mode}"
-            already_matched = frag_match_key in self._matched_compound_keys
+
+            # 【v13.0修复】移除 already_matched 检查，允许每个候选进行碎片匹配
+            # 旧代码：frag_match_key = f"{key}_{mode}" + already_matched 检查
+            # 改为：每次都尝试碎片匹配，累积所有匹配结果
 
             if mode == 'positive':
-                if not already_matched and obs_frags:
+                if obs_frags:
                     matched_obs, matched_ref, matched_src = self.match_fragments_v12(
                         obs_frags, cand['ref_frags'], prec_mz, frag_source_lookup
                     )
                     res['matched_frags_pos'].extend(matched_obs)
                     res['matched_sources_pos'].update(matched_src)
-                    self._matched_compound_keys.add(frag_match_key)
                 res['obs_frags_pos'].extend(obs_frags)
                 res['rt_pos'] = rt
                 res['ppm_pos'] = min(res['ppm_pos'], cand['ppm'])
                 res['m/z_pos'] = prec_mz
             else:
-                if not already_matched and obs_frags:
+                if obs_frags:
                     matched_obs, matched_ref, matched_src = self.match_fragments_v12(
                         obs_frags, cand['ref_frags'], prec_mz, frag_source_lookup
                     )
                     res['matched_frags_neg'].extend(matched_obs)
                     res['matched_sources_neg'].update(matched_src)
-                    self._matched_compound_keys.add(frag_match_key)
                 res['obs_frags_neg'].extend(obs_frags)
                 res['rt_neg'] = rt
                 res['ppm_neg'] = min(res['ppm_neg'], cand['ppm'])
                 res['m/z_neg'] = prec_mz
 
     def _merge_and_score(self):
-        """合并正负离子结果并计算置信度"""
+        """合并正负离子结果并计算置信度（v14.1来源药材优化版）"""
         for key, res in self.results.items():
             all_matched_obs = list(set(res['matched_frags_pos'] + res['matched_frags_neg']))
             all_obs = list(set(res['obs_frags_pos'] + res['obs_frags_neg']))
@@ -702,7 +760,29 @@ class UniversalIdentifier:
 
             matched_count = len(all_matched_obs)
 
+            # 【v14.0新增】计算参考碎片总数和覆盖率
+            all_ref_frags = res.get('ref_frags_pos', []) + res.get('ref_frags_neg', [])
+            total_ref_frags = len(all_ref_frags)
+
+            # 【v14.0新增】覆盖率计算 - 添加上限防止异常
+            if total_ref_frags > 0:
+                # 覆盖率上限为100%，防止异常数据
+                coverage_ratio = min(matched_count / total_ref_frags, 1.0)
+            else:
+                coverage_ratio = 0  # 无参考碎片时覆盖率为0
+
+            # 【v14.1新增】判断化合物来源药材是否与检测目标药材匹配
+            compound_herb = res.get('herb', '')
+            is_source_herb_match = False
+            if compound_herb and self.priority_herbs:
+                for priority_herb in self.priority_herbs:
+                    if priority_herb.lower() in compound_herb.lower():
+                        is_source_herb_match = True
+                        break
+
             res['matched_frag_count'] = matched_count
+            res['total_ref_frags'] = total_ref_frags
+            res['coverage_ratio'] = coverage_ratio
             res['diag_count'] = diag_count
             res['diag_ions_list'] = diag_ions
             res['has_pos_neg'] = has_pos_neg
@@ -711,15 +791,20 @@ class UniversalIdentifier:
             res['ppm'] = ppm
             res['actual_mz'] = actual_mz
             res['has_fragment_data'] = len(all_obs) > 0
+            res['is_source_herb_match'] = is_source_herb_match  # 【v14.1新增】
 
+            # 【v14.0修改】传递total_ref_frags给calculate_confidence
             confidence = calculate_confidence(
-                matched_count, 0, diag_count, res['total_lit_count'],
+                matched_count, total_ref_frags, diag_count, res['total_lit_count'],
                 has_pos_neg, rt_match, ppm, res['has_fragment_data'],
                 is_priority=res.get('is_priority', False)
             )
             res['confidence'] = confidence
 
-            level_code, level_name, suggestion = get_confidence_level(confidence, matched_count)
+            # 【v14.1修改】传递is_source_herb_match给get_confidence_level
+            level_code, level_name, suggestion = get_confidence_level(
+                confidence, matched_count, ppm, coverage_ratio, total_ref_frags, is_source_herb_match
+            )
             res['level_code'] = level_code
             res['level_name'] = level_name
             res['suggestion'] = suggestion
@@ -742,7 +827,7 @@ class UniversalIdentifier:
                 self.global_fragment_sources[frag_mz].update(sources)
 
     def export_reports(self, output_prefix='compound'):
-        """导出鉴定报告"""
+        """导出鉴定报告（v14.0平衡优化版）"""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
         records = []
@@ -761,6 +846,11 @@ class UniversalIdentifier:
             obs_str = '; '.join([f'{x:.4f}' for x in res.get('all_obs_frags', [])[:30]])
             diag_str = '; '.join([f'{x:.4f}' for x in res.get('diag_ions_list', [])])
 
+            # 【v14.1新增】覆盖率百分比字段和来源药材匹配标识
+            coverage_pct = res.get('coverage_ratio', 0) * 100
+            coverage_str = f"{coverage_pct:.1f}%"
+            is_source_match = res.get('is_source_herb_match', False)
+
             row = {
                 '序号': i,
                 '出峰时间t/min': res.get('rt_pos') or res.get('rt_neg', ''),
@@ -774,6 +864,9 @@ class UniversalIdentifier:
                 'ppm': round(res.get('ppm', 0), 4),
                 '是否有碎片数据': '是' if res.get('has_fragment_data') else '否',
                 '匹配观测碎片数': res.get('matched_frag_count', 0),
+                '参考碎片总数': res.get('total_ref_frags', 0),  # 【v14.0新增】
+                '碎片覆盖率': coverage_str,  # 【v14.0新增】
+                '药材匹配': '是' if is_source_match else '否',  # 【v14.1新增】
                 '主要碎片离子': obs_str if obs_str else all_ref_str,
                 '参考碎片离子': all_ref_str,
                 '匹配观测碎片(来源)': '; '.join(matched_obs_with_sources[:10]) if matched_obs_with_sources else '无',
@@ -800,7 +893,7 @@ class UniversalIdentifier:
 # Streamlit 应用
 # ============================================================================
 st.set_page_config(
-    page_title="中药化合物智能鉴定平台 v12.7",
+    page_title="中药化合物智能鉴定平台 v14.0",
     page_icon="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌿</text></svg>",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -836,8 +929,8 @@ st.markdown("""
 # 页面标题
 st.markdown("""
 <div class="main-header">
-    <h1>🌿 中药化合物智能鉴定平台 v12.7</h1>
-    <p>基于v12.7优化比对逻辑 | 二分查找数据库索引 | 多级置信度评分</p>
+    <h1>🌿 中药化合物智能鉴定平台 v14.0</h1>
+    <p>基于v14.0平衡优化 | 多维度验证标准 | 减少假阳性</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -860,14 +953,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("""
-    ### v12.7 更新说明
+    ### v14.0 方案二（平衡优化）更新说明
 
-    **核心优化**:
-    - ✅ 二分查找数据库索引（高效）
-    - ✅ 碎片匹配直接计数
-    - ✅ 确证级: ≥80且≥1碎片
-    - ✅ 高置信级: ≥65且≥1碎片
-    - ✅ 优先级加成60分
+    **核心优化 - 多维度验证标准**:
+    - ✅ 确证级：碎片数≥4 AND 覆盖率≥30% AND ppm≤10
+    - ✅ 高置信级：碎片数≥3 AND 覆盖率≥30% AND ppm≤15
+    - ✅ 新增碎片覆盖率评分（最高10分）
+    - ✅ ppm误差限制更严格
+    - ✅ 优先级加成60分（另外加）
     """)
 
 # 首页
@@ -897,7 +990,7 @@ if page == "🏠 首页":
     with col4:
         st.markdown("""
         <div class="stat-card">
-            <div class="stat-number">v12.7</div>
+            <div class="stat-number">v14.0</div>
             <div>最新版本</div>
         </div>
         """, unsafe_allow_html=True)
@@ -1180,24 +1273,25 @@ elif page == "📖 使用说明":
     | 碎片离子（负） | 负离子模式碎片 |
     | 文献来源 | 文献信息 |
 
-    ### 评级标准 (v12.7)
+    ### 评级标准 (v14.0方案二)
 
-    | 级别 | 置信度要求 | 说明 |
-    |------|-----------|------|
-    | 确证级 | ≥80且≥1碎片 | 高置信度，可作为定性依据 |
-    | 高置信级 | ≥65且≥1碎片 | 较强置信度，建议进一步验证 |
-    | 推定级 | ≥50 | 中等置信度，需要更多证据支持 |
-    | 提示级 | ≥30 | 低置信度，仅供参考 |
-    | 排除级 | <30 | 置信度不足，建议排除 |
+| 级别 | 置信度要求 | 碎片数 | ppm限制 | 覆盖率要求 | 说明 |
+|------|-----------|--------|---------|-----------|------|
+| 确证级 | ≥80 | ≥4 | ≤10 | ≥30% | 高置信度，可作为定性依据 |
+| 高置信级 | ≥65 | ≥3 | ≤15 | ≥30% | 较强置信度，建议进一步验证 |
+| 推定级 | ≥50 | ≥2 | - | - | 中等置信度，需要更多证据支持 |
+| 提示级 | ≥30 | ≥1 | - | - | 低置信度，仅供参考 |
+| 排除级 | <30 | - | - | - | 置信度不足，建议排除 |
 
-    ### 评分体系 (v12.7)
+### 评分体系 (v14.0方案二)
 
-    | 项目 | 最高分值 | 说明 |
-    |------|---------|------|
-    | 碎片匹配 | 60分 | ≥3碎片=58分，≥2碎片=55分 |
-    | 文献来源 | 20分 | 文献数量加分 |
-    | ppm误差 | 10分 | ppm≤5得10分 |
-    | 正负离子确认 | 5分 | 同时确认加5分 |
-    | 诊断离子 | 5分 | 匹配到诊断离子加分 |
-    | 优先级加成 | 60分 | 优先级药材另外加分 |
+| 项目 | 最高分值 | 说明 |
+|------|---------|------|
+| 碎片匹配 | 58分 | ≥10碎片=58分，每少1个递减 |
+| 碎片覆盖率 | 10分 | 新增：覆盖率≥30%=4分，每增10%加2分 |
+| 文献来源 | 20分 | 文献数量加分 |
+| ppm误差 | 10分 | ppm≤5得10分 |
+| 正负离子确认 | 5分 | 同时确认加5分 |
+| 诊断离子 | 5分 | 匹配到诊断离子加分 |
+| 优先级加成 | 60分 | 优先级药材另外加分 |
     """)
