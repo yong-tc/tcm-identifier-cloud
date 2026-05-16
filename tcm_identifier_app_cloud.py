@@ -20,6 +20,7 @@ import pandas as pd
 import numpy as np
 import re
 import os
+import time
 import tempfile
 from datetime import datetime
 from io import BytesIO
@@ -27,6 +28,82 @@ from typing import List, Dict, Tuple, Optional, Set
 from bisect import bisect_left, bisect_right
 import warnings
 warnings.filterwarnings('ignore')
+
+# ============================================================================
+# 登录验证常量
+# ============================================================================
+VALID_USERNAME = "ZY"
+VALID_PASSWORD = "513513"
+
+# ============================================================================
+# 登录页面函数
+# ============================================================================
+def login_page():
+    """显示登录页面"""
+    st.markdown("""
+    <style>
+        .login-container {
+            max-width: 450px;
+            margin: 100px auto;
+            padding: 2.5rem;
+            background: white;
+            border-radius: 24px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+        }
+        .login-title {
+            text-align: center;
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin-bottom: 2rem;
+            background: linear-gradient(135deg, #059669, #0891b2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .login-subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 2rem;
+            font-size: 0.95rem;
+        }
+    </style>
+    <div class="login-container">
+        <div class="login-title">🌿 中药化合物智能鉴定平台</div>
+        <div class="login-subtitle">v12.7 | 智能比对系统</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.form("login_form", clear_on_submit=True):
+        st.markdown("---")
+        username = st.text_input("👤 用户名", placeholder="请输入用户名", label_visibility="collapsed")
+        password = st.text_input("🔐 密码", type="password", placeholder="请输入密码", label_visibility="collapsed")
+        st.markdown("---")
+        submitted = st.form_submit_button("🚀 登录", use_container_width=True)
+
+        if submitted:
+            if username == VALID_USERNAME and password == VALID_PASSWORD:
+                st.session_state.logged_in = True
+                st.session_state.username = username
+                st.success("✅ 登录成功！正在跳转...")
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.error("❌ 用户名或密码错误，请重试")
+
+def logout_button():
+    """显示登出按钮"""
+    if st.sidebar.button("🚪 登出", use_container_width=True, type="primary"):
+        st.session_state.logged_in = False
+        st.session_state.pop('username', None)
+        st.rerun()
+
+def check_login():
+    """检查登录状态"""
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+    if not st.session_state.logged_in:
+        login_page()
+        return False
+    return True
 
 # ============================================================================
 # 配置参数
@@ -756,6 +833,13 @@ st.markdown("""
     <p>基于v12.7优化比对逻辑 | 二分查找数据库索引 | 多级置信度评分</p>
 </div>
 """, unsafe_allow_html=True)
+
+# 登录检查
+if not check_login():
+    st.stop()
+
+# 登出按钮
+logout_button()
 
 # 侧边栏
 with st.sidebar:
