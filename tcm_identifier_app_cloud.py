@@ -42,14 +42,15 @@ ISOTOPE_ABUNDANCES = {
 
 # 同位素质量增量（相对于主同位素）
 ISOTOPE_MASS_INCREMENT = {
-    'C': 1.0034,   # 13C - 12C
-    'H': 1.0063,   # 2H - 1H
-    'N': 0.9970,   # 15N - 14N
-    'O': 1.9942,   # 18O - 16O
-    'S': 1.9958,   # 34S - 32S
-    'Cl': 1.9970,  # 37Cl - 35Cl
-    'Br': 1.9980,  # 81Br - 79Br
-    'Si': 1.9946,  # 30Si - 28Si
+    'C': {12: 0, 13: 1.0034},   # 13C - 12C
+    'H': {1: 0, 2: 1.0063},     # 2H - 1H
+    'N': {14: 0, 15: 0.9970},   # 15N - 14N
+    'O': {16: 0, 18: 1.9942},   # 18O - 16O
+    'S': {32: 0, 34: 1.9958},   # 34S - 32S
+    'Cl': {35: 0, 37: 1.9970},  # 37Cl - 35Cl
+    'Br': {79: 0, 81: 1.9980},  # 81Br - 79Br
+    'Si': {28: 0, 30: 1.9946},  # 30Si - 28Si
+    'P': {31: 0},
 }
 
 # 同位素容差（Da）
@@ -261,25 +262,42 @@ def calculate_isotope_pattern(formula):
         if element not in ISOTOPE_ABUNDANCES:
             continue
 
-        abundances = ISOTOPE_ABUNDANCES[element]
+        # Ensure count is an integer
+        try:
+            count = int(count)
+        except (ValueError, TypeError):
+            continue
+
+        abundances = ISOTOPE_ABUNDANCES.get(element, {})
         mass_increments = ISOTOPE_MASS_INCREMENT.get(element, {})
+        # Ensure they are dicts
+        if isinstance(abundances, dict):
+            abundances = dict(abundances)
+        else:
+            abundances = {}
+        if isinstance(mass_increments, dict):
+            mass_increments = dict(mass_increments)
+        else:
+            mass_increments = {}
+
+        # Get base isotope key (the one with mass increment 0)
+        base_isotope = None
+        min_mass_inc = 999
+        for k, v in mass_increments.items():
+            if v < min_mass_inc:
+                min_mass_inc = v
+                base_isotope = k
 
         new_peaks = {}
         for atom_idx in range(count):
             temp_peaks = {}
-            for current_mass, current_abund in isotope_peaks.items():
-                for isotope_mass_diff, isotope_abund in abundances.items():
-                    if isotope_mass_diff == min(abundances.keys()):
+            for current_mass, current_abund in list(isotope_peaks.items()):
+                for isotope_mass_diff, isotope_abund in list(abundances.items()):
+                    if base_isotope and isotope_mass_diff == base_isotope:
                         new_mass = current_mass
                     else:
-                        mass_inc = 0
-                        for mi, mi_val in mass_increments.items():
-                            if mi == isotope_mass_diff:
-                                mass_inc = mi_val
-                                break
-                        if mass_inc == 0:
-                            mass_inc = isotope_mass_diff - min(abundances.keys())
-
+                        # Use mass increment if available
+                        mass_inc = mass_increments.get(isotope_mass_diff, 0)
                         new_mass = current_mass + mass_inc
 
                     new_abund = current_abund * isotope_abund
@@ -1105,14 +1123,20 @@ class UniversalIdentifier:
     def _build_fragment_sources(self):
         self.global_fragment_sources = {}
         for key, res in self.results.items():
-            for frag_mz, sources in res.get('matched_sources_pos', {}).items():
-                if frag_mz not in self.global_fragment_sources:
-                    self.global_fragment_sources[frag_mz] = set()
-                self.global_fragment_sources[frag_mz].update(sources)
-            for frag_mz, sources in res.get('matched_sources_neg', {}).items():
-                if frag_mz not in self.global_fragment_sources:
-                    self.global_fragment_sources[frag_mz] = set()
-                self.global_fragment_sources[frag_mz].update(sources)
+            # Safe handling of matched_sources_pos
+            sources_pos = res.get('matched_sources_pos', {})
+            if isinstance(sources_pos, dict):
+                for frag_mz, sources in sources_pos.items():
+                    if frag_mz not in self.global_fragment_sources:
+                        self.global_fragment_sources[frag_mz] = set()
+                    self.global_fragment_sources[frag_mz].update(sources)
+            # Safe handling of matched_sources_neg
+            sources_neg = res.get('matched_sources_neg', {})
+            if isinstance(sources_neg, dict):
+                for frag_mz, sources in sources_neg.items():
+                    if frag_mz not in self.global_fragment_sources:
+                        self.global_fragment_sources[frag_mz] = set()
+                    self.global_fragment_sources[frag_mz].update(sources)
 
     def export_reports(self, output_prefix='compound', max_confirmed=None):
         sorted_results = sorted(self.results.items(),
@@ -1133,9 +1157,18 @@ class UniversalIdentifier:
         for i, (key, res) in enumerate(sorted_results, 1):
 
             matched_obs_with_sources = []
+            # Safe handling of matched_sources
+            sources_pos = res.get('matched_sources_pos', {})
+            sources_neg = res.get('matched_sources_neg', {})
+            if not isinstance(sources_pos, dict):
+                sources_pos = {}
+            if not isinstance(sources_neg, dict):
+                sources_neg = {}
+
             for frag_mz in res.get('all_matched_obs', []):
-                sources = res.get('matched_sources_pos', {}).get(frag_mz, set()) | \
-                         res.get('matched_sources_neg', {}).get(frag_mz, set())
+                pos_sources = sources_pos.get(frag_mz, set()) if isinstance(sources_pos.get(frag_mz), (set, list)) else set()
+                neg_sources = sources_neg.get(frag_mz, set()) if isinstance(sources_neg.get(frag_mz), (set, list)) else set()
+                sources = pos_sources | neg_sources
                 sources_str = '; '.join(sorted(sources)) if sources else '无来源'
                 matched_obs_with_sources.append(f"{frag_mz:.4f}({sources_str})")
 
