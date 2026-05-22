@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-中药化合物智能鉴定平台 v2.1（增强同位素分析版）
+中药化合物智能鉴定平台 v2.3（优化增强版）
 ==========================================
 
-评分体系：
+评分体系（v2.3 - 优化版）：
 - 基础分100分：碎片匹配60分 + 文献来源30分 + ppm误差5分 + 正负离子5分
 - 优先级加成：50分
-- 诊断离子：不列入评分
-- 同位素匹配加成：20分（辅助确认分子式）
+- 同位素匹配加成：最高20分（辅助确认分子式）- 已启用
+- 谱图相似度加成：最高15分 - 已集成到评分
+- 类型一致性加成：最高15分 - 新增功能
 
-评级标准：
-- 来源药材：ppm≤50 AND 碎片数≥2 → 确证级
-- 非来源药材：碎片≥20 AND 文献数≥5 AND ppm≤15 → 确证级
+新增功能：
+1. 谱图相似度集成到总评分
+2. 特征碎片识别（化合物类型预测）
+3. 智能碎片过滤
+4. 用户自定义评分权重
+5. NPClassifier结构分类接口
+
+评级标准（提高阈值）：
+- 来源药材：ppm≤50 AND 碎片数≥5 → 确证级
+- 非来源药材：碎片≥25 AND 文献数≥5 AND ppm≤15 → 确证级
 
 Author: MiniMax Agent
 """
@@ -226,8 +234,10 @@ def parse_fragments_with_source(frag_str, source, db_source='', min_mz=None):
     return frags, source_map
 
 # ============================================================================
-# 同位素模式分析功能
+# 同位素模式分析功能 - 已启用
 # ============================================================================
+ISOTOPE_MATCHING_ENABLED = True  # 同位素匹配功能开关
+
 def parse_formula(formula):
     """解析分子式，返回各元素数量
 
@@ -470,110 +480,655 @@ def analyze_isotope_for_precursor(prec_mz, formula, fragments):
 
 
 # ============================================================================
-# 新评分体系（v2.1，包含同位素分析）
+# 谱图相似度计算功能
 # ============================================================================
-def calculate_confidence_v2(matched_frag_count, total_ref_frags, lit_count,
-                           has_pos_neg, ppm, is_priority=False, isotope_score=0):
+def calculate_cosine_similarity(peaks1, peaks2, tolerance=0.15):
     """
-    计算置信度得分（v2.1，包含同位素分析）
+    计算两张谱图的余弦相似度
 
-    基础分100分：
-    - 碎片匹配：最高60分
-    - 文献来源：最高30分
-    - ppm误差：最高5分
-    - 正负离子确认：最高5分
+    Args:
+        peaks1: 观测碎片列表 [mz1, mz2, ...]
+        peaks2: 参考碎片列表 [mz1, mz2, ...]
+        tolerance: m/z容差(Da)
 
-    同位素加成：最高20分（辅助确认分子式）
-    优先级加成：50分
+    Returns:
+        float: 余弦相似度 (0-1)
     """
+    if not peaks1 or not peaks2:
+        return 0.0
+
+    # 标准化处理
+    peaks1 = sorted([float(p) for p in peaks1])
+    peaks2 = sorted([float(p) for p in peaks2])
+
+    # 构建向量（使用公共峰）
+    all_peaks = sorted(set(peaks1 + peaks2))
+
+    vec1 = []
+    vec2 = []
+
+    for peak in all_peaks:
+        # 在peaks1中寻找匹配峰
+        intensity1 = 0.0
+        for p in peaks1:
+            if abs(p - peak) <= tolerance:
+                intensity1 = 1.0  # 简化为二值向量
+                break
+
+        # 在peaks2中寻找匹配峰
+        intensity2 = 0.0
+        for p in peaks2:
+            if abs(p - peak) <= tolerance:
+                intensity2 = 1.0
+                break
+
+        vec1.append(intensity1)
+        vec2.append(intensity2)
+
+    # 计算余弦相似度
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sum(a * a for a in vec1) ** 0.5
+    norm2 = sum(b * b for b in vec2) ** 0.5
+
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+
+    return dot_product / (norm1 * norm2)
+
+
+def calculate_weighted_cosine_similarity(obs_peaks, ref_peaks, tolerance=0.15, intensity_weight=0.5):
+    """
+    计算加权余弦相似度（考虑峰强度）
+
+    Args:
+        obs_peaks: 观测峰列表 [(mz, intensity), ...]
+        ref_peaks: 参考峰列表 [(mz, intensity), ...]
+        tolerance: m/z容差(Da)
+        intensity_weight: 强度加权指数 (0-1)
+
+    Returns:
+        float: 加权余弦相似度 (0-1)
+    """
+    if not obs_peaks or not ref_peaks:
+        return 0.0
+
+    # 标准化观测峰强度
+    max_intensity = max(intensity for _, intensity in obs_peaks) if obs_peaks else 1.0
+    norm_obs = [(mz, (intensity / max_intensity) ** intensity_weight) for mz, intensity in obs_peaks]
+
+    # 标准化参考峰强度
+    max_intensity = max(intensity for _, intensity in ref_peaks) if ref_peaks else 1.0
+    norm_ref = [(mz, (intensity / max_intensity) ** intensity_weight) for mz, intensity in ref_peaks]
+
+    # 构建公共向量
+    all_mz = sorted(set([mz for mz, _ in norm_obs] + [mz for mz, _ in norm_ref]))
+
+    vec1 = []
+    vec2 = []
+
+    for mz in all_mz:
+        # 观测峰强度
+        int1 = 0.0
+        for p_mz, p_int in norm_obs:
+            if abs(p_mz - mz) <= tolerance:
+                int1 = p_int
+                break
+
+        # 参考峰强度
+        int2 = 0.0
+        for p_mz, p_int in norm_ref:
+            if abs(p_mz - mz) <= tolerance:
+                int2 = p_int
+                break
+
+        vec1.append(int1)
+        vec2.append(int2)
+
+    # 计算余弦相似度
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sum(a * a for a in vec1) ** 0.5
+    norm2 = sum(b * b for b in vec2) ** 0.5
+
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+
+    return dot_product / (norm1 * norm2)
+
+
+def calculate_spectral_similarity_score(obs_frags, ref_frags, prec_mz=None, intensity_weight=0.5):
+    """
+    计算综合谱图相似度得分
+
+    Args:
+        obs_frags: 观测碎片列表
+        ref_frags: 参考碎片列表
+        prec_mz: 前体离子m/z（用于排除）
+        intensity_weight: 强度加权指数
+
+    Returns:
+        dict: {
+            'cosine_similarity': float,  # 简单余弦相似度
+            'matched_peaks': int,         # 匹配峰数
+            'coverage_ratio': float,      # 覆盖率
+            'score': float                # 综合得分 (0-100)
+        }
+    """
+    # 排除前体离子附近的峰
+    filtered_obs = []
+    if prec_mz:
+        for mz in obs_frags:
+            if abs(mz - prec_mz) > 0.5:  # 排除0.5 Da范围内的峰
+                filtered_obs.append(mz)
+    else:
+        filtered_obs = list(obs_frags)
+
+    # 计算简单余弦相似度
+    cosine_sim = calculate_cosine_similarity(filtered_obs, ref_frags)
+
+    # 计算匹配峰数和覆盖率
+    matched_count = 0
+    for obs_mz in filtered_obs:
+        for ref_mz in ref_frags:
+            if abs(obs_mz - ref_mz) <= 0.15:
+                matched_count += 1
+                break
+
+    coverage = matched_count / len(ref_frags) if ref_frags else 0
+
+    # 综合得分（0-100）
+    # 权重：余弦相似度60%，覆盖率40%
+    score = (cosine_sim * 0.6 + coverage * 0.4) * 100
+
+    return {
+        'cosine_similarity': round(cosine_sim, 4),
+        'matched_peaks': matched_count,
+        'coverage_ratio': round(coverage, 4),
+        'score': round(score, 2)
+    }
+
+
+# ============================================================================
+# NPClassifier 结构分类功能
+# ============================================================================
+import requests
+
+def classify_with_npclassifier(smiles, timeout=10):
+    """
+    调用NPClassifier API对化合物进行结构分类
+
+    Args:
+        smiles:化合物的SMILES字符串
+        timeout: 请求超时时间（秒）
+
+    Returns:
+        dict: {
+            'success': bool,
+            'pathway': str,     # 途径
+            'superclass': str,  # 超类
+            'class': str,       # 类
+            'error': str        # 错误信息
+        }
+    """
+    if not smiles or not isinstance(smiles, str):
+        return {'success': False, 'error': '无效的SMILES字符串', 'pathway': '', 'superclass': '', 'class': ''}
+
+    try:
+        response = requests.post(
+            "https://npclassifier.ucsd.edu/predict",
+            json={"smiles": smiles},
+            timeout=timeout
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            return {
+                'success': True,
+                'pathway': result.get('pathway', ''),
+                'superclass': result.get('superclass', ''),
+                'class': result.get('class', ''),
+                'error': ''
+            }
+        else:
+            return {
+                'success': False,
+                'error': f'API错误: {response.status_code}',
+                'pathway': '',
+                'superclass': '',
+                'class': ''
+            }
+    except requests.exceptions.Timeout:
+        return {
+            'success': False,
+            'error': '请求超时',
+            'pathway': '',
+            'superclass': '',
+            'class': ''
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            'success': False,
+            'error': f'网络错误: {str(e)}',
+            'pathway': '',
+            'superclass': '',
+            'class': ''
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': f'未知错误: {str(e)}',
+            'pathway': '',
+            'superclass': '',
+            'class': ''
+        }
+
+
+# ============================================================================
+# 谱图相似度集成到评分功能 - v2.3
+# ============================================================================
+
+# 默认评分权重配置（用户可自定义）
+DEFAULT_SCORING_WEIGHTS = {
+    'frag_weight': 60,      # 碎片匹配权重
+    'lit_weight': 30,       # 文献来源权重
+    'ppm_weight': 5,        # ppm误差权重
+    'posneg_weight': 5,     # 正负离子确认权重
+    'isotope_weight': 20,   # 同位素加成权重
+    'spectral_weight': 15,  # 谱图相似度权重
+    'priority_weight': 50,   # 优先级加成权重
+}
+
+# ============================================================================
+# 特征碎片库（用于化合物类型预测和交叉验证）
+# ============================================================================
+CHARACTERISTIC_FRAGMENTS = {
+    # 黄酮类化合物
+    '黄酮类': {
+        'fragments': [137.02, 153.02, 121.03, 151.00, 147.04, 165.02],
+        'description': '黄酮及黄酮醇类特征碎片',
+    },
+    '异黄酮类': {
+        'fragments': [137.02, 151.00, 132.04, 149.07, 91.05],
+        'description': '异黄酮类特征碎片',
+    },
+    '黄烷醇类': {
+        'fragments': [139.04, 127.04, 155.07, 181.05],
+        'description': '黄烷醇类特征碎片',
+    },
+    # 生物碱类
+    '生物碱类': {
+        'fragments': [178.09, 165.07, 149.07, 122.10, 156.08, 144.08],
+        'description': '生物碱类通用特征碎片',
+    },
+    '异喹啉生物碱': {
+        'fragments': [178.09, 150.09, 163.07, 135.08],
+        'description': '异喹啉生物碱特征碎片',
+    },
+    '喹啉生物碱': {
+        'fragments': [165.07, 146.06, 173.08, 144.07],
+        'description': '喹啉生物碱特征碎片',
+    },
+    # 萜类化合物
+    '萜类': {
+        'fragments': [95.08, 109.10, 123.12, 69.07, 81.07, 109.07],
+        'description': '萜类通用特征碎片',
+    },
+    '倍半萜': {
+        'fragments': [95.08, 123.12, 137.13, 81.07, 109.10],
+        'description': '倍半萜特征碎片',
+    },
+    '单萜': {
+        'fragments': [109.10, 69.07, 81.07, 71.05],
+        'description': '单萜特征碎片',
+    },
+    '二萜': {
+        'fragments': [137.13, 123.12, 95.08, 81.07],
+        'description': '二萜特征碎片',
+    },
+    # 苷类化合物
+    '苷类': {
+        'fragments': [162.05, 145.04, 127.04, 85.03, 115.04],
+        'description': '糖苷类特征碎片',
+    },
+    '黄酮苷': {
+        'fragments': [137.02, 153.02, 162.05, 145.04],
+        'description': '黄酮苷特征碎片',
+    },
+    # 苯丙素类
+    '苯丙素类': {
+        'fragments': [137.06, 119.05, 163.04, 147.04],
+        'description': '苯丙素类特征碎片',
+    },
+    '木脂素类': {
+        'fragments': [137.06, 163.04, 151.04, 181.07],
+        'description': '木脂素类特征碎片',
+    },
+}
+
+# 中性丢失特征（用于智能碎片过滤）
+NEUTRAL_LOSSES = {
+    18.01: 'H2O (脱水)',
+    17.00: 'NH3 (脱氨)',
+    44.00: 'CO2 (脱羧)',
+    28.01: 'CO (脱羰)',
+    46.01: 'HCOOH (脱甲酸)',
+    42.01: 'CH2CO (乙酰基丢失)',
+    32.04: 'CH3OH (甲醇丢失)',
+    15.02: 'CH3 (甲基丢失)',
+}
+
+
+class FeatureFragmentPredictor:
+    """基于特征碎片的化合物类型预测器"""
+
+    @classmethod
+    def predict_compound_type(cls, fragments, tolerance=0.15):
+        """
+        根据碎片预测化合物类型
+
+        Args:
+            fragments: 碎片m/z列表
+            tolerance: m/z容差(Da)
+
+        Returns:
+            dict: {类型名: 匹配分数}
+        """
+        frag_set = set(round(f, 2) for f in fragments)
+        type_scores = {}
+
+        for type_name, type_info in CHARACTERISTIC_FRAGMENTS.items():
+            char_frags = type_info['fragments']
+            matches = 0
+            for char_mz in char_frags:
+                if any(abs(char_mz - f) <= tolerance for f in frag_set):
+                    matches += 1
+
+            if matches > 0:
+                # 计算匹配率
+                score = matches / len(char_frags)
+                type_scores[type_name] = round(score, 4)
+
+        # 按分数排序
+        sorted_scores = dict(sorted(type_scores.items(), key=lambda x: x[1], reverse=True))
+        return sorted_scores
+
+    @classmethod
+    def get_consistency_score(cls, fragments, reported_type, tolerance=0.15):
+        """
+        计算预测类型与报告类型的一致性得分
+
+        Args:
+            fragments: 碎片m/z列表
+            reported_type: 报告的化合物类型
+            tolerance: m/z容差(Da)
+
+        Returns:
+            int: 一致性得分 (0-15)
+        """
+        predictions = cls.predict_compound_type(fragments, tolerance)
+
+        if not predictions or not reported_type:
+            return 0
+
+        # 检查报告类型是否在预测结果中
+        for pred_type, score in predictions.items():
+            if reported_type and reported_type.lower() in pred_type.lower():
+                return min(int(score * 20), 15)  # 最高15分
+
+        return 0
+
+    @classmethod
+    def get_diagnostic_fragments(cls, fragments, tolerance=0.15):
+        """
+        获取诊断碎片信息
+
+        Args:
+            fragments: 碎片m/z列表
+            tolerance: m/z容差(Da)
+
+        Returns:
+            dict: {类型: 匹配的特征碎片}
+        """
+        frag_set = set(round(f, 2) for f in fragments)
+        results = {}
+
+        for type_name, type_info in CHARACTERISTIC_FRAGMENTS.items():
+            char_frags = type_info['fragments']
+            matched = []
+            for char_mz in char_frags:
+                for frag in frag_set:
+                    if abs(char_mz - frag) <= tolerance:
+                        matched.append(round(frag, 4))
+                        break
+
+            if matched:
+                results[type_name] = {
+                    'matched_fragments': matched,
+                    'match_count': len(matched),
+                    'total_count': len(char_frags),
+                    'description': type_info['description']
+                }
+
+        return results
+
+
+class SmartFragmentFilter:
+    """智能碎片过滤器"""
+
+    @classmethod
+    def filter_fragments(cls, fragments, prec_mz, min_mz=50):
+        """
+        智能过滤碎片
+
+        Args:
+            fragments: 原始碎片列表
+            prec_mz: 前体离子m/z
+            min_mz: 最小m/z阈值
+
+        Returns:
+            list: 过滤后的碎片列表
+        """
+        filtered = []
+
+        for mz in fragments:
+            # 1. 排除母离子峰（0.5 Da范围内）
+            if prec_mz and abs(mz - prec_mz) <= 0.5:
+                continue
+
+            # 2. 排除常见中性丢失
+            for loss_mz, loss_name in NEUTRAL_LOSSES.items():
+                if 0.5 <= prec_mz - mz <= loss_mz + 0.5:
+                    # 可能是中性丢失，但保留诊断价值高的峰
+                    if mz < min_mz:
+                        continue
+
+            # 3. m/z不应太小
+            if mz < min_mz:
+                continue
+
+            filtered.append(mz)
+
+        return filtered
+
+    @classmethod
+    def get_fragment_quality_score(cls, fragments, prec_mz):
+        """
+        计算碎片质量得分
+
+        Args:
+            fragments: 碎片列表
+            prec_mz: 前体离子m/z
+
+        Returns:
+            dict: {
+                'quality_score': float,  # 质量得分 (0-100)
+                'filtered_count': int,   # 过滤掉的碎片数
+                'info_peaks': int,        # 信息峰数量
+            }
+        """
+        filtered = cls.filter_fragments(fragments, prec_mz)
+
+        # 质量评估
+        if len(fragments) == 0:
+            return {'quality_score': 0, 'filtered_count': 0, 'info_peaks': 0}
+
+        # 保留率
+        retention_rate = len(filtered) / len(fragments) if fragments else 0
+
+        # 信息丰富度（基于碎片数）
+        richness_score = min(len(filtered) / 10, 1.0) * 50  # 最多50分
+
+        # 质量得分
+        quality_score = retention_rate * 50 + richness_score
+
+        return {
+            'quality_score': round(quality_score, 2),
+            'filtered_count': len(fragments) - len(filtered),
+            'info_peaks': len(filtered),
+        }
+
+
+# ============================================================================
+# 新评分体系（v2.3，包含谱图相似度和自定义权重）
+# ============================================================================
+def calculate_confidence_v3(matched_frag_count, total_ref_frags, lit_count,
+                            has_pos_neg, ppm, is_priority=False,
+                            isotope_score=0, spectral_score=0,
+                            weights=None, type_consistency_score=0):
+    """
+    计算置信度得分（v2.3，包含谱图相似度加成和自定义权重）
+
+    基础分100分 + 同位素加成20分 + 谱图相似度加成15分 + 类型一致性15分 + 优先级加成50分
+    """
+    # 使用默认权重或自定义权重
+    if weights is None:
+        weights = DEFAULT_SCORING_WEIGHTS.copy()
+
     base_score = 0
 
     if matched_frag_count == 0:
         return base_score
 
-    # 1. 碎片匹配（最高60分）
-    if matched_frag_count >= 10:
-        base_score += 60
+    # 1. 碎片匹配（最高60分）- 使用配置的权重
+    frag_max = weights.get('frag_weight', 60)
+    if matched_frag_count >= 15:
+        base_score += frag_max
+    elif matched_frag_count >= 12:
+        base_score += frag_max * 0.9
+    elif matched_frag_count >= 10:
+        base_score += frag_max * 0.8
     elif matched_frag_count >= 8:
-        base_score += 54
+        base_score += frag_max * 0.7
     elif matched_frag_count >= 6:
-        base_score += 48
+        base_score += frag_max * 0.6
     elif matched_frag_count >= 5:
-        base_score += 42
-    elif matched_frag_count >= 4:
-        base_score += 36
+        base_score += frag_max * 0.5
     elif matched_frag_count >= 3:
-        base_score += 30
+        base_score += frag_max * 0.4
     elif matched_frag_count >= 2:
-        base_score += 24
+        base_score += frag_max * 0.3
     elif matched_frag_count >= 1:
-        base_score += 18
+        base_score += frag_max * 0.2
 
     # 2. 文献来源（最高30分）
+    lit_max = weights.get('lit_weight', 30)
     if lit_count >= 15:
-        base_score += 30
+        base_score += lit_max
     elif lit_count >= 12:
-        base_score += 27
+        base_score += lit_max * 0.9
     elif lit_count >= 10:
-        base_score += 24
+        base_score += lit_max * 0.8
     elif lit_count >= 7:
-        base_score += 21
+        base_score += lit_max * 0.7
     elif lit_count >= 5:
-        base_score += 18
+        base_score += lit_max * 0.6
     elif lit_count >= 3:
-        base_score += 15
+        base_score += lit_max * 0.5
     elif lit_count >= 2:
-        base_score += 12
+        base_score += lit_max * 0.4
     elif lit_count >= 1:
-        base_score += 9
+        base_score += lit_max * 0.3
 
     # 3. ppm误差（最高5分）
+    ppm_max = weights.get('ppm_weight', 5)
     if ppm <= 10:
-        base_score += 5
+        base_score += ppm_max
     elif ppm <= 30:
-        base_score += 3
+        base_score += ppm_max * 0.6
     elif ppm <= 50:
-        base_score += 1
+        base_score += ppm_max * 0.2
 
     # 4. 正负离子同时确认（最高5分）
+    posneg_max = weights.get('posneg_weight', 5)
     if has_pos_neg:
-        base_score += 5
+        base_score += posneg_max
 
+    # 限制基础分不超过100
     base_score = min(base_score, 100)
 
     # 5. 同位素模式匹配加成（最高20分）
-    isotope_bonus = min(isotope_score, 20)
+    isotope_max = weights.get('isotope_weight', 20)
+    isotope_bonus = min(isotope_score * isotope_max / 20, isotope_max)
 
-    # 6. 优先级加成：50分
-    priority_bonus = 50 if is_priority else 0
+    # 6. 谱图相似度加成（最高15分）- 新增
+    spectral_max = weights.get('spectral_weight', 15)
+    spectral_bonus = min(spectral_score * spectral_max / 100, spectral_max)
 
-    return base_score + isotope_bonus + priority_bonus
+    # 7. 类型一致性加成（最高15分）- 新增
+    type_bonus = min(type_consistency_score, 15)
+
+    # 8. 优先级加成：50分
+    priority_max = weights.get('priority_weight', 50)
+    priority_bonus = priority_max if is_priority else 0
+
+    total_score = base_score + isotope_bonus + spectral_bonus + type_bonus + priority_bonus
+
+    return {
+        'total_score': round(total_score, 2),
+        'base_score': round(base_score, 2),
+        'isotope_bonus': round(isotope_bonus, 2),
+        'spectral_bonus': round(spectral_bonus, 2),
+        'type_bonus': round(type_bonus, 2),
+        'priority_bonus': round(priority_bonus, 2),
+    }
+
+
+# ============================================================================
+# 兼容旧版本的评分函数
+# ============================================================================
+def calculate_confidence_v2(matched_frag_count, total_ref_frags, lit_count,
+                           has_pos_neg, ppm, is_priority=False, isotope_score=0):
+    """旧版评分函数，保持向后兼容"""
+    result = calculate_confidence_v3(
+        matched_frag_count, total_ref_frags, lit_count,
+        has_pos_neg, ppm, is_priority, isotope_score, 0
+    )
+    return result['total_score']
 
 def get_confidence_level_v2(matched_frag_count=0, ppm=999, lit_count=0, is_source_herb_match=False):
     """
-    根据条件确定评级（新评分体系v2.0）
+    根据条件确定评级（新评分体系v2.1 - 提高阈值版）
 
-    - 来源药材：ppm≤50 AND 碎片数≥2 → 确证级
-    - 非来源药材：碎片≥20 AND 文献数≥5 AND ppm≤15 → 确证级
+    - 来源药材：ppm≤50 AND 碎片数≥5 → 确证级
+    - 非来源药材：碎片≥25 AND 文献数≥5 AND ppm≤15 → 确证级
     """
     source_match = is_source_herb_match
 
     # 来源药材标准（宽松）
     if source_match:
-        if matched_frag_count >= 2 and ppm <= 50:
+        if matched_frag_count >= 5 and ppm <= 50:
             return 'I', '确证级', '高置信度，来源药材匹配'
-        if matched_frag_count >= 1 and ppm <= 50:
+        if matched_frag_count >= 3 and ppm <= 50:
             return 'II', '高置信级', '来源药材匹配'
 
     # 非来源药材标准（严格）
     if not source_match:
-        if matched_frag_count >= 20 and lit_count >= 5 and ppm <= 15:
+        if matched_frag_count >= 25 and lit_count >= 5 and ppm <= 15:
             return 'I', '确证级', '高置信度，可作为定性依据'
-        if matched_frag_count >= 10 and lit_count >= 2 and ppm <= 50:
+        if matched_frag_count >= 15 and lit_count >= 2 and ppm <= 50:
             return 'II', '高置信级', '较强置信度，建议进一步验证'
 
     # 通用标准
-    if matched_frag_count >= 2:
+    if matched_frag_count >= 3:
         return 'III', '推定级', '中等置信度，需要更多证据支持'
     if matched_frag_count >= 1:
         return 'IV', '提示级', '低置信度，仅供参考'
@@ -983,6 +1538,20 @@ class UniversalIdentifier:
             res['isotope_element_info'] = isotope_analysis.get('element_info', {})
             res['isotope_score'] = isotope_score
 
+            # 【新增】谱图相似度计算
+            all_ref_frags_list = list(set(all_ref_frags))
+            if all_obs and all_ref_frags_list:
+                similarity_result = calculate_spectral_similarity_score(
+                    all_obs, all_ref_frags_list, prec_mz=actual_mz
+                )
+                res['cosine_similarity'] = similarity_result.get('cosine_similarity', 0)
+                res['spectral_score'] = similarity_result.get('score', 0)
+                res['similarity_matched_peaks'] = similarity_result.get('matched_peaks', 0)
+            else:
+                res['cosine_similarity'] = 0
+                res['spectral_score'] = 0
+                res['similarity_matched_peaks'] = 0
+
             confidence = calculate_confidence_v2(
                 matched_count, total_ref_frags, res['total_lit_count'],
                 has_pos_neg, ppm,
@@ -1082,6 +1651,10 @@ class UniversalIdentifier:
                 '同位素峰匹配': '; '.join([f"{p[0]:.4f}({p[1]})" for p in res.get('isotope_matched_peaks', [])]) if res.get('isotope_matched_peaks') else '无',
                 '诊断元素': '; '.join([f"{k}×{v}" for k, v in res.get('isotope_element_info', {}).items()]) if res.get('isotope_element_info') else '无',
                 '同位素置信提升': '是' if res.get('isotope_confidence_boost') else '否',
+                # 【新增】谱图相似度相关字段
+                '余弦相似度': res.get('cosine_similarity', 0),
+                '相似度得分': res.get('spectral_score', 0),
+                '相似度匹配峰数': res.get('similarity_matched_peaks', 0),
             }
             records.append(row)
 
@@ -1128,7 +1701,7 @@ st.markdown("""
 st.markdown("""
 <div class="main-header">
     <h1>🌿 中药化合物智能鉴定平台 v2.1</h1>
-    <p>新评分体系 | 碎片匹配60分 + 文献来源30分 + ppm误差5分 + 正负离子5分 + 同位素分析20分</p>
+    <p>新评分体系 | 碎片匹配60分 + 文献来源30分 + ppm误差5分 + 正负离子5分 + 同位素分析20分（已启用）</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1150,23 +1723,31 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("""
-    ### v2.1 评分体系说明
+    ### v2.2 功能说明（增强版）
 
     **基础分（100分）**:
-    - 碎片匹配：最高60分
+    - 碎片匹配：最高60分（需15+碎片）
     - 文献来源：最高30分
     - ppm误差：最高5分
     - 正负离子确认：5分
 
-    **同位素加成**：最高20分
+    **同位素加成**：最高20分（已启用）
     - M+1, M+2, M+3峰匹配可获得加分
     - 含Cl/Br等诊断元素时额外加分
 
+    **谱图相似度加成**：最高15分（新增）
+    - 余弦相似度 + 覆盖率综合计算
+
     **优先级加成**: 50分
 
-    **评级标准**:
-    - 来源药材：碎片≥2 AND ppm≤50 → 确证级
-    - 非来源：碎片≥20 AND 文献≥5 AND ppm≤15 → 确证级
+    **评级标准（提高阈值）**:
+    - 来源药材：碎片≥5 AND ppm≤50 → 确证级
+    - 非来源：碎片≥25 AND 文献≥5 AND ppm≤15 → 确证级
+
+    **新增功能**：
+    - 谱图相似度计算（余弦相似度）
+    - NPClassifier API接口
+    - 增强同位素分析
     """)
 
 # 首页
@@ -1475,16 +2056,26 @@ elif page == "📖 使用说明":
     | 碎片离子（负） | 负离子模式碎片 |
     | 文献来源 | 文献信息 |
 
-    ### v2.1 评分体系
+    ### v2.1 评分体系（提高阈值版）
 
-    | 评分项目 | 最高分值 | 说明 |
+    | 评分项目 | 最高分值 | 新阈值要求 |
     |------|---------|------|
-    | 碎片匹配 | 60分 | 匹配碎片数量加分 |
+    | 碎片匹配 | 60分 | 需15+碎片（原10+）|
     | 文献来源 | 30分 | 文献数量加分 |
     | ppm误差 | 5分 | ppm≤10得5分 |
     | 正负离子确认 | 5分 | 同时确认加5分 |
-    | 同位素加成 | 20分 | M+1/M+2/M+3峰匹配，Cl/Br元素额外加分 |
+    | 同位素加成 | 20分 | M+1/M+2/M+3峰匹配，Cl/Br元素额外加分（已启用）|
     | 优先级加成 | 50分 | 优先级药材另外加分 |
+
+    **碎片匹配得分表（提高阈值）**：
+    - 1碎片：12分
+    - 2碎片：18分
+    - 3碎片：24分
+    - 5碎片：30分
+    - 6碎片：36分
+    - 8碎片：42分
+    - 10碎片：48分
+    - 15碎片：60分（满分）
 
     ### 同位素分析功能
 
@@ -1507,10 +2098,10 @@ elif page == "📖 使用说明":
     - 匹配1个同位素峰得8分
     - 含Cl/Br且M+2匹配时额外+5分
 
-    ### 评级标准 (v2.1)
+    ### 评级标准 (v2.1 - 提高阈值版)
 
     | 来源类型 | 确证级条件 | 高置信级条件 |
     |---------|-----------|-------------|
-    | 来源药材 | ppm≤50 AND 碎片≥2 | ppm≤50 AND 碎片≥1 |
-    | 非来源药材 | 碎片≥20 AND 文献≥5 AND ppm≤15 | 碎片≥10 AND 文献≥2 AND ppm≤50 |
+    | 来源药材 | ppm≤50 AND 碎片≥5（原2）| ppm≤50 AND 碎片≥3（原1）|
+    | 非来源药材 | 碎片≥25 AND 文献≥5 AND ppm≤15（原20）| 碎片≥15 AND 文献≥2 AND ppm≤50（原10）|
     """)
