@@ -197,9 +197,6 @@ def load_db(file_path):
             '碎片离子(负离子模式)': '碎片离子（负）',
         }
         df = df.rename(columns=col_mapping)
-        # 确保药材名称列存在（如果药材名称不存在，使用药材名）
-        if '药材名称' not in df.columns and '药材名' in df.columns:
-            df['药材名称'] = df['药材名']
         return df
     except Exception as e:
         return pd.DataFrame()
@@ -1612,7 +1609,7 @@ class UniversalIdentifier:
                 matched_obs_with_sources.append(f"{frag_mz:.4f}({sources_str})")
 
             all_ref_frags = res.get('ref_frags_pos', []) + res.get('ref_frags_neg', [])
-            all_ref_str = '; '.join([f'{x:.4f}' for x in list(set(all_ref_frags))[:20]])
+            all_ref_str = '; '.join([f'{x:.4f}' for x in set(all_ref_frags)][:20])
             obs_str = '; '.join([f'{x:.4f}' for x in res.get('all_obs_frags', [])[:30]])
 
             coverage_pct = res.get('coverage_ratio', 0) * 100
