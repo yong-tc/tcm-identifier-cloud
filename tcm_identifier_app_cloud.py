@@ -570,86 +570,82 @@ def calculate_confidence_v3(matched_frag_count, total_ref_frags, lit_count,
                             has_pos_neg, ppm, is_priority=False,
                             isotope_score=0, spectral_score=0,
                             weights=None, type_consistency_score=0):
-    """计算置信度得分（v2.3）"""
-    if weights is None:
-        weights = DEFAULT_SCORING_WEIGHTS.copy()
-
+    """计算置信度得分（v2.3）- 与原始程序一致"""
     base_score = 0
 
     if matched_frag_count == 0:
-        return 0
+        return {
+            'total_score': 0.0,
+            'base_score': 0.0,
+            'isotope_bonus': 0.0,
+            'priority_bonus': 0.0,
+        }
 
-    frag_max = weights.get('frag_weight', 60)
+    # 1. 碎片匹配（最高60分）
     if matched_frag_count >= 15:
-        base_score += frag_max
+        base_score += 60
     elif matched_frag_count >= 12:
-        base_score += frag_max * 0.9
+        base_score += 54
     elif matched_frag_count >= 10:
-        base_score += frag_max * 0.8
+        base_score += 48
     elif matched_frag_count >= 8:
-        base_score += frag_max * 0.7
+        base_score += 42
     elif matched_frag_count >= 6:
-        base_score += frag_max * 0.6
+        base_score += 36
     elif matched_frag_count >= 5:
-        base_score += frag_max * 0.5
+        base_score += 30
     elif matched_frag_count >= 3:
-        base_score += frag_max * 0.4
+        base_score += 24
     elif matched_frag_count >= 2:
-        base_score += frag_max * 0.3
+        base_score += 18
     elif matched_frag_count >= 1:
-        base_score += frag_max * 0.2
+        base_score += 12
 
-    lit_max = weights.get('lit_weight', 30)
+    # 2. 文献来源（最高30分）
     if lit_count >= 15:
-        base_score += lit_max
+        base_score += 30
     elif lit_count >= 12:
-        base_score += lit_max * 0.9
+        base_score += 27
     elif lit_count >= 10:
-        base_score += lit_max * 0.8
+        base_score += 24
     elif lit_count >= 7:
-        base_score += lit_max * 0.7
+        base_score += 21
     elif lit_count >= 5:
-        base_score += lit_max * 0.6
+        base_score += 18
     elif lit_count >= 3:
-        base_score += lit_max * 0.5
+        base_score += 15
     elif lit_count >= 2:
-        base_score += lit_max * 0.4
+        base_score += 12
     elif lit_count >= 1:
-        base_score += lit_max * 0.3
+        base_score += 9
 
-    ppm_max = weights.get('ppm_weight', 5)
+    # 3. ppm误差（最高5分）
     if ppm <= 10:
-        base_score += ppm_max
+        base_score += 5
     elif ppm <= 30:
-        base_score += ppm_max * 0.6
+        base_score += 3
     elif ppm <= 50:
-        base_score += ppm_max * 0.2
+        base_score += 1
 
-    posneg_max = weights.get('posneg_weight', 5)
+    # 4. 正负离子同时确认（最高5分）
     if has_pos_neg:
-        base_score += posneg_max
+        base_score += 5
 
+    # 限制基础分不超过100
     base_score = min(base_score, 100)
 
-    isotope_max = weights.get('isotope_weight', 20)
-    isotope_bonus = min(isotope_score * isotope_max / 20, isotope_max)
+    # 5. 同位素模式匹配加成（最高20分）
+    isotope_bonus = min(isotope_score, 20)
 
-    spectral_max = weights.get('spectral_weight', 15)
-    spectral_bonus = min(spectral_score * spectral_max / 100, spectral_max)
+    # 6. 优先级加成：50分
+    priority_bonus = 50 if is_priority else 0
 
-    type_bonus = min(type_consistency_score, 15)
-
-    priority_max = weights.get('priority_weight', 50)
-    priority_bonus = priority_max if is_priority else 0
-
-    total_score = base_score + isotope_bonus + spectral_bonus + type_bonus + priority_bonus
+    total_score = base_score + isotope_bonus + priority_bonus
 
     return {
         'total_score': round(total_score, 2),
         'base_score': round(base_score, 2),
         'isotope_bonus': round(isotope_bonus, 2),
-        'spectral_bonus': round(spectral_bonus, 2),
-        'type_bonus': round(type_bonus, 2),
         'priority_bonus': round(priority_bonus, 2),
     }
 
@@ -1087,19 +1083,6 @@ class UniversalIdentifier:
             res['isotope_confidence_boost'] = isotope_analysis.get('confidence_boost', False)
             res['isotope_element_info'] = isotope_analysis.get('element_info', {})
             res['isotope_score'] = isotope_score
-
-            all_ref_frags_list = list(set(all_ref_frags))
-            if all_obs and all_ref_frags_list:
-                similarity_result = calculate_spectral_similarity_score(
-                    all_obs, all_ref_frags_list, prec_mz=actual_mz
-                )
-                res['cosine_similarity'] = similarity_result.get('cosine_similarity', 0)
-                res['spectral_score'] = similarity_result.get('score', 0)
-                res['similarity_matched_peaks'] = similarity_result.get('matched_peaks', 0)
-            else:
-                res['cosine_similarity'] = 0
-                res['spectral_score'] = 0
-                res['similarity_matched_peaks'] = 0
 
             confidence = calculate_confidence_v2(
                 matched_count, total_ref_frags, res['total_lit_count'],
