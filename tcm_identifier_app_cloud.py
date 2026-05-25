@@ -570,7 +570,7 @@ def calculate_confidence_v3(matched_frag_count, total_ref_frags, lit_count,
                             has_pos_neg, ppm, is_priority=False,
                             isotope_score=0, spectral_score=0,
                             weights=None, type_consistency_score=0):
-    """计算置信度得分（v2.3）- 与原始程序一致"""
+    """计算置信度得分（v2.3）- 与test_results一致，包含谱图相似度加成"""
     base_score = 0
 
     if matched_frag_count == 0:
@@ -578,6 +578,7 @@ def calculate_confidence_v3(matched_frag_count, total_ref_frags, lit_count,
             'total_score': 0.0,
             'base_score': 0.0,
             'isotope_bonus': 0.0,
+            'spectral_bonus': 0.0,
             'priority_bonus': 0.0,
         }
 
@@ -637,25 +638,29 @@ def calculate_confidence_v3(matched_frag_count, total_ref_frags, lit_count,
     # 5. 同位素模式匹配加成（最高20分）
     isotope_bonus = min(isotope_score, 20)
 
-    # 6. 优先级加成：50分
+    # 6. 谱图相似度加成（最高15分）
+    spectral_bonus = min(spectral_score, 15)
+
+    # 7. 优先级加成：50分
     priority_bonus = 50 if is_priority else 0
 
-    total_score = base_score + isotope_bonus + priority_bonus
+    total_score = base_score + isotope_bonus + spectral_bonus + priority_bonus
 
     return {
         'total_score': round(total_score, 2),
         'base_score': round(base_score, 2),
         'isotope_bonus': round(isotope_bonus, 2),
+        'spectral_bonus': round(spectral_bonus, 2),
         'priority_bonus': round(priority_bonus, 2),
     }
 
 
 def calculate_confidence_v2(matched_frag_count, total_ref_frags, lit_count,
-                           has_pos_neg, ppm, is_priority=False, isotope_score=0):
+                           has_pos_neg, ppm, is_priority=False, isotope_score=0, spectral_score=0):
     """旧版评分函数，保持向后兼容"""
     result = calculate_confidence_v3(
         matched_frag_count, total_ref_frags, lit_count,
-        has_pos_neg, ppm, is_priority, isotope_score, 0
+        has_pos_neg, ppm, is_priority, isotope_score, spectral_score
     )
     if isinstance(result, dict):
         return result['total_score']
@@ -1084,11 +1089,28 @@ class UniversalIdentifier:
             res['isotope_element_info'] = isotope_analysis.get('element_info', {})
             res['isotope_score'] = isotope_score
 
+            # 谱图相似度计算
+            all_ref_frags_list = list(set(all_ref_frags))
+            if all_obs and all_ref_frags_list:
+                similarity_result = calculate_spectral_similarity_score(
+                    all_obs, all_ref_frags_list, prec_mz=actual_mz
+                )
+                res['cosine_similarity'] = similarity_result.get('cosine_similarity', 0)
+                spectral_score = similarity_result.get('score', 0)
+                res['spectral_score'] = spectral_score
+                res['similarity_matched_peaks'] = similarity_result.get('matched_peaks', 0)
+            else:
+                res['cosine_similarity'] = 0
+                spectral_score = 0
+                res['spectral_score'] = 0
+                res['similarity_matched_peaks'] = 0
+
             confidence = calculate_confidence_v2(
                 matched_count, total_ref_frags, res['total_lit_count'],
                 has_pos_neg, ppm,
                 is_priority=res.get('is_priority', False),
-                isotope_score=isotope_score
+                isotope_score=isotope_score,
+                spectral_score=spectral_score
             )
             res['confidence'] = confidence
 
