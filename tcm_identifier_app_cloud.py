@@ -150,7 +150,7 @@ def check_login():
 # 内置数据库配置
 # ============================================================================
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-BUILTIN_DB_PATH = os.path.join(_CURRENT_DIR, 'user_input_files', 'TCM-SM-MS DB.CSV')
+BUILTIN_DB_PATH = os.path.join(_CURRENT_DIR, 'TCM-SM-MS DB.CSV')
 
 # ============================================================================
 # 配置参数
@@ -570,82 +570,86 @@ def calculate_confidence_v3(matched_frag_count, total_ref_frags, lit_count,
                             has_pos_neg, ppm, is_priority=False,
                             isotope_score=0, spectral_score=0,
                             weights=None, type_consistency_score=0):
-    """计算置信度得分（v2.3）- 与原始程序一致"""
+    """计算置信度得分（v2.3）"""
+    if weights is None:
+        weights = DEFAULT_SCORING_WEIGHTS.copy()
+
     base_score = 0
 
     if matched_frag_count == 0:
-        return {
-            'total_score': 0.0,
-            'base_score': 0.0,
-            'isotope_bonus': 0.0,
-            'priority_bonus': 0.0,
-        }
+        return 0
 
-    # 1. 碎片匹配（最高60分）
+    frag_max = weights.get('frag_weight', 60)
     if matched_frag_count >= 15:
-        base_score += 60
+        base_score += frag_max
     elif matched_frag_count >= 12:
-        base_score += 54
+        base_score += frag_max * 0.9
     elif matched_frag_count >= 10:
-        base_score += 48
+        base_score += frag_max * 0.8
     elif matched_frag_count >= 8:
-        base_score += 42
+        base_score += frag_max * 0.7
     elif matched_frag_count >= 6:
-        base_score += 36
+        base_score += frag_max * 0.6
     elif matched_frag_count >= 5:
-        base_score += 30
+        base_score += frag_max * 0.5
     elif matched_frag_count >= 3:
-        base_score += 24
+        base_score += frag_max * 0.4
     elif matched_frag_count >= 2:
-        base_score += 18
+        base_score += frag_max * 0.3
     elif matched_frag_count >= 1:
-        base_score += 12
+        base_score += frag_max * 0.2
 
-    # 2. 文献来源（最高30分）
+    lit_max = weights.get('lit_weight', 30)
     if lit_count >= 15:
-        base_score += 30
+        base_score += lit_max
     elif lit_count >= 12:
-        base_score += 27
+        base_score += lit_max * 0.9
     elif lit_count >= 10:
-        base_score += 24
+        base_score += lit_max * 0.8
     elif lit_count >= 7:
-        base_score += 21
+        base_score += lit_max * 0.7
     elif lit_count >= 5:
-        base_score += 18
+        base_score += lit_max * 0.6
     elif lit_count >= 3:
-        base_score += 15
+        base_score += lit_max * 0.5
     elif lit_count >= 2:
-        base_score += 12
+        base_score += lit_max * 0.4
     elif lit_count >= 1:
-        base_score += 9
+        base_score += lit_max * 0.3
 
-    # 3. ppm误差（最高5分）
+    ppm_max = weights.get('ppm_weight', 5)
     if ppm <= 10:
-        base_score += 5
+        base_score += ppm_max
     elif ppm <= 30:
-        base_score += 3
+        base_score += ppm_max * 0.6
     elif ppm <= 50:
-        base_score += 1
+        base_score += ppm_max * 0.2
 
-    # 4. 正负离子同时确认（最高5分）
+    posneg_max = weights.get('posneg_weight', 5)
     if has_pos_neg:
-        base_score += 5
+        base_score += posneg_max
 
-    # 限制基础分不超过100
     base_score = min(base_score, 100)
 
-    # 5. 同位素模式匹配加成（最高20分）
-    isotope_bonus = min(isotope_score, 20)
+    isotope_max = weights.get('isotope_weight', 20)
+    isotope_bonus = min(isotope_score * isotope_max / 20, isotope_max)
 
-    # 6. 优先级加成：50分
-    priority_bonus = 50 if is_priority else 0
+    spectral_max = weights.get('spectral_weight', 15)
+    spectral_bonus = min(spectral_score * spectral_max / 100, spectral_max)
 
-    total_score = base_score + isotope_bonus + priority_bonus
+    type_bonus = min(type_consistency_score, 15)
+
+    priority_max = weights.get('priority_weight', 50)
+    priority_bonus = priority_max if is_priority else 0
+
+    total_score = base_score + isotope_bonus + spectral_bonus + type_bonus + priority_bonus
 
     return {
         'total_score': round(total_score, 2),
         'base_score': round(base_score, 2),
         'isotope_bonus': round(isotope_bonus, 2),
+        'spectral_bonus': round(spectral_bonus, 2),
+        'type_bonus': round(type_bonus, 2),
         'priority_bonus': round(priority_bonus, 2),
     }
 
@@ -739,32 +743,31 @@ class EfficientDatabaseIndex:
                 'has_frag_data': len(frag_pos) > 0 or len(frag_neg) > 0,
             }
 
-            # 处理可能的多个m/z值（用/分隔），与run_original_v2.py一致
-            def parse_mz_val(val):
-                if pd.isna(val) or str(val).strip() == '':
-                    return []
+            if pd.notna(mz_p) and str(mz_p).strip():
                 try:
-                    return [float(v) for v in str(val).split('/')]
+                    base = float(mz_p)
+                    for shift in [0] + list(ADDUCTS_POSITIVE.values()):
+                        mz_val = base + shift
+                        self.sorted_idx_pos.append((mz_val, info, frag_pos))
+                        for frag_mz, src_set in source_map_pos.items():
+                            if frag_mz not in self.frag_source_lookup_pos:
+                                self.frag_source_lookup_pos[frag_mz] = set()
+                            self.frag_source_lookup_pos[frag_mz].update(src_set)
                 except:
-                    return []
+                    pass
 
-            for base in parse_mz_val(mz_p):
-                for shift in [0] + list(ADDUCTS_POSITIVE.values()):
-                    mz_val = base + shift
-                    self.sorted_idx_pos.append((mz_val, info, frag_pos))
-                    for frag_mz, src_set in source_map_pos.items():
-                        if frag_mz not in self.frag_source_lookup_pos:
-                            self.frag_source_lookup_pos[frag_mz] = set()
-                        self.frag_source_lookup_pos[frag_mz].update(src_set)
-
-            for base in parse_mz_val(mz_n):
-                for shift in [0] + list(ADDUCTS_NEGATIVE.values()):
-                    mz_val = base + shift
-                    self.sorted_idx_neg.append((mz_val, info, frag_neg))
-                    for frag_mz, src_set in source_map_neg.items():
-                        if frag_mz not in self.frag_source_lookup_neg:
-                            self.frag_source_lookup_neg[frag_mz] = set()
-                        self.frag_source_lookup_neg[frag_mz].update(src_set)
+            if pd.notna(mz_n) and str(mz_n).strip():
+                try:
+                    base = float(mz_n)
+                    for shift in [0] + list(ADDUCTS_NEGATIVE.values()):
+                        mz_val = base + shift
+                        self.sorted_idx_neg.append((mz_val, info, frag_neg))
+                        for frag_mz, src_set in source_map_neg.items():
+                            if frag_mz not in self.frag_source_lookup_neg:
+                                self.frag_source_lookup_neg[frag_mz] = set()
+                            self.frag_source_lookup_neg[frag_mz].update(src_set)
+                except:
+                    pass
 
         self.sorted_idx_pos.sort(key=lambda x: x[0])
         self.sorted_idx_neg.sort(key=lambda x: x[0])
@@ -862,13 +865,11 @@ class UniversalIdentifier:
         self.ms_pos = load_ms(ms_pos_file) if ms_pos_file else pd.DataFrame()
         self.ms_neg = load_ms(ms_neg_file) if ms_neg_file else pd.DataFrame()
         self.db = load_db(db_file)
-        self.db_idx = None
-        self.results = {}
-
         if self.db.empty:
             return
 
         self.db_idx = MultiPriorityDB(self.db, priority_herbs)
+        self.results = {}
 
     def match_fragments_v12(self, obs_frags, ref_frags, prec_mz, frag_source_lookup):
         if not obs_frags or not ref_frags:
@@ -896,9 +897,6 @@ class UniversalIdentifier:
         return list(set(matched_obs)), list(matched_ref), matched_sources
 
     def identify(self):
-        if self.db_idx is None:
-            return {}
-
         pos_data = self._extract_precursors(self.ms_pos, 'positive')
         neg_data = self._extract_precursors(self.ms_neg, 'negative')
 
@@ -1090,6 +1088,19 @@ class UniversalIdentifier:
             res['isotope_element_info'] = isotope_analysis.get('element_info', {})
             res['isotope_score'] = isotope_score
 
+            all_ref_frags_list = list(set(all_ref_frags))
+            if all_obs and all_ref_frags_list:
+                similarity_result = calculate_spectral_similarity_score(
+                    all_obs, all_ref_frags_list, prec_mz=actual_mz
+                )
+                res['cosine_similarity'] = similarity_result.get('cosine_similarity', 0)
+                res['spectral_score'] = similarity_result.get('score', 0)
+                res['similarity_matched_peaks'] = similarity_result.get('matched_peaks', 0)
+            else:
+                res['cosine_similarity'] = 0
+                res['spectral_score'] = 0
+                res['similarity_matched_peaks'] = 0
+
             confidence = calculate_confidence_v2(
                 matched_count, total_ref_frags, res['total_lit_count'],
                 has_pos_neg, ppm,
@@ -1128,9 +1139,6 @@ class UniversalIdentifier:
                     self.global_fragment_sources[frag_mz].update(sources)
 
     def export_reports(self, output_prefix='compound', max_confirmed=None):
-        if not self.results:
-            return pd.DataFrame()
-
         sorted_results = sorted(self.results.items(),
                                key=lambda x: (0 if x[1]['is_priority'] else 1, -x[1]['confidence']))
 
@@ -1470,6 +1478,7 @@ elif page == "🔬 开始鉴定":
                     st.success(f"✅ 鉴定完成！共识别出 {len(df)} 个化合物")
 
                     col1, col2, col3, col4, col5 = st.columns(5)
+                    level_counts = df['评级名称'].value_counts()
 
                     with col1:
                         confirmed = len(df[df['评级'] == 'I'])
