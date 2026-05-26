@@ -1092,9 +1092,6 @@ class UniversalIdentifier:
         self.ms_pos = load_ms(ms_pos_file) if ms_pos_file else pd.DataFrame()
         self.ms_neg = load_ms(ms_neg_file) if ms_neg_file else pd.DataFrame()
         self.db = load_db(db_file)
-        if self.db.empty:
-            return
-
         self.db_idx = MultiPriorityDB(self.db, priority_herbs)
         self.results = {}
 
