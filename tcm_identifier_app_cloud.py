@@ -1128,6 +1128,9 @@ class UniversalIdentifier:
                     self.global_fragment_sources[frag_mz].update(sources)
 
     def export_reports(self, output_prefix='compound', max_confirmed=None):
+        if not self.results:
+            return pd.DataFrame()
+
         sorted_results = sorted(self.results.items(),
                                key=lambda x: (0 if x[1]['is_priority'] else 1, -x[1]['confidence']))
 
@@ -1467,7 +1470,6 @@ elif page == "🔬 开始鉴定":
                     st.success(f"✅ 鉴定完成！共识别出 {len(df)} 个化合物")
 
                     col1, col2, col3, col4, col5 = st.columns(5)
-                    level_counts = df['评级名称'].value_counts()
 
                     with col1:
                         confirmed = len(df[df['评级'] == 'I'])
