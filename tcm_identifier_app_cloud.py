@@ -862,11 +862,13 @@ class UniversalIdentifier:
         self.ms_pos = load_ms(ms_pos_file) if ms_pos_file else pd.DataFrame()
         self.ms_neg = load_ms(ms_neg_file) if ms_neg_file else pd.DataFrame()
         self.db = load_db(db_file)
+        self.db_idx = None
+        self.results = {}
+
         if self.db.empty:
             return
 
         self.db_idx = MultiPriorityDB(self.db, priority_herbs)
-        self.results = {}
 
     def match_fragments_v12(self, obs_frags, ref_frags, prec_mz, frag_source_lookup):
         if not obs_frags or not ref_frags:
@@ -894,6 +896,9 @@ class UniversalIdentifier:
         return list(set(matched_obs)), list(matched_ref), matched_sources
 
     def identify(self):
+        if self.db_idx is None:
+            return {}
+
         pos_data = self._extract_precursors(self.ms_pos, 'positive')
         neg_data = self._extract_precursors(self.ms_neg, 'negative')
 
