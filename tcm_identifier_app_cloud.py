@@ -150,7 +150,7 @@ def check_login():
 # 内置数据库配置
 # ============================================================================
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-BUILTIN_DB_PATH = os.path.join(_CURRENT_DIR, 'TCM-SM-MS DB.CSV')
+BUILTIN_DB_PATH = os.path.join(_CURRENT_DIR, 'user_input_files', 'TCM-SM-MS DB.CSV')
 
 # ============================================================================
 # 配置参数
@@ -739,31 +739,32 @@ class EfficientDatabaseIndex:
                 'has_frag_data': len(frag_pos) > 0 or len(frag_neg) > 0,
             }
 
-            if pd.notna(mz_p) and str(mz_p).strip():
+            # 处理可能的多个m/z值（用/分隔），与run_original_v2.py一致
+            def parse_mz_val(val):
+                if pd.isna(val) or str(val).strip() == '':
+                    return []
                 try:
-                    base = float(mz_p)
-                    for shift in [0] + list(ADDUCTS_POSITIVE.values()):
-                        mz_val = base + shift
-                        self.sorted_idx_pos.append((mz_val, info, frag_pos))
-                        for frag_mz, src_set in source_map_pos.items():
-                            if frag_mz not in self.frag_source_lookup_pos:
-                                self.frag_source_lookup_pos[frag_mz] = set()
-                            self.frag_source_lookup_pos[frag_mz].update(src_set)
+                    return [float(v) for v in str(val).split('/')]
                 except:
-                    pass
+                    return []
 
-            if pd.notna(mz_n) and str(mz_n).strip():
-                try:
-                    base = float(mz_n)
-                    for shift in [0] + list(ADDUCTS_NEGATIVE.values()):
-                        mz_val = base + shift
-                        self.sorted_idx_neg.append((mz_val, info, frag_neg))
-                        for frag_mz, src_set in source_map_neg.items():
-                            if frag_mz not in self.frag_source_lookup_neg:
-                                self.frag_source_lookup_neg[frag_mz] = set()
-                            self.frag_source_lookup_neg[frag_mz].update(src_set)
-                except:
-                    pass
+            for base in parse_mz_val(mz_p):
+                for shift in [0] + list(ADDUCTS_POSITIVE.values()):
+                    mz_val = base + shift
+                    self.sorted_idx_pos.append((mz_val, info, frag_pos))
+                    for frag_mz, src_set in source_map_pos.items():
+                        if frag_mz not in self.frag_source_lookup_pos:
+                            self.frag_source_lookup_pos[frag_mz] = set()
+                        self.frag_source_lookup_pos[frag_mz].update(src_set)
+
+            for base in parse_mz_val(mz_n):
+                for shift in [0] + list(ADDUCTS_NEGATIVE.values()):
+                    mz_val = base + shift
+                    self.sorted_idx_neg.append((mz_val, info, frag_neg))
+                    for frag_mz, src_set in source_map_neg.items():
+                        if frag_mz not in self.frag_source_lookup_neg:
+                            self.frag_source_lookup_neg[frag_mz] = set()
+                        self.frag_source_lookup_neg[frag_mz].update(src_set)
 
         self.sorted_idx_pos.sort(key=lambda x: x[0])
         self.sorted_idx_neg.sort(key=lambda x: x[0])
