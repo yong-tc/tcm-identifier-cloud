@@ -8,7 +8,7 @@
 1. 中药化合物智能鉴定平台 v2.3（Streamlit Web应用）
 2. 中药材化合物进一步确认程序（诊断离子库、中性丢失分析等）
 
-模a块化设计：
+模块化设计：
 - 基础鉴定模块：碎片匹配、数据库搜索、初步评分
 - 深度确认模块：诊断离子分析、中性丢失模式、碳数-RT相关性
 
@@ -479,23 +479,23 @@ def check_login():
 # 内置数据库配置
 # ============================================================================
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-BUILTIN_DB_PATH = os.path.join(_CURRENT_DIR, 'TCM-SM-MS DB.CSV')
+BUILTIN_DB_PATH = os.path.join(_CURRENT_DIR, 'user_input_files', 'TCM-SM-MS DB.CSV')
 
 # ============================================================================
-# 配置参数
+# 配置参数（与run_original_v2.py一致）
 # ============================================================================
 PRIMARY_PPM_TOLERANCE = 50
 SECONDARY_DA_TOLERANCE = 0.15
 RT_TOLERANCE = 0.2
 
 ADDUCTS_POSITIVE = {
-    '[M+H]+': 1.0078,
-    '[M+Na]+': 22.9898,
+    '[M+H]+': 1.0073,
+    '[M+Na]+': 22.9892,
     '[M+K]+': 38.9637,
     '[M+NH4]+': 18.0338,
 }
 ADDUCTS_NEGATIVE = {
-    '[M-H]-': -1.0078,
+    '[M-H]-': -1.0073,
     '[M+Cl]-': 34.9689,
     '[M+HCOO]-': 44.9977,
 }
@@ -969,31 +969,32 @@ class EfficientDatabaseIndex:
                 'has_frag_data': len(frag_pos) > 0 or len(frag_neg) > 0,
             }
 
-            if pd.notna(mz_p) and str(mz_p).strip():
+            # 处理可能的多个m/z值（用/分隔），与run_original_v2.py一致
+            def parse_mz_val(val):
+                if pd.isna(val) or str(val).strip() == '':
+                    return []
                 try:
-                    base = float(mz_p)
-                    for shift in [0] + list(ADDUCTS_POSITIVE.values()):
-                        mz_val = base + shift
-                        self.sorted_idx_pos.append((mz_val, info, frag_pos))
-                        for frag_mz, src_set in source_map_pos.items():
-                            if frag_mz not in self.frag_source_lookup_pos:
-                                self.frag_source_lookup_pos[frag_mz] = set()
-                            self.frag_source_lookup_pos[frag_mz].update(src_set)
+                    return [float(v) for v in str(val).split('/')]
                 except:
-                    pass
+                    return []
 
-            if pd.notna(mz_n) and str(mz_n).strip():
-                try:
-                    base = float(mz_n)
-                    for shift in [0] + list(ADDUCTS_NEGATIVE.values()):
-                        mz_val = base + shift
-                        self.sorted_idx_neg.append((mz_val, info, frag_neg))
-                        for frag_mz, src_set in source_map_neg.items():
-                            if frag_mz not in self.frag_source_lookup_neg:
-                                self.frag_source_lookup_neg[frag_mz] = set()
-                            self.frag_source_lookup_neg[frag_mz].update(src_set)
-                except:
-                    pass
+            for base in parse_mz_val(mz_p):
+                for shift in [0] + list(ADDUCTS_POSITIVE.values()):
+                    mz_val = base + shift
+                    self.sorted_idx_pos.append((mz_val, info, frag_pos))
+                    for frag_mz, src_set in source_map_pos.items():
+                        if frag_mz not in self.frag_source_lookup_pos:
+                            self.frag_source_lookup_pos[frag_mz] = set()
+                        self.frag_source_lookup_pos[frag_mz].update(src_set)
+
+            for base in parse_mz_val(mz_n):
+                for shift in [0] + list(ADDUCTS_NEGATIVE.values()):
+                    mz_val = base + shift
+                    self.sorted_idx_neg.append((mz_val, info, frag_neg))
+                    for frag_mz, src_set in source_map_neg.items():
+                        if frag_mz not in self.frag_source_lookup_neg:
+                            self.frag_source_lookup_neg[frag_mz] = set()
+                        self.frag_source_lookup_neg[frag_mz].update(src_set)
 
         self.sorted_idx_pos.sort(key=lambda x: x[0])
         self.sorted_idx_neg.sort(key=lambda x: x[0])
@@ -1947,22 +1948,24 @@ elif page == "🔬 化合物鉴定":
                     st.success(f"✅ 鉴定完成！共识别出 {len(df)} 个化合物")
 
                     col1, col2, col3, col4, col5 = st.columns(5)
-                    level_counts = df['评级名称'].value_counts()
+
+                    # 安全获取各评级数量
+                    rating_col = '评级' if '评级' in df.columns else None
+                    confirmed = len(df[df[rating_col] == 'I']) if rating_col and len(df) > 0 else 0
+                    high_conf = len(df[df[rating_col] == 'II']) if rating_col and len(df) > 0 else 0
+                    probable = len(df[df[rating_col] == 'III']) if rating_col and len(df) > 0 else 0
+                    low_conf = len(df[df[rating_col] == 'IV']) if rating_col and len(df) > 0 else 0
+                    excluded = len(df[df[rating_col] == 'V']) if rating_col and len(df) > 0 else 0
 
                     with col1:
-                        confirmed = len(df[df['评级'] == 'I'])
                         st.metric("确证级", confirmed)
                     with col2:
-                        high_conf = len(df[df['评级'] == 'II'])
                         st.metric("高置信级", high_conf)
                     with col3:
-                        probable = len(df[df['评级'] == 'III'])
                         st.metric("推定级", probable)
                     with col4:
-                        low_conf = len(df[df['评级'] == 'IV'])
                         st.metric("提示级", low_conf)
                     with col5:
-                        excluded = len(df[df['评级'] == 'V'])
                         st.metric("排除级", excluded)
 
                     st.markdown("---")
@@ -2134,17 +2137,21 @@ elif page == "📈 结果分析":
         with col1:
             st.metric("总化合物数", len(df))
         with col2:
-            high_count = len(df[df['评级名称'].isin(['确证级', '高置信级'])])
+            rating_name_col = '评级名称' if '评级名称' in df.columns else None
+            high_count = len(df[df[rating_name_col].isin(['确证级', '高置信级'])]) if rating_name_col and len(df) > 0 else 0
             st.metric("高置信化合物", high_count)
         with col3:
-            avg_score = df['置信度'].mean()
+            avg_score = df['置信度'].mean() if len(df) > 0 else 0
             st.metric("平均置信度", f"{avg_score:.1f}")
 
         st.markdown("---")
 
         st.markdown("### 评级分布")
         level_order = ['确证级', '高置信级', '推定级', '提示级', '排除级']
-        level_counts = df['评级名称'].value_counts().reindex(level_order).fillna(0)
+        if rating_name_col and len(df) > 0:
+            level_counts = df[rating_name_col].value_counts().reindex(level_order).fillna(0)
+        else:
+            level_counts = pd.Series(dtype=float)
         st.bar_chart(level_counts)
 
         st.markdown("---")
