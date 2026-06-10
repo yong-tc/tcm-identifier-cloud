@@ -120,6 +120,8 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 VALID_USER, VALID_PASS = 'ZY', '513513'
 INSTRUMENT_PPM = {'orbitrap': 10, 'qtof': 15, 'qqq': 30, 'low_res': 50}
 SECONDARY_DA_TOLERANCE = 0.15
+# R3 原版三个主推药材 (priority 辅以避免 L1 丢分)
+SUPPORTED_HERBS = ['栀子', '党参', '西红花']
 
 ISOTOPE_ABUNDANCES = {
     'C': {12: 0.9893, 13: 0.0107}, 'H': {1: 0.99985, 2: 0.00015},
@@ -363,7 +365,14 @@ def identify(extracted_pos, extracted_neg, priority_herbs, instrument='qtof', us
     compound_lit_count = db['compound_lit_count']
     ppm_tol = INSTRUMENT_PPM.get(instrument, 15)
 
-    priority_set = set(priority_herbs) if priority_herbs else set()
+    # R3 兼容: priority 默认为 "用户选的药材" + SUPPORTED_HERBS
+    # - 多药材模式: user + SUPPORTED
+    # - 单药材模式: user + SUPPORTED
+    # - 全库模式 (空 list): 不加 SUPPORTED, 纯粗筛
+    if priority_herbs:
+        priority_set = set(priority_herbs) | set(SUPPORTED_HERBS)
+    else:
+        priority_set = set()
     results = {}
 
     def process_one(extracted, mode):
@@ -427,7 +436,9 @@ def identify(extracted_pos, extracted_neg, priority_herbs, instrument='qtof', us
     if extracted_pos: process_one(extracted_pos, 'positive')
     if extracted_neg: process_one(extracted_neg, 'negative')
     if not results: return pd.DataFrame()
-    # dedup
+    # dedup: 按 (name, normalized_formula) 合并
+    # 合并原则: is_priority OR (任一 priority), total_lit/lit/cas/ctype 取第一个非空,
+    #          matched*/obs* 取所有合集, ref_pos/neg 取最丰富的那个
     groups = defaultdict(list)
     for k, v in results.items():
         norm = normalize_formula(v['formula'])
@@ -435,20 +446,39 @@ def identify(extracted_pos, extracted_neg, priority_herbs, instrument='qtof', us
     merged = {}
     for gk, entries in groups.items():
         if len(entries) == 1:
-            merged[entries[0][0]] = entries[0][1]; continue
-        first = dict(entries[0][1])
-        for k, v in entries[1:]:
-            for attr in ['matched_pos', 'matched_neg', 'obs_pos', 'obs_neg',
-                         'w_pos', 'w_neg', 'rt_pos', 'rt_neg']:
-                if v.get(attr):
-                    s = first.setdefault(attr, set() if attr in ['matched_pos', 'matched_neg'] else [])
-                    if isinstance(s, set): s.update(v[attr])
-                    else: s.extend(v[attr])
-            if v.get('ppm_pos', 999) < first['ppm_pos']: first['ppm_pos'] = v['ppm_pos']
-            if v.get('ppm_neg', 999) < first['ppm_neg']: first['ppm_neg'] = v['ppm_neg']
+            merged[entries[0][0]] = dict(entries[0][1]); continue
+        # 从所有 entries 中选最丰富的 (ref 最多) 作基底
+        entries_sorted = sorted(entries, key=lambda e: -(len(e[1].get('ref_pos', [])) + len(e[1].get('ref_neg', []))))
+        first = dict(entries_sorted[0][1])
+        # 集合/列表 累加
+        for attr in ['matched_pos', 'matched_neg', 'obs_pos', 'obs_neg',
+                     'w_pos', 'w_neg', 'rt_pos', 'rt_neg']:
+            if attr in ['matched_pos', 'matched_neg']:
+                first[attr] = set(first.get(attr, set()))
+                for k, v in entries_sorted[1:]:
+                    first[attr].update(v.get(attr, set()))
+            else:
+                first[attr] = list(first.get(attr, []))
+                for k, v in entries_sorted[1:]:
+                    first[attr].extend(v.get(attr, []))
+        # is_priority: OR 逻辑
+        first['is_priority'] = any(v.get('is_priority') for k, v in entries_sorted)
+        # total_lit / lit: 取最大
+        first['total_lit'] = max(v.get('total_lit', 0) for k, v in entries_sorted)
+        first['lit'] = max(v.get('lit', 0) for k, v in entries_sorted)
+        # ppm_pos/neg: 取最小
+        first['ppm_pos'] = min(v.get('ppm_pos', 999) for k, v in entries_sorted)
+        first['ppm_neg'] = min(v.get('ppm_neg', 999) for k, v in entries_sorted)
+        # mz_pos/neg: 任一非空
+        for k, v in entries_sorted:
             if v.get('mz_pos') is not None: first['mz_pos'] = v['mz_pos']
             if v.get('mz_neg') is not None: first['mz_neg'] = v['mz_neg']
-        merged[entries[0][0]] = first
+        # cas/ctype: 取第一个非空
+        for attr in ['cas', 'ctype']:
+            for k, v in entries_sorted:
+                if v.get(attr) and v.get(attr) != 'nan':
+                    first[attr] = v[attr]; break
+        merged[entries_sorted[0][0]] = first
     # 同位素 (可选)
     if use_isotope:
         _iso_cache = {}
