@@ -47,16 +47,63 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# 路径配置
+# 路径配置(云端友好:自动探测可用位置,失败则降级到 /tmp)
 # ============================================================================
-WORKSPACE = '/workspace'
-ATTACH = f'{WORKSPACE}/attachments'
-DB_CSV = f'{ATTACH}/dd8427e3__4372d4a5-7ddc-4fb6-9b0a-153b811f3b03.csv'
-REPORTS_DIR = f'{WORKSPACE}/tcm_v5/reports'
-RESULTS_DIR = f'{WORKSPACE}/tcm_v5/results'
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-os.makedirs(REPORTS_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
+
+def _find_attachments_dir():
+    """查找 attachments 目录(包含数据库和 xlsx 数据)"""
+    candidates = [
+        '/workspace/attachments',                              # 本地标准路径
+        os.path.join(_SCRIPT_DIR, '..', '..', 'attachments'),  # 源码相对路径
+        os.path.join(_SCRIPT_DIR, 'attachments'),            # 同级
+        os.path.expanduser('~/attachments'),                  # home
+        os.path.join('/tmp', 'attachments'),                  # 临时
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.path.isdir(c):
+            return c
+    return None
+
+
+def _ensure_writable_dir(primary, prefix='tcm_v5'):
+    """安全创建报告/结果目录,依次尝试多个候选位置"""
+    candidates = [
+        primary,                                                # 主首选
+        os.path.expanduser(f'~/{prefix}'),                     # home
+        os.path.join('/tmp', prefix + '_' + os.environ.get('USER', 'anon')),  # /tmp
+        os.path.join(tempfile.gettempdir(), prefix + '_' + str(os.getpid())),   # temp
+    ]
+    errors = []
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            test = os.path.join(path, '.write_test')
+            with open(test, 'w') as f:
+                f.write('ok')
+            os.remove(test)
+            return path
+        except (OSError, PermissionError) as e:
+            errors.append(f'{path}: {e}')
+            continue
+    raise RuntimeError('所有目录都不可写:\n  ' + '\n  '.join(errors))
+
+
+ATTACH = _find_attachments_dir()
+if ATTACH is None:
+    raise FileNotFoundError(
+        '找不到 attachments 目录(包含 TCM-SM-MS DB.csv 和 *.xlsx 数据)。\n'
+        '请将数据放在: /workspace/attachments 或同代码下 attachments/ 子目录'
+    )
+DB_CSV = f'{ATTACH}/dd8427e3__4372d4a5-7ddc-4fb6-9b0a-153b811f3b03.csv'
+
+# 报告/结果目录(云端可写优先)
+REPORTS_DIR = _ensure_writable_dir(f'{_SCRIPT_DIR}/reports', 'tcm_reports')
+RESULTS_DIR = _ensure_writable_dir(f'{_SCRIPT_DIR}/results', 'tcm_results')
+print(f'📁 附件: {ATTACH}')
+print(f'📁 报告: {REPORTS_DIR}')
+print(f'📁 结果: {RESULTS_DIR}')
 
 # ============================================================================
 # 数据集(支持所有药材,可扩展)
