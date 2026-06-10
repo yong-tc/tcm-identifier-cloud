@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌿 中药化合物智能鉴定平台 v5.0 - 整合版
-================================================
+TCM Compound Identification Platform v5.0 - Integrated
+=====================================================
 
 【部署到 Streamlit】
     streamlit run tcm_v5.py
@@ -136,11 +136,26 @@ if ATTACH is None:
     print('   修复 3: 在代码里直接改: ATTACH = "/your/data/path"')
     raise FileNotFoundError('找不到 TCM 数据库目录(需要放 TCM-SM-MS DB.csv)')
 
-DB_CSV = f'{ATTACH}/dd8427e3__4372d4a5-7ddc-4fb6-9b0a-153b811f3b03.csv'
-if not os.path.exists(DB_CSV):
-    print(f'❌ 数据库文件不存在: {DB_CSV}')
-    print(f'   请把 TCM-SM-MS DB.csv 放到 {ATTACH}/目录下。')
-    raise FileNotFoundError(f'数据库 csv 不存在: {DB_CSV}')
+DB_CSV = None
+_candidates_in_attach = [
+    'TCM-SM-MS DB.csv',
+    'TCM-SM-MS DB.CSV',
+    'dd8427e3__4372d4a5-7ddc-4fb6-9b0a-153b811f3b03.csv',
+]
+for _name in _candidates_in_attach:
+    _p = os.path.join(ATTACH, _name)
+    if os.path.exists(_p):
+        DB_CSV = _p
+        break
+if DB_CSV is None:
+    # 退而求其次:在附件目录里找第一个 .csv
+    import glob as _glob
+    _csvs = _glob.glob(os.path.join(ATTACH, '*.csv')) + _glob.glob(os.path.join(ATTACH, '*.CSV'))
+    if _csvs:
+        DB_CSV = _csvs[0]
+if DB_CSV is None:
+    print(f'❌ 找不到数据库 csv。请把 TCM-SM-MS DB.csv 放到 {ATTACH}/目录下。')
+    raise FileNotFoundError(f'数据库 csv 不存在: {ATTACH}/TCM-SM-MS DB.csv')
 
 # 报告/结果目录(云端可写优先)
 REPORTS_DIR = _ensure_writable_dir(f'{_SCRIPT_DIR}/reports', 'tcm_reports')
