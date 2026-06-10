@@ -74,7 +74,8 @@ def _find_attachments_dir():
     for c in candidates:
         if os.path.exists(c) and os.path.isdir(c):
             return c
-    return None
+    # 兑底: 仓库根目录(某些用户把数据放在根目录)以脚本所在目录为根
+    return _SCRIPT_DIR
 
 
 def _ensure_writable_dir(primary, prefix='tcm_v5'):
