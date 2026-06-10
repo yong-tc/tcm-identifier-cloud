@@ -53,13 +53,23 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _find_attachments_dir():
-    """查找 attachments 目录(包含数据库和 xlsx 数据)"""
+    """查找 attachments 目录(包含数据库和 xlsx 数据)
+    优先级: 环境变量 TCM_ATTACH_DIR > 多个候选路径
+    """
+    # 1) 环境变量优先(云端推荐用法)
+    env_dir = os.environ.get('TCM_ATTACH_DIR')
+    if env_dir and os.path.isdir(env_dir):
+        return env_dir
+
     candidates = [
         '/workspace/attachments',                              # 本地标准路径
+        '/app/attachments',                                     # Docker/Cloud Run
         os.path.join(_SCRIPT_DIR, '..', '..', 'attachments'),  # 源码相对路径
+        os.path.join(_SCRIPT_DIR, '..', 'attachments'),        # 二级
         os.path.join(_SCRIPT_DIR, 'attachments'),            # 同级
         os.path.expanduser('~/attachments'),                  # home
         os.path.join('/tmp', 'attachments'),                  # 临时
+        os.path.join('/data', 'attachments'),                  # data 卷
     ]
     for c in candidates:
         if os.path.exists(c) and os.path.isdir(c):
@@ -69,11 +79,26 @@ def _find_attachments_dir():
 
 def _ensure_writable_dir(primary, prefix='tcm_v5'):
     """安全创建报告/结果目录,依次尝试多个候选位置"""
+    # 1) 环境变量优先
+    env_var = prefix.upper().replace('TCM_', 'TCM_') + '_DIR'
+    env_dir = os.environ.get(env_var)
+    if env_dir:
+        try:
+            os.makedirs(env_dir, exist_ok=True)
+            test = os.path.join(env_dir, '.write_test')
+            with open(test, 'w') as f:
+                f.write('ok')
+            os.remove(test)
+            return env_dir
+        except (OSError, PermissionError):
+            pass
+
     candidates = [
         primary,                                                # 主首选
         os.path.expanduser(f'~/{prefix}'),                     # home
         os.path.join('/tmp', prefix + '_' + os.environ.get('USER', 'anon')),  # /tmp
         os.path.join(tempfile.gettempdir(), prefix + '_' + str(os.getpid())),   # temp
+        os.path.join('/tmp', prefix),                           # /tmp/{prefix}
     ]
     errors = []
     for path in candidates:
@@ -92,9 +117,29 @@ def _ensure_writable_dir(primary, prefix='tcm_v5'):
 
 ATTACH = _find_attachments_dir()
 if ATTACH is None:
+    print('⚠️  警告: 找不到 attachments 目录(包含数据库和 xlsx 数据)。')
+    print('   已尝试路径:')
+    for c in [
+        '$TCM_ATTACH_DIR(环境变量)',
+        '/workspace/attachments',
+        '/app/attachments',
+        f'{_SCRIPT_DIR}/../../attachments',
+        f'{_SCRIPT_DIR}/attachments',
+        '~/attachments',
+        '/tmp/attachments',
+        '/data/attachments',
+    ]:
+        print(f'     - {c}')
+    print()
+    print('   云端部署:设置环境变量 TCM_ATTACH_DIR 指向数据目录。')
+    print('   本地:   把数据放在 /workspace/attachments 或同代码下 attachments/ 子目录。')
+    print()
+    # 退出(明确告知用户怎么修)
     raise FileNotFoundError(
-        '找不到 attachments 目录(包含 TCM-SM-MS DB.csv 和 *.xlsx 数据)。\n'
-        '请将数据放在: /workspace/attachments 或同代码下 attachments/ 子目录'
+        '找不到 TCM 数据目录(包含 TCM-SM-MS DB.csv 和 *.xlsx)。\n'
+        '   修复 1: 设置环境变量 export TCM_ATTACH_DIR=/your/data/path\n'
+        '   修复 2: 把数据放到 /workspace/attachments 或 ./attachments\n'
+        '   修复 3: 在代码里直接改: ATTACH = "/your/data/path"'
     )
 DB_CSV = f'{ATTACH}/dd8427e3__4372d4a5-7ddc-4fb6-9b0a-153b811f3b03.csv'
 
