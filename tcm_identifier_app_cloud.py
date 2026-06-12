@@ -350,21 +350,57 @@ def extract_xlsx_to_list(file_path_or_buffer, is_buffer=False):
 # ============================================================================
 # v7.0: 核心鉴定器改为 v3opt7 (RT一致性 + RT离散度 + 正负RT配对 + 同位素精细评分)
 # ============================================================================
+# v3opt7 引擎定位策略 (按优先级搜索, 适应 Streamlit Cloud / 本地 / 其他部署):
+#   1. v7 同目录下的 v3opt7_engine.py (推荐: 打包部署时一并上传)
+#   2. 当前工作目录下的 v3opt7_engine.py
+#   3. ATTACH_DIR 下的 v3opt7_engine.py
+#   4. /workspace/attachments/下的原始文件
+#   5. Streamlit Cloud 常见路径: /mount/src/<repo>/...
 import importlib.util as _importlib_util
 
-_V3OPT7_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            '..', 'attachments',
-                            '73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py')
-if not os.path.exists(_V3OPT7_PATH):
-    # 兼容其他部署路径
-    for _cand in ['/workspace/attachments/73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py',
-                  os.path.join(ATTACH_DIR, 'v3opt7_engine.py')]:
-        if os.path.exists(_cand):
-            _V3OPT7_PATH = _cand; break
 
-_v3spec = _importlib_util.spec_from_file_location("v3opt7_engine", _V3OPT7_PATH)
-v3opt7_engine = _importlib_util.module_from_spec(_v3spec)
-_v3spec.loader.exec_module(v3opt7_engine)
+def _find_v3opt7_engine():
+    """多路径搜索 v3opt7_engine.py"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, 'v3opt7_engine.py'),                      # 1. v7 同目录
+        os.path.join(os.getcwd(), 'v3opt7_engine.py'),               # 2. 当前工作目录
+        os.path.join(ATTACH_DIR, 'v3opt7_engine.py'),                # 3. ATTACH_DIR
+        '/workspace/attachments/73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py',  # 4. 本地原始路径
+    ]
+    # 5. Streamlit Cloud 常见路径: /mount/src/<repo>/
+    for root in ['/mount/src', '/app', '/home/app']:
+        if os.path.isdir(root):
+            for sub in os.listdir(root):
+                sub_path = os.path.join(root, sub)
+                if os.path.isdir(sub_path):
+                    for fn in ['v3opt7_engine.py', '73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py']:
+                        cand = os.path.join(sub_path, fn)
+                        if os.path.exists(cand):
+                            candidates.append(cand)
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+@st.cache_resource(show_spinner='加载 v3opt7 鉴定引擎...')
+def _load_v3opt7_engine():
+    """加载并缓存 v3opt7 引擎 (streamlit rerun 时不会重复 exec_module)"""
+    p = _find_v3opt7_engine()
+    if p is None:
+        raise FileNotFoundError(
+            '找不到 v3opt7 引擎文件。\n'
+            '请将 v3opt7_engine.py 上传到 v7 应用同目录或 ATTACH_DIR。\n'
+            f'已搜索路径示例:\n  {os.path.dirname(os.path.abspath(__file__))}/\n  {os.getcwd()}/\n  {ATTACH_DIR}/'
+        )
+    spec = _importlib_util.spec_from_file_location('v3opt7_engine', p)
+    mod = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+v3opt7_engine = _load_v3opt7_engine()
 
 
 
