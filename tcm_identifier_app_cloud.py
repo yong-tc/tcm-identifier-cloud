@@ -360,24 +360,34 @@ import importlib.util as _importlib_util
 
 
 def _find_v3opt7_engine():
-    """多路径搜索 v3opt7_engine.py"""
+    """多路径搜索 v3opt7_engine.py (容错处理,适配 Streamlit Cloud 沙箱)"""
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(here, 'v3opt7_engine.py'),                      # 1. v7 同目录
         os.path.join(os.getcwd(), 'v3opt7_engine.py'),               # 2. 当前工作目录
-        os.path.join(ATTACH_DIR, 'v3opt7_engine.py'),                # 3. ATTACH_DIR
+        os.path.join(ATTACH_DIR, 'v3opt7_engine.py') if ATTACH_DIR else None,  # 3. ATTACH_DIR
         '/workspace/attachments/73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py',  # 4. 本地原始路径
+        os.path.join(here, '73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py'),    # 5. v7 同目录原始名
     ]
-    # 5. Streamlit Cloud 常见路径: /mount/src/<repo>/
-    for root in ['/mount/src', '/app', '/home/app']:
-        if os.path.isdir(root):
+    candidates = [c for c in candidates if c]
+
+    # 6. Streamlit Cloud 常见路径: /mount/src/<repo>/  (包裹异常以适应沙箱)
+    for root in ['/mount/src', '/app', '/home/app', '/srv', '/opt']:
+        try:
+            if not os.path.isdir(root):
+                continue
             for sub in os.listdir(root):
                 sub_path = os.path.join(root, sub)
-                if os.path.isdir(sub_path):
-                    for fn in ['v3opt7_engine.py', '73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py']:
-                        cand = os.path.join(sub_path, fn)
-                        if os.path.exists(cand):
-                            candidates.append(cand)
+                if not os.path.isdir(sub_path):
+                    continue
+                for fn in ['v3opt7_engine.py', '73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py']:
+                    cand = os.path.join(sub_path, fn)
+                    if os.path.exists(cand):
+                        candidates.append(cand)
+        except (PermissionError, OSError):
+            # 沙箱环境下某些路径不可读,直接跳过
+            continue
+
     for cand in candidates:
         if os.path.exists(cand):
             return cand
