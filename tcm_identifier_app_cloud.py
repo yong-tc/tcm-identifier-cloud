@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌿 中药 LC-MS/MS 化合物通用鉴定平台 v6.0 - Streamlit
-====================================================
+🌿 中药 LC-MS/MS 化合物通用鉴定平台 v7.0 - Streamlit (v6 框架 + v3opt7 算法)
+==========================================================================
 
-通用版: 不限定药材, 自动从 TCM-SM-MS DB 抽取所有药材名作为候选
-
-启动: streamlit run streamlit_app.py
-默认账号: ZY / 513513
+v7.0 变更:
+- 核心鉴定算法从 v6 替换为 v3opt7 (RT一致性 + RT离散度 + 正负RT配对 + 同位素精细评分 + 双门棁评级)
+- 保留 v6 的 streamlit 框架 (登录 / 侧边栏 / UI / 报告 / xlsx 解析)
+- 启动: streamlit run streamlit_app_v7.py
+- 默认账号: ZY / 513513
 """
 import os, sys, re, json, time, pickle, hashlib, tempfile
 from io import BytesIO
@@ -120,6 +121,8 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 VALID_USER, VALID_PASS = 'ZY', '513513'
 INSTRUMENT_PPM = {'orbitrap': 10, 'qtof': 15, 'qqq': 30, 'low_res': 50}
 SECONDARY_DA_TOLERANCE = 0.15
+# R3 原版三个主推药材 (priority 辅以避免 L1 丢分)
+SUPPORTED_HERBS = ['栀子', '党参', '西红花']
 
 ISOTOPE_ABUNDANCES = {
     'C': {12: 0.9893, 13: 0.0107}, 'H': {1: 0.99985, 2: 0.00015},
@@ -344,232 +347,114 @@ def extract_xlsx_to_list(file_path_or_buffer, is_buffer=False):
 # ============================================================================
 # 鉴定器 (通用版: priority_herbs 是字符串列表)
 # ============================================================================
-def determine_msi_level(is_herb_match, frag_count, ppm, has_lit,
-                        l1_ppm=10, l1_frag=5, l2_ppm=30, l2_frag=3):
-    if is_herb_match and frag_count >= l1_frag and ppm <= l1_ppm: return 1
-    if frag_count >= l2_frag and ppm <= l2_ppm and has_lit: return 2
-    if ppm <= 50: return 3
+# ============================================================================
+# v7.0: 核心鉴定器改为 v3opt7 (RT一致性 + RT离散度 + 正负RT配对 + 同位素精细评分)
+# ============================================================================
+import importlib.util as _importlib_util
+
+_V3OPT7_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            '..', 'attachments',
+                            '73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py')
+if not os.path.exists(_V3OPT7_PATH):
+    # 兼容其他部署路径
+    for _cand in ['/workspace/attachments/73a297ee__58e4ea42-04bf-46d8-ae15-e08da4863fc0.py',
+                  os.path.join(ATTACH_DIR, 'v3opt7_engine.py')]:
+        if os.path.exists(_cand):
+            _V3OPT7_PATH = _cand; break
+
+_v3spec = _importlib_util.spec_from_file_location("v3opt7_engine", _V3OPT7_PATH)
+v3opt7_engine = _importlib_util.module_from_spec(_v3spec)
+_v3spec.loader.exec_module(v3opt7_engine)
+
+
+
+# 旧 v6 的 _compute_isotope_pattern 和 determine_msi_level 已废弃, 由 v3opt7 内部接管
+# 保留同名空壳防止 import 报错
+
+
+def _compute_isotope_pattern(*args, **kwargs):
+    """v7.0 已废弃: 请使用 v3opt7_engine 的同位素评分"""
+    return [(0, 1.0)]
+
+
+def determine_msi_level(*args, **kwargs):
+    """v7.0 已废弃: 请使用 v3opt7_engine 的评级"""
     return 4
 
 
-def identify(extracted_pos, extracted_neg, priority_herbs, instrument='qtof', use_isotope=True):
-    """通用鉴定: 1 个 pos + 1 个 neg (可空), 返回 DataFrame"""
+def identify(extracted_pos, extracted_neg, priority_herbs, instrument='qtof',
+             use_isotope=True, add_supported_herbs=False):
+    """v7.0 鉴定: 委托给 v3opt7 引擎,输出 schema 跟 v6 兼容
+
+    参数:
+        priority_herbs: 用户选的药材列表
+        add_supported_herbs: 是否合并 SUPPORTED_HERBS (栀子/党参/西红花)
+            - False (默认): 通用模式,只以用户选的药材为 priority
+            - True: R3 兼容模式,优先级 = 用户选 + SUPPORTED_HERBS
+    """
     db = build_db_pkl_cached()
-    records = db['records']
-    sorted_p = db['sorted_p']
-    sorted_n = db['sorted_n']
-    mz_p_arr = db['mz_p_arr']
-    mz_n_arr = db['mz_n_arr']
-    compound_lit_count = db['compound_lit_count']
     ppm_tol = INSTRUMENT_PPM.get(instrument, 15)
 
-    priority_set = set(priority_herbs) if priority_herbs else set()
-    results = {}
-
-    def process_one(extracted, mode):
-        arr = mz_p_arr if mode == 'positive' else mz_n_arr
-        idx_map = sorted_p if mode == 'positive' else sorted_n
-        if len(arr) == 0: return
-        for prec_data in extracted:
-            prec_mz = prec_data['prec']
-            obs_frags = prec_data['frags']
-            obs_w = prec_data['weights']
-            tol = prec_mz * ppm_tol / 1e6
-            lo = bisect_left(arr, prec_mz - tol)
-            hi = bisect_right(arr, prec_mz + tol)
-            for i in range(lo, min(hi, len(arr))):
-                mz_val, rec_i = idx_map[i]
-                rec = records[rec_i]
-                ppm_err = abs(prec_mz - mz_val) / mz_val * 1e6
-                name = rec['name']
-                if name == 'nan': name = f"MZ_{prec_mz:.4f}"
-                # 关键: priority_herbs 决定是否是 priority
-                is_priority = bool(priority_set) and any(p in rec['herb'] for p in priority_set)
-                key = f"{name}|{rec['herb']}|{rec['formula']}"
-                if key not in results:
-                    results[key] = {
-                        'name': name, 'formula': rec['formula'],
-                        'herb': rec['herb'], 'ctype': rec['ctype'],
-                        'cas': rec['cas'], 'lit': rec['lit'],
-                        'total_lit': compound_lit_count.get(name, rec['lit']),
-                        'is_priority': is_priority,
-                        'ref_pos': rec['frag_p'], 'ref_neg': rec['frag_n'],
-                        'matched_pos': set(), 'matched_neg': set(),
-                        'obs_pos': [], 'obs_neg': [],
-                        'w_pos': [], 'w_neg': [],
-                        'rt_pos': [], 'rt_neg': [],
-                        'ppm_pos': 999, 'ppm_neg': 999,
-                        'mz_pos': None, 'mz_neg': None,
-                    }
-                res = results[key]
-                ref = rec['frag_p'] if mode == 'positive' else rec['frag_n']
-                matched = set()
-                for of in obs_frags:
-                    if abs(of - prec_mz) <= SECONDARY_DA_TOLERANCE: continue
-                    for rf in ref:
-                        if abs(of - rf) <= SECONDARY_DA_TOLERANCE and of not in matched:
-                            matched.add(of); break
-                if mode == 'positive':
-                    res['matched_pos'].update(matched)
-                    res['obs_pos'].extend(obs_frags)
-                    res['w_pos'].extend(obs_w)
-                    res['rt_pos'].append(prec_data['rt'])
-                    if ppm_err < res['ppm_pos']: res['ppm_pos'] = ppm_err
-                    res['mz_pos'] = prec_mz
-                else:
-                    res['matched_neg'].update(matched)
-                    res['obs_neg'].extend(obs_frags)
-                    res['w_neg'].extend(obs_w)
-                    res['rt_neg'].append(prec_data['rt'])
-                    if ppm_err < res['ppm_neg']: res['ppm_neg'] = ppm_err
-                    res['mz_neg'] = prec_mz
-
-    if extracted_pos: process_one(extracted_pos, 'positive')
-    if extracted_neg: process_one(extracted_neg, 'negative')
-    if not results: return pd.DataFrame()
-    # dedup
-    groups = defaultdict(list)
-    for k, v in results.items():
-        norm = normalize_formula(v['formula'])
-        groups[(v['name'], norm)].append((k, v))
-    merged = {}
-    for gk, entries in groups.items():
-        if len(entries) == 1:
-            merged[entries[0][0]] = entries[0][1]; continue
-        first = dict(entries[0][1])
-        for k, v in entries[1:]:
-            for attr in ['matched_pos', 'matched_neg', 'obs_pos', 'obs_neg',
-                         'w_pos', 'w_neg', 'rt_pos', 'rt_neg']:
-                if v.get(attr):
-                    s = first.setdefault(attr, set() if attr in ['matched_pos', 'matched_neg'] else [])
-                    if isinstance(s, set): s.update(v[attr])
-                    else: s.extend(v[attr])
-            if v.get('ppm_pos', 999) < first['ppm_pos']: first['ppm_pos'] = v['ppm_pos']
-            if v.get('ppm_neg', 999) < first['ppm_neg']: first['ppm_neg'] = v['ppm_neg']
-            if v.get('mz_pos') is not None: first['mz_pos'] = v['mz_pos']
-            if v.get('mz_neg') is not None: first['mz_neg'] = v['mz_neg']
-        merged[entries[0][0]] = first
-    # 同位素 (可选)
-    if use_isotope:
-        _iso_cache = {}
-        for k, r in merged.items():
-            formula = r['formula']
-            if not formula or formula in ('unknown', 'nan'):
-                r['iso_score'] = 0; r['iso_elements'] = ''; continue
-            prec_mz = r.get('mz_pos') or r.get('mz_neg')
-            if not prec_mz:
-                r['iso_score'] = 0; r['iso_elements'] = ''; continue
-            key = (formula, 3)
-            if key not in _iso_cache:
-                _iso_cache[key] = _compute_isotope_pattern(formula, n_max=3)
-            theo = _iso_cache[key]
-            obs = list(set(r.get('obs_pos', []) + r.get('obs_neg', [])))
-            matched = sum(1 for off, _ in theo if any(abs(o - (prec_mz + off)) <= 0.02 for o in obs))
-            comp = parse_formula(formula) or {}
-            has_diag = any(comp.get(e, 0) > 0 for e in ['Cl', 'Br', 'S', 'Si'])
-            if matched >= 3: r['iso_score'] = 100
-            elif matched == 2: r['iso_score'] = 70
-            elif matched == 1: r['iso_score'] = 40 if has_diag else 30
-            else: r['iso_score'] = 0
-            r['iso_elements'] = '; '.join([f'{e}x{comp[e]}' for e in ['Cl', 'Br', 'S', 'Si'] if comp.get(e, 0) > 0]) or '无'
+    # v7.0 通用版: 默认不加 SUPPORTED_HERBS, 保证 priority 完全由用户控制
+    if priority_herbs:
+        if add_supported_herbs:
+            priority_herbs_eff = list(set(priority_herbs) | set(SUPPORTED_HERBS))
+        else:
+            priority_herbs_eff = list(priority_herbs)
     else:
-        for r in merged.values():
-            r['iso_score'] = 0; r['iso_elements'] = '无'
-    # 评分
-    out = []
-    for k, r in merged.items():
-        matched = r['matched_pos'] | r['matched_neg']
-        obs = list(set(r['obs_pos'] + r['obs_neg']))
-        obs_w = r['w_pos'] + r['w_neg']
-        all_ref = r['ref_pos'] + r['ref_neg']
-        total_ref = len(all_ref)
-        mc = len(matched)
-        coverage = mc / total_ref if total_ref > 0 else 0
-        if r['mz_pos']: ppm = r['ppm_pos']
-        else: ppm = r['ppm_neg']
-        msi = determine_msi_level(r['is_priority'], mc, ppm, r['total_lit'] >= 1)
-        c = cosine_intensity(obs, obs_w, all_ref, None) if obs and all_ref else 0
-        base = 0
-        if mc > 0:
-            if mc >= 15: base += 60
-            elif mc >= 10: base += 48
-            elif mc >= 5: base += 30
-            elif mc >= 3: base += 24
-            elif mc >= 2: base += 18
-            else: base += 12
-        lc = r['total_lit']
-        if lc >= 15: base += 30
-        elif lc >= 5: base += 18
-        elif lc >= 1: base += 9
-        if ppm <= 10: base += 4
-        elif ppm <= 30: base += 1.5
-        elif ppm <= 50: base += 0.5
-        if r['mz_pos'] and r['mz_neg']: base += 5
-        base = min(base, 100)
-        iso_bonus = min(r.get('iso_score', 0) * 0.2, 20)
-        pri = 50 if r['is_priority'] else 0
-        conf = round(base + iso_bonus + min(c * 15, 15) + pri, 2)
-        if r['is_priority'] and mc >= 5 and ppm <= 50:
-            rating, rating_name = 'I', '确证级'
-        elif mc >= 25 and lc >= 5 and ppm <= 15:
-            rating, rating_name = 'I', '确证级'
-        elif mc >= 15 and lc >= 2 and ppm <= 50:
-            rating, rating_name = 'II', '高置信级'
-        elif mc >= 3: rating, rating_name = 'III', '推定级'
-        elif mc >= 1: rating, rating_name = 'IV', '提示级'
-        else: rating, rating_name = 'V', '排除级'
-        rts = [x for x in r['rt_pos'] + r['rt_neg'] if x is not None]
-        out.append({
-            '化合物中文名': r['name'],
-            '分子式': r['formula'],
-            'CAS号': r['cas'],
-            'm/z实际值': round(r.get('mz_pos') or r.get('mz_neg') or 0, 4),
-            'ppm': round(r['ppm_pos'] if r['mz_pos'] else r['ppm_neg'], 4),
-            '匹配观测碎片数': mc,
-            '参考碎片总数': total_ref,
-            '碎片覆盖率': f"{coverage * 100:.1f}%",
-            '出峰时间t/min': round(np.mean(rts), 3) if rts else '',
-            '药材匹配': '是' if r['is_priority'] else '否',
-            '主要碎片离子': '; '.join([f'{x:.3f}' for x in obs[:15]]),
-            '参考碎片离子': '; '.join([f'{x:.3f}' for x in all_ref[:15]]),
-            '库中文献数': lc,
-            '评级': rating, '评级名称': rating_name,
-            'MSI_Level': msi, '置信度': conf,
-            '余弦相似度': round(c, 4),
-            '同位素得分': r.get('iso_score', 0),
-            '诊断元素': r.get('iso_elements', '无'),
-            '药材来源': r['herb'], '化合物类型': r['ctype'],
-        })
-    df = pd.DataFrame(out)
-    if len(df) > 0:
-        df = df.sort_values(['药材匹配', '置信度'], ascending=[False, False]).reset_index(drop=True)
-        df.insert(0, '序号', range(1, len(df) + 1))
+        priority_herbs_eff = []
+
+    df = v3opt7_engine.identify_v3opt7(
+        extracted_pos or [],
+        extracted_neg or [],
+        priority_herbs_eff,
+        db,
+        ppm_tol=ppm_tol,
+        da_tol=0.2,
+        use_isotope=use_isotope,
+        relax_priority=True,
+        rt_tol=0.5,
+    )
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    # ---- 字段重命名 / 补充 v6 UI 期望的列 ----
+    # v3opt7 的 '匹配参考碎片数' = v6 语义中的 mc (匹配上的 ref 碎片数)
+    # 如果 v3opt7 原始输出里就有 '匹配观测碎片数' (unique obs 命中), 先 drop, 再重命名
+    if '匹配观测碎片数' in df.columns and '匹配参考碎片数' in df.columns:
+        df = df.drop(columns=['匹配观测碎片数'])
+    df = df.rename(columns={'匹配参考碎片数': '匹配观测碎片数'})
+
+    # v6 UI 期望的 '余弦相似度' / '诊断元素' 列
+    if '余弦相似度' not in df.columns:
+        if '谱图相似度' in df.columns:
+            df['余弦相似度'] = df['谱图相似度'].round(4)
+        else:
+            df['余弦相似度'] = 0.0
+
+    if '诊断元素' not in df.columns:
+        def _diag_elements(f):
+            comp = parse_formula(f) or {}
+            parts = [f'{e}x{comp[e]}' for e in ['Cl', 'Br', 'S', 'Si'] if comp.get(e, 0) > 0]
+            return '; '.join(parts) if parts else '无'
+        df['诊断元素'] = df['分子式'].apply(_diag_elements)
+
+    # 按 v6 的列顺序重新组织
+    preferred_cols = [
+        '序号', '化合物中文名', '分子式', 'CAS号',
+        'm/z实际值', 'ppm',
+        '匹配观测碎片数', '参考碎片总数',
+        '碎片覆盖率', '出峰时间t/min',
+        '药材匹配',
+        '主要碎片离子', '参考碎片离子',
+        '库中文献数',
+        '评级', '评级名称', 'MSI_Level', '置信度',
+        '余弦相似度', '同位素得分', '诊断元素',
+        '药材来源', '化合物类型',
+    ]
+    extra_cols = [c for c in df.columns if c not in preferred_cols]
+    df = df[[c for c in preferred_cols if c in df.columns] + extra_cols]
     return df
-
-
-def _compute_isotope_pattern(formula, n_max=3):
-    comp = parse_formula(formula)
-    if not comp: return [(0, 1.0)]
-    peaks = {0: 1.0}
-    for elem, count in comp.items():
-        if elem not in ISOTOPE_ABUNDANCES: continue
-        try: count = int(count)
-        except: continue
-        ab = ISOTOPE_ABUNDANCES[elem]
-        mi = ISOTOPE_MASS_INCREMENT[elem]
-        base = min(mi.keys(), key=lambda k: mi[k])
-        for _ in range(count):
-            new = {}
-            for cm, ca in peaks.items():
-                for im, ia in ab.items():
-                    nm = cm if im == base else cm + mi.get(im, 0)
-                    new[nm] = new.get(nm, 0) + ca * ia
-            peaks = new
-            if len(peaks) > 200:
-                peaks = dict(sorted(peaks.items(), key=lambda x: -x[1])[:100])
-    max_a = max(peaks.values()) if peaks else 1.0
-    return sorted([(round(m, 4), a / max_a) for m, a in peaks.items()], key=lambda x: x[0])[:n_max + 1]
-
 
 # ============================================================================
 # 报告生成
@@ -623,7 +508,7 @@ def generate_report_md(df, herb_label, instrument):
 # Streamlit UI
 # ============================================================================
 st.set_page_config(
-    page_title='中药 LC-MS/MS 通用鉴定平台 v6.0',
+    page_title='中药 LC-MS/MS 通用鉴定平台 v7.0 (v3opt7 算法)',
     page_icon='🌿',
     layout='wide',
     initial_sidebar_state='expanded',
@@ -641,13 +526,13 @@ st.markdown('''
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if not st.session_state.logged_in:
-    st.markdown('<div class="main-title"><h1>🌿 中药 LC-MS/MS 化合物通用鉴定平台</h1>'
-                '<p>基于 TCM-SM-MS DB (48,886 化合物 / 579 药材) 的 LC-MS/MS 智能鉴定</p></div>',
+    st.markdown('<div class="main-title"><h1>🌿 中药 LC-MS/MS 化合物通用鉴定平台 v7.0</h1>'
+                '<p>基于 TCM-SM-MS DB (48,886 化合物 / 579 药材) 的 LC-MS/MS 智能鉴定 | 算法: v3opt7</p></div>',
                 unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 2, 1]) if False else st.columns(3)
     with col2:
         with st.form('login'):
-            st.markdown('### 🔐 登录')
+            st.markdown('### 🔐 登录 (v7.0 / v3opt7 算法)')
             u = st.text_input('用户名', value='ZY')
             p = st.text_input('密码', value='513513', type='password')
             if st.form_submit_button('登录', use_container_width=True, type='primary'):
@@ -673,15 +558,22 @@ with st.sidebar:
                           help='不指定时, 所有化合物都按"非 priority"处理')
     selected_herbs = []
     if herb_mode == '单药材':
-        h = st.selectbox('选择药材', all_herbs, index=all_herbs.index('栀子') if '栀子' in all_herbs else 0)
+        # v7.0 通用版: 默认选第一个药材,不再硬编码“栀子”
+        h = st.selectbox('选择药材', all_herbs, index=0)
         selected_herbs = [h]
     elif herb_mode == '多药材':
-        h = st.multiselect('选择药材 (可多选)', all_herbs,
-                            default=['栀子', '党参'] if '栀子' in all_herbs and '党参' in all_herbs else all_herbs[:2])
+        # v7.0 通用版: 默认选前 2 个药材,不再硬编码“栀子、党参”
+        h = st.multiselect('选择药材 (可多选)', all_herbs, default=all_herbs[:2])
         selected_herbs = h
     else:
         selected_herbs = []
         st.caption('当前为全库模式, 所有化合物不享受 priority 加分')
+    # v7.0: 是否追加主推三药材 (R3 兼容选项, 默认关闭)
+    add_supported = st.checkbox(
+        '追加主推三药材 priority (栀子/党参/西红花)',
+        value=False,
+        help='勾选后,priority 集合 = 用户选 + 栀子/党参/西红花。\n不勾选: priority 完全由用户控制 (通用版)。',
+    )
     st.markdown('---')
     st.markdown('### 📈 平台信息')
     st.metric('TCM-SM-MS DB', f'{len(all_herbs)} 药材')
@@ -692,8 +584,8 @@ with st.sidebar:
         st.rerun()
 
 # 主区
-st.markdown('<div class="main-title"><h1>🌿 中药 LC-MS/MS 化合物通用鉴定平台 v6.0</h1>'
-            '<p>通用版 | 自动适配 DB 内 579 种药材 | MSI Level 1-4 鉴定</p></div>',
+st.markdown('<div class="main-title"><h1>🌿 中药 LC-MS/MS 化合物通用鉴定平台 v7.0</h1>'
+            '<p>v6 框架 + v3opt7 核心算法 | 自动适配 DB 内 579 种药材 | MSI Level 1-4 鉴定</p></div>',
             unsafe_allow_html=True)
 
 # 标签页
@@ -734,7 +626,8 @@ with tab_upload:
             with st.spinner(f'🔍 用 {INSTRUMENT_PPM[instrument]} ppm 容差鉴定 {len(selected_herbs) if selected_herbs else "全库"} 药材...'):
                 t0 = time.time()
                 df = identify(pos_data or [], neg_data or [], selected_herbs,
-                              instrument=instrument, use_isotope=use_isotope)
+                              instrument=instrument, use_isotope=use_isotope,
+                              add_supported_herbs=add_supported)
                 elapsed = time.time() - t0
             if len(df) == 0:
                 st.warning('⚠️ 未鉴定到任何化合物。试试调高 PPM 容差或换仪器类型。')
